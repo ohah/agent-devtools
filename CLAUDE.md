@@ -81,6 +81,18 @@ src/
 - 유닛: WebSocket 프레임, CDP 메시지, 네트워크 필터링, AX 트리 압축
 - 통합: 실제 Chrome 스폰 + CDP 연결 (Zig만으로 가능)
 
+### 테스트 작성 원칙
+
+- **테스트 코드는 반드시 공식 문서/RFC/스펙을 직접 참조하고 작성할 것**
+  - WebSocket: [RFC 6455](https://datatracker.ietf.org/doc/html/rfc6455)
+  - CDP: [Chrome DevTools Protocol 공식 문서](https://chromedevtools.github.io/devtools-protocol/)
+  - 기억이나 추측에 의존하지 않고, 스펙 원문을 확인한 후 테스트 작성
+- 경계값 테스트 필수 (boundary conditions)
+- 에러 경로 빠짐없이 테스트
+- 라운드트립 테스트 (encode → decode → 비교)
+- `testing.allocator` 사용으로 메모리 누수 자동 감지
+- 회귀 테스트 방지: 한번 작성된 테스트는 삭제하지 않음
+
 ## Build & Run
 
 ```bash
