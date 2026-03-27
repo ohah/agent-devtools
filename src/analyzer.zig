@@ -46,16 +46,15 @@ pub fn isApiRequest(url: []const u8, resource_type: []const u8, mime_type: []con
         return true;
     }
 
-    // Filter by mime type
-    if (std.mem.indexOf(u8, mime_type, "application/json") != null or
-        std.mem.indexOf(u8, mime_type, "application/xml") != null or
-        std.mem.indexOf(u8, mime_type, "text/json") != null or
-        std.mem.indexOf(u8, mime_type, "application/graphql") != null)
+    // Filter by mime type (use startsWith for correct matching)
+    if (std.mem.startsWith(u8, mime_type, "application/json") or
+        std.mem.startsWith(u8, mime_type, "application/xml") or
+        std.mem.startsWith(u8, mime_type, "text/json") or
+        std.mem.startsWith(u8, mime_type, "application/graphql"))
     {
         return true;
     }
 
-    // Filter by URL pattern (common API paths)
     if (std.mem.indexOf(u8, url, "/api/") != null or
         std.mem.indexOf(u8, url, "/graphql") != null or
         std.mem.indexOf(u8, url, "/v1/") != null or
@@ -66,17 +65,15 @@ pub fn isApiRequest(url: []const u8, resource_type: []const u8, mime_type: []con
         return true;
     }
 
-    // Exclude known static types
+    // Strip query/fragment before checking extensions
+    const path = extractPath(url);
+
     const static_exts = [_][]const u8{
         ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
         ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
     };
     for (static_exts) |ext| {
-        if (std.mem.endsWith(u8, url, ext)) return false;
-        // Also check with query string: .js?v=123
-        if (std.mem.indexOf(u8, url, ext)) |pos| {
-            if (pos + ext.len < url.len and url[pos + ext.len] == '?') return false;
-        }
+        if (std.mem.endsWith(u8, path, ext)) return false;
     }
 
     return false;
@@ -167,13 +164,15 @@ pub fn isLikelyId(segment: []const u8) bool {
 }
 
 /// Convert a concrete path to a parameterized pattern.
-/// e.g. "/api/users/123/posts/456" → "/api/users/{id}/posts/{id}"
+/// Uses the preceding segment to derive parameter names:
+/// e.g. "/api/users/123/posts/456" → "/api/users/{userId}/posts/{postId}"
 pub fn pathToPattern(allocator: Allocator, path: []const u8) ![]u8 {
     var result: std.ArrayList(u8) = .empty;
     errdefer result.deinit(allocator);
 
     var iter = std.mem.splitScalar(u8, path, '/');
     var first = true;
+    var prev_segment: []const u8 = "";
 
     while (iter.next()) |segment| {
         if (!first) try result.append(allocator, '/');
@@ -182,14 +181,44 @@ pub fn pathToPattern(allocator: Allocator, path: []const u8) ![]u8 {
         if (segment.len == 0) continue;
 
         if (isLikelyId(segment)) {
-            try result.appendSlice(allocator, "{id}");
+            try result.append(allocator, '{');
+            if (prev_segment.len > 0 and !isLikelyId(prev_segment)) {
+                try appendParamName(&result, allocator, prev_segment);
+            } else {
+                try result.appendSlice(allocator, "id");
+            }
+            try result.append(allocator, '}');
         } else {
             try result.appendSlice(allocator, segment);
         }
+
+        prev_segment = segment;
     }
 
     return result.toOwnedSlice(allocator);
 }
+
+/// Derive a parameter name from a plural resource name.
+/// "users" → "userId", "posts" → "postId", "items" → "itemId"
+fn appendParamName(result: *std.ArrayList(u8), allocator: Allocator, resource: []const u8) !void {
+    // Remove trailing 's' for singular form (simple English pluralization)
+    var singular = resource;
+    if (singular.len > 1 and singular[singular.len - 1] == 's') {
+        // Handle "ies" → "y" (e.g. "categories" → "category")
+        if (singular.len > 3 and std.mem.endsWith(u8, singular, "ies")) {
+            singular = singular[0 .. singular.len - 3];
+            try result.appendSlice(allocator, singular);
+            try result.append(allocator, 'y');
+        } else {
+            singular = singular[0 .. singular.len - 1];
+            try result.appendSlice(allocator, singular);
+        }
+    } else {
+        try result.appendSlice(allocator, singular);
+    }
+    try result.appendSlice(allocator, "Id");
+}
+
 
 /// Analyze collected network requests and extract API endpoints.
 pub fn analyzeRequests(allocator: Allocator, collector: *const network_mod.Collector) !AnalysisResult {
@@ -258,19 +287,32 @@ pub fn analyzeRequests(allocator: Allocator, collector: *const network_mod.Colle
     var ep_it = endpoints_map.iterator();
     while (ep_it.next()) |entry| {
         const accum = entry.value_ptr;
+        const method = allocator.dupe(u8, accum.method) catch continue;
+        errdefer allocator.free(method);
+        const path_pattern = allocator.dupe(u8, accum.pattern) catch continue;
+        errdefer allocator.free(path_pattern);
+        const example_url = allocator.dupe(u8, accum.example_url) catch continue;
+        errdefer allocator.free(example_url);
+        const mime_type = allocator.dupe(u8, accum.mime_type) catch continue;
+
         endpoints.append(allocator, .{
-            .method = allocator.dupe(u8, accum.method) catch continue,
-            .path_pattern = allocator.dupe(u8, accum.pattern) catch continue,
-            .example_url = allocator.dupe(u8, accum.example_url) catch continue,
+            .method = method,
+            .path_pattern = path_pattern,
+            .example_url = example_url,
             .status = accum.last_status,
-            .mime_type = allocator.dupe(u8, accum.mime_type) catch continue,
+            .mime_type = mime_type,
             .count = accum.count,
-        }) catch {};
+        }) catch {
+            allocator.free(method);
+            allocator.free(path_pattern);
+            allocator.free(example_url);
+            allocator.free(mime_type);
+        };
     }
 
     return .{
-        .endpoints = endpoints.toOwnedSlice(allocator) catch &.{},
-        .base_url = base_url orelse allocator.dupe(u8, "") catch "",
+        .endpoints = try endpoints.toOwnedSlice(allocator),
+        .base_url = base_url orelse try allocator.dupe(u8, ""),
         .total_requests = total,
         .api_requests = api_count,
         .allocator = allocator,
@@ -278,8 +320,8 @@ pub fn analyzeRequests(allocator: Allocator, collector: *const network_mod.Colle
 }
 
 const EndpointAccum = struct {
-    method: []const u8, // borrowed from RequestInfo
-    pattern: []const u8, // borrowed from key
+    method: []const u8, // borrowed from RequestInfo (valid during analyzeRequests scope)
+    pattern: []const u8, // owned — allocated by pathToPattern, freed in defer
     example_url: []const u8, // borrowed from RequestInfo
     last_status: ?i64,
     mime_type: []const u8,
@@ -425,28 +467,40 @@ test "pathToPattern: no IDs" {
     try testing.expectEqualStrings("/api/users", pattern);
 }
 
-test "pathToPattern: numeric ID" {
+test "pathToPattern: numeric ID with semantic name" {
     const pattern = try pathToPattern(testing.allocator, "/api/users/123");
     defer testing.allocator.free(pattern);
-    try testing.expectEqualStrings("/api/users/{id}", pattern);
+    try testing.expectEqualStrings("/api/users/{userId}", pattern);
 }
 
-test "pathToPattern: UUID" {
+test "pathToPattern: UUID with semantic name" {
     const pattern = try pathToPattern(testing.allocator, "/api/users/550e8400-e29b-41d4-a716-446655440000/posts");
     defer testing.allocator.free(pattern);
-    try testing.expectEqualStrings("/api/users/{id}/posts", pattern);
+    try testing.expectEqualStrings("/api/users/{userId}/posts", pattern);
 }
 
-test "pathToPattern: multiple IDs" {
+test "pathToPattern: multiple IDs with semantic names" {
     const pattern = try pathToPattern(testing.allocator, "/api/users/123/posts/456");
     defer testing.allocator.free(pattern);
-    try testing.expectEqualStrings("/api/users/{id}/posts/{id}", pattern);
+    try testing.expectEqualStrings("/api/users/{userId}/posts/{postId}", pattern);
 }
 
 test "pathToPattern: version prefix preserved" {
     const pattern = try pathToPattern(testing.allocator, "/v2/users/123");
     defer testing.allocator.free(pattern);
-    try testing.expectEqualStrings("/v2/users/{id}", pattern);
+    try testing.expectEqualStrings("/v2/users/{userId}", pattern);
+}
+
+test "pathToPattern: categories → categoryId" {
+    const pattern = try pathToPattern(testing.allocator, "/api/categories/42");
+    defer testing.allocator.free(pattern);
+    try testing.expectEqualStrings("/api/categories/{categoryId}", pattern);
+}
+
+test "pathToPattern: items → itemId" {
+    const pattern = try pathToPattern(testing.allocator, "/items/abc123def456abc0");
+    defer testing.allocator.free(pattern);
+    try testing.expectEqualStrings("/items/{itemId}", pattern);
 }
 
 test "pathToPattern: root" {
