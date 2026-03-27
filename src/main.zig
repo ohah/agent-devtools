@@ -134,6 +134,8 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
     };
     if (started) {
         writeErr("Started daemon (session: {s})\n", .{session});
+    } else if (daemon_opts.headed or daemon_opts.cdp_port != null) {
+        writeErr("Daemon already running — --headed/--port options ignored. Use 'close' first.\n", .{});
     }
 
     // Connect and send command
@@ -204,11 +206,11 @@ fn runDaemon() void {
 
     var ws_url_buf: [256]u8 = undefined;
     const ws_url: []const u8 = if (ext_port) |port_str| blk: {
-        // --port: connect to existing Chrome at given port
         const port = std.fmt.parseInt(u16, port_str, 10) catch {
             std.debug.print("Daemon: Invalid port: {s}\n", .{port_str});
             return;
         };
+        // TODO: use /json/version discovery for correct path with GUID
         break :blk std.fmt.bufPrint(&ws_url_buf, "ws://127.0.0.1:{d}/devtools/browser", .{port}) catch return;
     } else blk: {
         chrome_proc = chrome.ChromeProcess.launch(allocator, .{ .headless = !is_headed }) catch |err| {
@@ -493,16 +495,14 @@ fn appendRemoteObjectText(allocator: Allocator, obj: std.json.Value, buf: *std.A
     }
 }
 
-const error_fallback = "{\"success\":false,\"error\":\"internal error\"}\n";
-
 fn respondOk(allocator: Allocator) []u8 {
     return daemon.serializeResponse(allocator, .{ .success = true }) catch
-        allocator.dupe(u8, "{\"success\":true}\n") catch @constCast(error_fallback);
+        allocator.dupe(u8, "{\"success\":true}\n") catch "";
 }
 
 fn respondErr(allocator: Allocator, msg: []const u8) []u8 {
     return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = msg }) catch
-        allocator.dupe(u8, error_fallback) catch @constCast(error_fallback);
+        allocator.dupe(u8, "{\"success\":false,\"error\":\"internal error\"}\n") catch "";
 }
 
 fn handleCommand(
@@ -634,12 +634,23 @@ fn handleNetworkGet(
     defer if (body_owned) |b| allocator.free(b);
     var base64_encoded = false;
 
+    // Process messages while waiting for getResponseBody response.
+    // Events are forwarded to collector to avoid data loss.
     for (0..30) |_| {
         const msg = ws.recvMessage() catch break;
         defer allocator.free(msg);
 
         const parsed = cdp.parseMessage(allocator, msg) catch continue;
         defer parsed.parsed.deinit();
+
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| {
+                    _ = collector.processEvent(method, params) catch {};
+                }
+            }
+            continue;
+        }
 
         if (parsed.message.isResponse()) {
             if (parsed.message.result) |result| {
