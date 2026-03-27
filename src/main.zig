@@ -394,13 +394,7 @@ fn collectConsoleEvent(allocator: Allocator, params: std.json.Value, console_msg
             if (args_val == .array) {
                 for (args_val.array.items, 0..) |arg, i| {
                     if (i > 0) text_buf.append(allocator, ' ') catch {};
-                    if (cdp.getString(arg, "value")) |v| {
-                        text_buf.appendSlice(allocator, v) catch {};
-                    } else if (cdp.getString(arg, "description")) |d| {
-                        text_buf.appendSlice(allocator, d) catch {};
-                    } else if (cdp.getString(arg, "type")) |t| {
-                        text_buf.appendSlice(allocator, t) catch {};
-                    }
+                    appendRemoteObjectText(allocator, arg, &text_buf);
                 }
             }
         }
@@ -419,6 +413,84 @@ fn collectConsoleEvent(allocator: Allocator, params: std.json.Value, console_msg
         allocator.free(text);
         allocator.free(log_type);
     };
+}
+
+/// Convert a CDP RemoteObject to a readable text representation.
+/// Handles all types: string, number, boolean, null, undefined, object, function, symbol, bigint.
+/// Reference: js_protocol.json RemoteObject type
+fn appendRemoteObjectText(allocator: Allocator, obj: std.json.Value, buf: *std.ArrayList(u8)) void {
+    if (obj != .object) return;
+    const map = obj.object;
+
+    const obj_type = cdp.getString(obj, "type") orelse "unknown";
+
+    // For strings, use the value directly (not description which adds quotes)
+    if (std.mem.eql(u8, obj_type, "string")) {
+        if (cdp.getString(obj, "value")) |v| {
+            buf.appendSlice(allocator, v) catch {};
+            return;
+        }
+    }
+
+    // For numbers, booleans: value field contains the actual value
+    if (std.mem.eql(u8, obj_type, "number") or std.mem.eql(u8, obj_type, "boolean") or std.mem.eql(u8, obj_type, "bigint")) {
+        // value can be number, bool, or string (for bigint/unserializable)
+        if (map.get("value")) |val| switch (val) {
+            .integer => |n| {
+                var num_buf: [24]u8 = undefined;
+                const s = std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch return;
+                buf.appendSlice(allocator, s) catch {};
+                return;
+            },
+            .float => |f| {
+                var num_buf: [32]u8 = undefined;
+                const s = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch return;
+                buf.appendSlice(allocator, s) catch {};
+                return;
+            },
+            .bool => |b| {
+                buf.appendSlice(allocator, if (b) "true" else "false") catch {};
+                return;
+            },
+            .string => |s| {
+                buf.appendSlice(allocator, s) catch {};
+                return;
+            },
+            else => {},
+        };
+        // Fallback: unserializableValue (Infinity, NaN, -0, bigint literals)
+        if (cdp.getString(obj, "unserializableValue")) |u| {
+            buf.appendSlice(allocator, u) catch {};
+            return;
+        }
+    }
+
+    // For undefined
+    if (std.mem.eql(u8, obj_type, "undefined")) {
+        buf.appendSlice(allocator, "undefined") catch {};
+        return;
+    }
+
+    // Check subtype first (null, array, error, etc.)
+    if (cdp.getString(obj, "subtype")) |subtype| {
+        if (std.mem.eql(u8, subtype, "null")) {
+            buf.appendSlice(allocator, "null") catch {};
+            return;
+        }
+    }
+
+    // For objects: use description (Array(3), Error: msg, Uint8Array(3), etc.)
+    if (cdp.getString(obj, "description")) |d| {
+        buf.appendSlice(allocator, d) catch {};
+        return;
+    }
+
+    // Last resort: className or type
+    if (cdp.getString(obj, "className")) |c| {
+        buf.appendSlice(allocator, c) catch {};
+    } else {
+        buf.appendSlice(allocator, obj_type) catch {};
+    }
 }
 
 const error_fallback = "{\"success\":false,\"error\":\"internal error\"}\n";
@@ -729,4 +801,130 @@ test "isPlannedCommand: rejects implemented commands" {
     try std.testing.expect(!isPlannedCommand("open"));
     try std.testing.expect(!isPlannedCommand("network"));
     try std.testing.expect(!isPlannedCommand("close"));
+}
+
+// ============================================================================
+// Tests: appendRemoteObjectText (CDP RemoteObject → text)
+// Based on: js_protocol.json RemoteObject type
+// ============================================================================
+
+fn makeJsonObj(allocator: Allocator, json_str: []const u8) !std.json.Parsed(std.json.Value) {
+    return std.json.parseFromSlice(std.json.Value, allocator, json_str, .{});
+}
+
+fn remoteObjectToText(json_str: []const u8) ![]u8 {
+    const parsed = try makeJsonObj(std.testing.allocator, json_str);
+    defer parsed.deinit();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(std.testing.allocator);
+    appendRemoteObjectText(std.testing.allocator, parsed.value, &buf);
+    return buf.toOwnedSlice(std.testing.allocator);
+}
+
+test "RemoteObject: string value" {
+    const text = try remoteObjectToText("{\"type\":\"string\",\"value\":\"hello world\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("hello world", text);
+}
+
+test "RemoteObject: number value (integer)" {
+    const text = try remoteObjectToText("{\"type\":\"number\",\"value\":42,\"description\":\"42\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("42", text);
+}
+
+test "RemoteObject: number value (float)" {
+    const text = try remoteObjectToText("{\"type\":\"number\",\"value\":3.14,\"description\":\"3.14\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expect(std.mem.startsWith(u8, text, "3.14"));
+}
+
+test "RemoteObject: boolean true" {
+    const text = try remoteObjectToText("{\"type\":\"boolean\",\"value\":true,\"description\":\"true\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("true", text);
+}
+
+test "RemoteObject: boolean false" {
+    const text = try remoteObjectToText("{\"type\":\"boolean\",\"value\":false,\"description\":\"false\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("false", text);
+}
+
+test "RemoteObject: null (subtype)" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"null\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("null", text);
+}
+
+test "RemoteObject: undefined" {
+    const text = try remoteObjectToText("{\"type\":\"undefined\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("undefined", text);
+}
+
+test "RemoteObject: NaN (unserializable)" {
+    const text = try remoteObjectToText("{\"type\":\"number\",\"unserializableValue\":\"NaN\",\"description\":\"NaN\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("NaN", text);
+}
+
+test "RemoteObject: Infinity (unserializable)" {
+    const text = try remoteObjectToText("{\"type\":\"number\",\"unserializableValue\":\"Infinity\",\"description\":\"Infinity\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Infinity", text);
+}
+
+test "RemoteObject: object with description" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"description\":\"Object\",\"className\":\"Object\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Object", text);
+}
+
+test "RemoteObject: array with description" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"array\",\"description\":\"Array(3)\",\"className\":\"Array\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Array(3)", text);
+}
+
+test "RemoteObject: error with description" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"error\",\"description\":\"Error: something failed\",\"className\":\"Error\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Error: something failed", text);
+}
+
+test "RemoteObject: typed array" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"typedarray\",\"description\":\"Uint8Array(3)\",\"className\":\"Uint8Array\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Uint8Array(3)", text);
+}
+
+test "RemoteObject: symbol" {
+    const text = try remoteObjectToText("{\"type\":\"symbol\",\"description\":\"Symbol(test)\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Symbol(test)", text);
+}
+
+test "RemoteObject: function" {
+    const text = try remoteObjectToText("{\"type\":\"function\",\"description\":\"function foo() { ... }\",\"className\":\"Function\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("function foo() { ... }", text);
+}
+
+test "RemoteObject: bigint" {
+    const text = try remoteObjectToText("{\"type\":\"bigint\",\"unserializableValue\":\"123n\",\"description\":\"123n\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("123n", text);
+}
+
+test "RemoteObject: object without description falls back to className" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"className\":\"MyClass\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("MyClass", text);
+}
+
+test "RemoteObject: object without description or className falls back to type" {
+    const text = try remoteObjectToText("{\"type\":\"object\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("object", text);
 }
