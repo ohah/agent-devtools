@@ -5,6 +5,7 @@ const cdp = agent.cdp;
 const websocket = agent.websocket;
 const network = agent.network;
 const daemon = agent.daemon;
+const analyzer = agent.analyzer;
 
 const Allocator = std.mem.Allocator;
 const version = "0.1.0";
@@ -106,6 +107,8 @@ pub fn main() void {
             writeErr("Unknown console subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
         }
+    } else if (std.mem.eql(u8, cmd, "analyze")) {
+        sendAction(session, "analyze", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "status")) {
         sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "close")) {
@@ -544,6 +547,8 @@ fn handleCommand(
         }
         console_msgs.clearRetainingCapacity();
         return respondOk(allocator);
+    } else if (std.mem.eql(u8, req.action, "analyze")) {
+        return handleAnalyze(allocator, collector);
     } else if (std.mem.eql(u8, req.action, "status")) {
         return handleStatus(allocator, collector, console_msgs);
     } else if (std.mem.eql(u8, req.action, "close")) {
@@ -736,6 +741,19 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
         respondErr(allocator, "serialize error");
 }
 
+fn handleAnalyze(allocator: Allocator, collector: *const network.Collector) []u8 {
+    var result = analyzer.analyzeRequests(allocator, collector) catch
+        return respondErr(allocator, "analysis failed");
+    defer result.deinit();
+
+    const data = analyzer.serializeResult(allocator, &result) catch
+        return respondErr(allocator, "serialize failed");
+    defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "response failed");
+}
+
 fn handleStatus(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry)) []u8 {
     var buf: [256]u8 = undefined;
     const data = std.fmt.bufPrint(&buf, "{{\"requests\":{d},\"console\":{d},\"daemon\":\"running\"}}", .{
@@ -752,7 +770,7 @@ fn handleStatus(allocator: Allocator, collector: *const network.Collector, conso
 // ============================================================================
 
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{ "analyze", "intercept", "record", "replay", "diff" };
+    const planned = [_][]const u8{ "intercept", "record", "replay", "diff" };
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
@@ -809,8 +827,13 @@ test "version string is set" {
 }
 
 test "isPlannedCommand: recognizes planned commands" {
-    try std.testing.expect(isPlannedCommand("analyze"));
     try std.testing.expect(isPlannedCommand("intercept"));
+    try std.testing.expect(isPlannedCommand("record"));
+    try std.testing.expect(isPlannedCommand("diff"));
+}
+
+test "isPlannedCommand: analyze is now implemented" {
+    try std.testing.expect(!isPlannedCommand("analyze"));
 }
 
 test "isPlannedCommand: rejects implemented commands" {
