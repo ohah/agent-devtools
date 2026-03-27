@@ -218,9 +218,9 @@ pub const ChromeProcess = struct {
         argv.appendSlice(allocator, args) catch return error.LaunchFailed;
 
         var child = std.process.Child.init(argv.items, allocator);
-        child.stdin_behavior = .ignore;
-        child.stdout_behavior = .ignore;
-        child.stderr_behavior = .pipe;
+        child.stdin_behavior = .Ignore;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Pipe;
 
         child.spawn() catch return error.LaunchFailed;
         errdefer {
@@ -273,7 +273,7 @@ fn waitForWsUrl(allocator: Allocator, child: *std.process.Child, user_data_dir: 
                 }
             } else |_| {}
 
-            std.time.sleep(poll_interval_ns);
+            std.Thread.sleep(poll_interval_ns);
         }
     }
 
