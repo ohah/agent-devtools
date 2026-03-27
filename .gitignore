@@ -1,0 +1,19 @@
+zig-out/
+zig-cache/
+.zig-cache/
+*.o
+*.a
+*.so
+*.dylib
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Node (npm distribution)
+node_modules/
+dist/
