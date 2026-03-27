@@ -165,6 +165,37 @@ pub fn main() void {
         }
     } else if (std.mem.eql(u8, cmd, "analyze")) {
         sendAction(session, "analyze", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "screenshot")) {
+        const path = args_iter.next();
+        sendAction(session, "screenshot", path, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "eval")) {
+        const expr = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools eval <expression>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "eval", expr, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "back")) {
+        sendAction(session, "back", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "forward")) {
+        sendAction(session, "forward", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "reload")) {
+        sendAction(session, "reload", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "get")) {
+        const what = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools get <url|title>\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, what, "url")) {
+            sendAction(session, "get_url", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "title")) {
+            sendAction(session, "get_title", null, null, daemon_opts);
+        } else {
+            writeErr("Unknown: get {s}. Use: get url, get title\n", .{what});
+            std.process.exit(1);
+        }
+    } else if (std.mem.eql(u8, cmd, "wait")) {
+        const ms = args_iter.next() orelse "1000";
+        sendAction(session, "wait", ms, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "status")) {
         sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "close")) {
@@ -676,6 +707,25 @@ fn handleCommand(
         return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "analyze")) {
         return handleAnalyze(allocator, ws, cmd_id, session_id, collector);
+    } else if (std.mem.eql(u8, req.action, "screenshot")) {
+        return handleScreenshot(allocator, ws, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "eval")) {
+        return handleEval(allocator, ws, cmd_id, session_id, collector, req.url);
+    } else if (std.mem.eql(u8, req.action, "back")) {
+        return handleNavAction(allocator, ws, cmd_id, session_id, "Page.navigateToHistoryEntry", "-1");
+    } else if (std.mem.eql(u8, req.action, "forward")) {
+        return handleNavAction(allocator, ws, cmd_id, session_id, "Page.navigateToHistoryEntry", "1");
+    } else if (std.mem.eql(u8, req.action, "reload")) {
+        return handleSimpleCdp(allocator, ws, cmd_id, session_id, "Page.reload");
+    } else if (std.mem.eql(u8, req.action, "get_url")) {
+        return handleEval(allocator, ws, cmd_id, session_id, collector, "window.location.href");
+    } else if (std.mem.eql(u8, req.action, "get_title")) {
+        return handleEval(allocator, ws, cmd_id, session_id, collector, "document.title");
+    } else if (std.mem.eql(u8, req.action, "wait")) {
+        const ms_str = req.url orelse "1000";
+        const ms = std.fmt.parseInt(u32, ms_str, 10) catch 1000;
+        std.Thread.sleep(@as(u64, ms) * std.time.ns_per_ms);
+        return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "record")) {
         return handleRecord(allocator, collector, console_msgs, req.url);
     } else if (std.mem.eql(u8, req.action, "diff")) {
@@ -888,6 +938,146 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
 
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
         respondErr(allocator, "serialize error");
+}
+
+fn handleScreenshot(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.captureScreenshot",
+        \\{"format":"png"}
+    , session_id) catch return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    ws.sendText(cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(5000);
+    defer ws.setReadTimeout(100);
+
+    for (0..20) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getString(result, "data")) |base64_data| {
+                    // If path provided, save to file
+                    if (path_opt) |file_path| {
+                        const decoded_size = std.base64.standard.Decoder.calcSizeUpperBound(base64_data.len) catch
+                            return respondErr(allocator, "invalid base64");
+                        const buf = allocator.alloc(u8, decoded_size) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(buf);
+
+                        std.base64.standard.Decoder.decode(buf, base64_data) catch
+                            return respondErr(allocator, "decode error");
+
+                        const file = std.fs.cwd().createFile(file_path, .{}) catch
+                            return respondErr(allocator, "file create error");
+                        defer file.close();
+                        _ = file.write(buf[0..decoded_size]) catch return respondErr(allocator, "write error");
+
+                        var resp_buf: [512]u8 = undefined;
+                        const data = std.fmt.bufPrint(&resp_buf, "{{\"file\":\"{s}\",\"size\":{d}}}", .{ file_path, decoded_size }) catch
+                            return respondOk(allocator);
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
+                    } else {
+                        // Return base64 data directly
+                        var resp_buf: std.ArrayList(u8) = .empty;
+                        defer resp_buf.deinit(allocator);
+                        const writer = resp_buf.writer(allocator);
+                        writer.writeAll("{\"data\":\"") catch return respondErr(allocator, "write error");
+                        writer.writeAll(base64_data) catch return respondErr(allocator, "write error");
+                        writer.writeAll("\"}") catch {};
+
+                        const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(data);
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "screenshot timeout");
+}
+
+fn handleEval(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, collector: *network.Collector, expr_opt: ?[]const u8) []u8 {
+    const expression = expr_opt orelse return respondErr(allocator, "expression required");
+
+    const cmd = cdp.runtimeEvaluate(allocator, cmd_id.next(), expression, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    ws.sendText(cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(5000);
+    defer ws.setReadTimeout(100);
+
+    for (0..20) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| {
+                    _ = collector.processEvent(method, params) catch {};
+                }
+            }
+            continue;
+        }
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "result")) |remote_obj| {
+                    // Extract value from RemoteObject
+                    if (cdp.getString(remote_obj, "value")) |v| {
+                        const data = allocator.dupe(u8, v) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(data);
+                        var resp: std.ArrayList(u8) = .empty;
+                        defer resp.deinit(allocator);
+                        cdp.writeJsonString(resp.writer(allocator), data) catch return respondErr(allocator, "write error");
+                        const resp_data = resp.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(resp_data);
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = resp_data }) catch respondErr(allocator, "resp error");
+                    }
+                    if (cdp.getString(remote_obj, "description")) |d| {
+                        const resp_data = allocator.dupe(u8, d) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(resp_data);
+                        var resp: std.ArrayList(u8) = .empty;
+                        defer resp.deinit(allocator);
+                        cdp.writeJsonString(resp.writer(allocator), resp_data) catch {};
+                        const rd = resp.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(rd);
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = rd }) catch respondErr(allocator, "resp error");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "eval timeout");
+}
+
+fn handleSimpleCdp(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, method: []const u8) []u8 {
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), method, null, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch return respondErr(allocator, "send error");
+    return respondOk(allocator);
+}
+
+fn handleNavAction(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, method: []const u8, direction: []const u8) []u8 {
+    // Use Runtime.evaluate with history.back()/forward() — simpler than history entry management
+    _ = method;
+    const expr = if (std.mem.eql(u8, direction, "-1")) "history.back()" else "history.forward()";
+    const cmd = cdp.runtimeEvaluate(allocator, cmd_id.next(), expr, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch return respondErr(allocator, "send error");
+    return respondOk(allocator);
 }
 
 fn handleRecord(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry), name: ?[]const u8) []u8 {
@@ -1150,7 +1340,7 @@ fn handleStatus(allocator: Allocator, collector: *const network.Collector, conso
 // ============================================================================
 
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{ "replay" };
+    const planned = [_][]const u8{"replay"};
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
