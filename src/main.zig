@@ -217,6 +217,31 @@ pub fn main() void {
         sendAction(session, "forward", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "reload")) {
         sendAction(session, "reload", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "dblclick")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools dblclick <@ref>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "dblclick", target, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "is")) {
+        const what = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools is <visible|enabled|checked> <@ref>\n", .{});
+            std.process.exit(1);
+        };
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools is {s} <@ref>\n", .{what});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, what, "visible")) {
+            sendAction(session, "is_visible", target, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "enabled")) {
+            sendAction(session, "is_enabled", target, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "checked")) {
+            sendAction(session, "is_checked", target, null, daemon_opts);
+        } else {
+            writeErr("Unknown: is {s}\n", .{what});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, cmd, "scroll")) {
         const dir = args_iter.next() orelse "down";
         const px = args_iter.next() orelse "300";
@@ -261,6 +286,16 @@ pub fn main() void {
                 std.process.exit(1);
             };
             sendAction(session, "get_value", target, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "attr")) {
+            const target = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get attr <@ref> <name>\n", .{});
+                std.process.exit(1);
+            };
+            const attr_name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get attr <@ref> <name>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "get_attr", target, attr_name, daemon_opts);
         } else {
             writeErr("Unknown: get {s}\n", .{what});
             std.process.exit(1);
@@ -816,6 +851,12 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleScroll(allocator, ws, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "select_option")) {
         return handleSelectOption(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "dblclick")) {
+        return handleClick(allocator, ws, cmd_id, session_id, ref_map, collector, req.url);
+    } else if (std.mem.eql(u8, req.action, "is_visible") or std.mem.eql(u8, req.action, "is_enabled") or std.mem.eql(u8, req.action, "is_checked")) {
+        return handleIsCheck(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.action);
+    } else if (std.mem.eql(u8, req.action, "get_attr")) {
+        return handleGetAttr(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "get_text") or std.mem.eql(u8, req.action, "get_html") or std.mem.eql(u8, req.action, "get_value")) {
         return handleGetElementProp(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.action);
     } else if (std.mem.eql(u8, req.action, "screenshot")) {
@@ -1235,6 +1276,182 @@ fn handlePress(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.Command
     ws.sendText(cmd2) catch {};
 
     return respondOk(allocator);
+}
+
+fn handleIsCheck(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8, action: []const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+
+    const prop = if (std.mem.eql(u8, action, "is_visible"))
+        "function(){var r=this.getBoundingClientRect();return r.width>0&&r.height>0&&window.getComputedStyle(this).visibility!=='hidden'}"
+    else if (std.mem.eql(u8, action, "is_enabled"))
+        "function(){return !this.disabled}"
+    else
+        "function(){return !!this.checked}";
+
+    // DOM.resolveNode → objectId
+    var resolve_buf: [128]u8 = undefined;
+    const resolve_params = std.fmt.bufPrint(&resolve_buf, "{{\"backendNodeId\":{d}}}", .{backend_id}) catch
+        return respondErr(allocator, "format error");
+    const resolve_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "DOM.resolveNode", resolve_params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(resolve_cmd);
+    ws.sendText(resolve_cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(3000);
+    defer ws.setReadTimeout(100);
+
+    var object_id: ?[]u8 = null;
+    defer if (object_id) |o| allocator.free(o);
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| _ = collector.processEvent(method, params) catch {};
+            }
+            continue;
+        }
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "object")) |obj| {
+                    if (cdp.getString(obj, "objectId")) |oid| object_id = allocator.dupe(u8, oid) catch null;
+                }
+            }
+            break;
+        }
+    }
+
+    const oid = object_id orelse return respondErr(allocator, "failed to resolve element");
+
+    // Runtime.callFunctionOn
+    var call_buf: std.ArrayList(u8) = .empty;
+    defer call_buf.deinit(allocator);
+    const cw = call_buf.writer(allocator);
+    cw.writeAll("{\"objectId\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(cw, oid) catch {};
+    cw.writeAll(",\"functionDeclaration\":") catch {};
+    cdp.writeJsonString(cw, prop) catch {};
+    cw.writeAll(",\"returnByValue\":true}") catch {};
+
+    const call_params = call_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(call_params);
+    const call_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Runtime.callFunctionOn", call_params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(call_cmd);
+    ws.sendText(call_cmd) catch {};
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "result")) |remote_obj| {
+                    if (cdp.getBool(remote_obj, "value")) |v| {
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = if (v) "true" else "false" }) catch respondErr(allocator, "resp error");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "check timeout");
+}
+
+fn handleGetAttr(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8, attr_name: ?[]const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    const attr = attr_name orelse return respondErr(allocator, "attribute name required");
+
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+
+    // Build function that gets the attribute
+    var expr_buf: [256]u8 = undefined;
+    const func = std.fmt.bufPrint(&expr_buf, "function(){{return this.getAttribute('{s}')}}", .{attr}) catch
+        return respondErr(allocator, "attr name too long");
+
+    // Resolve → callFunctionOn (reuse same pattern as handleGetElementProp)
+    var resolve_buf: [128]u8 = undefined;
+    const resolve_params = std.fmt.bufPrint(&resolve_buf, "{{\"backendNodeId\":{d}}}", .{backend_id}) catch
+        return respondErr(allocator, "format error");
+    const resolve_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "DOM.resolveNode", resolve_params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(resolve_cmd);
+    ws.sendText(resolve_cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(3000);
+    defer ws.setReadTimeout(100);
+
+    var object_id: ?[]u8 = null;
+    defer if (object_id) |o| allocator.free(o);
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| _ = collector.processEvent(method, params) catch {};
+            }
+            continue;
+        }
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "object")) |obj| {
+                    if (cdp.getString(obj, "objectId")) |oid| object_id = allocator.dupe(u8, oid) catch null;
+                }
+            }
+            break;
+        }
+    }
+
+    const oid = object_id orelse return respondErr(allocator, "failed to resolve element");
+
+    var call_buf: std.ArrayList(u8) = .empty;
+    defer call_buf.deinit(allocator);
+    const cw = call_buf.writer(allocator);
+    cw.writeAll("{\"objectId\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(cw, oid) catch {};
+    cw.writeAll(",\"functionDeclaration\":") catch {};
+    cdp.writeJsonString(cw, func) catch {};
+    cw.writeAll(",\"returnByValue\":true}") catch {};
+
+    const call_params = call_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(call_params);
+    const call_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Runtime.callFunctionOn", call_params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(call_cmd);
+    ws.sendText(call_cmd) catch {};
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "result")) |remote_obj| {
+                    if (cdp.getString(remote_obj, "value")) |v| {
+                        var resp: std.ArrayList(u8) = .empty;
+                        defer resp.deinit(allocator);
+                        cdp.writeJsonString(resp.writer(allocator), v) catch {};
+                        const data = resp.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(data);
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "get attr timeout");
 }
 
 fn handleScroll(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, dir_opt: ?[]const u8, px_opt: ?[]const u8) []u8 {
