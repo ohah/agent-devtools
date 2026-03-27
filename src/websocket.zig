@@ -395,6 +395,18 @@ pub const Client = struct {
         self.allocator.free(self.recv_buf);
     }
 
+    /// Set a read timeout on the underlying socket.
+    /// After this, recvMessage will return error if no data arrives within `ms` milliseconds.
+    /// Pass 0 to disable timeout (block forever).
+    pub fn setReadTimeout(self: *Client, ms: u32) void {
+        const timeval = std.posix.timeval{
+            .sec = @intCast(ms / 1000),
+            .usec = @intCast(@as(u64, ms % 1000) * 1000),
+        };
+        const bytes = std.mem.asBytes(&timeval);
+        std.posix.setsockopt(self.stream.handle, std.posix.SOL.SOCKET, std.c.SO.RCVTIMEO, bytes) catch {};
+    }
+
     pub fn sendText(self: *Client, payload: []const u8) SendError!void {
         const frame = try encode(self.allocator, .text, payload);
         defer self.allocator.free(frame);
