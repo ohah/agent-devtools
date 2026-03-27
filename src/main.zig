@@ -1144,15 +1144,25 @@ fn handleFill(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandI
     defer allocator.free(focus_cmd);
     ws.sendText(focus_cmd) catch return respondErr(allocator, "send error");
 
-    // Clear existing content (select all + delete)
-    const select_all = cdp.runtimeEvaluate(allocator, cmd_id.next(), "document.execCommand('selectAll')", session_id) catch return respondErr(allocator, "cmd error");
-    defer allocator.free(select_all);
-    ws.sendText(select_all) catch {};
-
+    // Wait for focus response
     _ = collector;
+    ws.setReadTimeout(1000);
+    for (0..5) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+        if (parsed.message.isResponse()) break;
+    }
 
-    // Small delay for focus
-    std.Thread.sleep(50 * std.time.ns_per_ms);
+    // Select all text (works for input/textarea/contenteditable)
+    const select_expr = cdp.runtimeEvaluate(allocator, cmd_id.next(),
+        \\(function(){var a=document.activeElement;if(a&&a.select)a.select();else document.execCommand('selectAll')})()
+    , session_id) catch return respondErr(allocator, "cmd error");
+    defer allocator.free(select_expr);
+    ws.sendText(select_expr) catch {};
+
+    std.Thread.sleep(30 * std.time.ns_per_ms);
 
     // Insert text
     const insert_cmd = snapshot_mod.buildInsertTextCmd(allocator, cmd_id.next(), fill_text, session_id) catch
@@ -1166,20 +1176,39 @@ fn handleFill(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandI
 fn handlePress(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8) []u8 {
     const key_name = key orelse return respondErr(allocator, "key required");
 
-    // Map common key names to CDP key event params
-    var buf: [256]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\"}}", .{key_name}) catch
-        return respondErr(allocator, "key too long");
+    // For single printable characters, include text field for actual input
+    const is_printable = key_name.len == 1 and key_name[0] >= 0x20;
 
-    const cmd1 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+    var down_buf: std.ArrayList(u8) = .empty;
+    defer down_buf.deinit(allocator);
+    const dw = down_buf.writer(allocator);
+    dw.writeAll("{\"type\":\"keyDown\",\"key\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(dw, key_name) catch return respondErr(allocator, "write error");
+    if (is_printable) {
+        dw.writeAll(",\"text\":") catch {};
+        cdp.writeJsonString(dw, key_name) catch {};
+    }
+    dw.writeByte('}') catch {};
+
+    const down_params = down_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(down_params);
+
+    const cmd1 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", down_params, session_id) catch
         return respondErr(allocator, "cmd error");
     defer allocator.free(cmd1);
     ws.sendText(cmd1) catch {};
 
-    const params_up = std.fmt.bufPrint(&buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{key_name}) catch
-        return respondErr(allocator, "key too long");
+    var up_buf: std.ArrayList(u8) = .empty;
+    defer up_buf.deinit(allocator);
+    const uw = up_buf.writer(allocator);
+    uw.writeAll("{\"type\":\"keyUp\",\"key\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(uw, key_name) catch {};
+    uw.writeByte('}') catch {};
 
-    const cmd2 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params_up, session_id) catch
+    const up_params = up_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(up_params);
+
+    const cmd2 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", up_params, session_id) catch
         return respondErr(allocator, "cmd error");
     defer allocator.free(cmd2);
     ws.sendText(cmd2) catch {};
