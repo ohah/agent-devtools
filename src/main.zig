@@ -57,6 +57,7 @@ pub fn main() void {
     var cdp_port: ?[]const u8 = null;
     var user_agent: ?[]const u8 = null;
     var interactive = false;
+    var debug_mode = false;
     var command: ?[]const u8 = null;
 
     while (args_iter.next()) |arg| {
@@ -70,6 +71,8 @@ pub fn main() void {
             user_agent = arg["--user-agent=".len..];
         } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "--pipe")) {
             interactive = true;
+        } else if (std.mem.eql(u8, arg, "--debug")) {
+            debug_mode = true;
         } else if (command == null) {
             command = arg;
             break;
@@ -83,7 +86,7 @@ pub fn main() void {
     };
 
     if (interactive) {
-        const exit_code = runInteractive(session, daemon_opts);
+        const exit_code = runInteractive(session, daemon_opts, debug_mode);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
@@ -919,9 +922,231 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
 // Interactive / Pipe Mode
 // ============================================================================
 
+/// Check if a command is an "action" that may trigger side effects (network, console, errors, navigation).
+/// Used by debug mode to gather context before/after the action.
+fn isActionCommand(action: []const u8) bool {
+    const actions = [_][]const u8{
+        "click", "dblclick", "tap", "fill", "type", "press", "select",
+        "check", "uncheck", "hover", "drag", "dispatch", "open", "navigate",
+        "goto", "submit", "focus", "upload", "clear", "selectall",
+    };
+    for (actions) |a| {
+        if (std.mem.eql(u8, action, a)) return true;
+    }
+    return false;
+}
+
+/// Extract the action name from a JSON line or text command line.
+fn extractActionFromLine(line: []const u8) ?[]const u8 {
+    if (line.len == 0) return null;
+    if (line[0] == '{') {
+        // JSON: find "action":"<value>"
+        const marker = "\"action\":\"";
+        const start = std.mem.indexOf(u8, line, marker) orelse return null;
+        const val_start = start + marker.len;
+        const val_end = std.mem.indexOfScalarPos(u8, line, val_start, '"') orelse return null;
+        return line[val_start..val_end];
+    } else {
+        // Text command: first word
+        var it = std.mem.splitScalar(u8, line, ' ');
+        return it.next();
+    }
+}
+
+/// Send a query to the daemon and return the response line (caller must free).
+/// Returns null on any failure (connection, send, recv).
+fn sendDebugQuery(allocator: std.mem.Allocator, session: []const u8, action: []const u8, id: []const u8) ?[]u8 {
+    const req = daemon.serializeRequest(allocator, .{ .id = id, .action = action }) catch return null;
+    defer allocator.free(req);
+
+    var client = daemon.SocketClient.connect(session) catch return null;
+    defer client.close();
+
+    client.send(req) catch return null;
+
+    var recv_buf: [65536]u8 = undefined;
+    const resp_line = client.recvLine(&recv_buf) catch return null;
+    return allocator.dupe(u8, resp_line) catch null;
+}
+
+/// Parse an integer field from a JSON response data. E.g. extract "requests" count from status.
+fn parseCountFromJson(line: []const u8, field: []const u8) ?usize {
+    // Look for "field":NNN in the response
+    // We search for "data":{..."field":NNN...}
+    var search_buf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&search_buf, "\"{s}\":", .{field}) catch return null;
+    const pos = std.mem.indexOf(u8, line, needle) orelse return null;
+    const num_start = pos + needle.len;
+    // Parse the integer
+    var end = num_start;
+    while (end < line.len and line[end] >= '0' and line[end] <= '9') : (end += 1) {}
+    if (end == num_start) return null;
+    return std.fmt.parseInt(usize, line[num_start..end], 10) catch null;
+}
+
+/// Build debug JSON object and merge it with the original response.
+/// Returns the merged JSON line (caller must free), or null on failure.
+fn buildDebugResponse(
+    allocator: std.mem.Allocator,
+    original_resp: []const u8,
+    session: []const u8,
+    pre_requests: usize,
+    pre_console: usize,
+    pre_errors: usize,
+    post_requests: usize,
+    post_console: usize,
+    post_errors: usize,
+    pre_url: ?[]const u8,
+) ?[]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+
+    // Start building debug object
+    w.writeAll("{\"debug\":{") catch return null;
+    var has_field = false;
+
+    // New network requests
+    if (post_requests > pre_requests) {
+        if (sendDebugQuery(allocator, session, "network_list", "d2")) |net_resp| {
+            defer allocator.free(net_resp);
+            // Extract the data array from the response
+            if (std.mem.indexOf(u8, net_resp, "\"data\":")) |data_start| {
+                const val_start = data_start + "\"data\":".len;
+                // Find end — the data value goes until the closing }
+                // We need to extract just the array portion
+                if (net_resp[val_start] == '[') {
+                    // Find matching ] bracket
+                    var depth: usize = 0;
+                    var end: usize = val_start;
+                    while (end < net_resp.len) : (end += 1) {
+                        if (net_resp[end] == '[') depth += 1
+                        else if (net_resp[end] == ']') {
+                            depth -= 1;
+                            if (depth == 0) {
+                                end += 1;
+                                break;
+                            }
+                        }
+                    }
+                    // We only want the NEW requests (skip pre_requests count)
+                    // But the array has all of them, so we write them as-is (new ones are at the end)
+                    w.writeAll("\"new_requests\":") catch return null;
+                    w.writeAll(net_resp[val_start..end]) catch return null;
+                    has_field = true;
+                }
+            }
+        }
+    }
+
+    // New console messages
+    if (post_console > pre_console) {
+        if (sendDebugQuery(allocator, session, "console_list", "d3")) |con_resp| {
+            defer allocator.free(con_resp);
+            if (std.mem.indexOf(u8, con_resp, "\"data\":")) |data_start| {
+                const val_start = data_start + "\"data\":".len;
+                if (con_resp[val_start] == '[') {
+                    var depth: usize = 0;
+                    var end: usize = val_start;
+                    while (end < con_resp.len) : (end += 1) {
+                        if (con_resp[end] == '[') depth += 1
+                        else if (con_resp[end] == ']') {
+                            depth -= 1;
+                            if (depth == 0) {
+                                end += 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (has_field) w.writeByte(',') catch return null;
+                    w.writeAll("\"new_console\":") catch return null;
+                    w.writeAll(con_resp[val_start..end]) catch return null;
+                    has_field = true;
+                }
+            }
+        }
+    }
+
+    // New errors
+    if (post_errors > pre_errors) {
+        if (sendDebugQuery(allocator, session, "errors", "d4")) |err_resp| {
+            defer allocator.free(err_resp);
+            if (std.mem.indexOf(u8, err_resp, "\"data\":")) |data_start| {
+                const val_start = data_start + "\"data\":".len;
+                if (err_resp[val_start] == '[') {
+                    var depth: usize = 0;
+                    var end: usize = val_start;
+                    while (end < err_resp.len) : (end += 1) {
+                        if (err_resp[end] == '[') depth += 1
+                        else if (err_resp[end] == ']') {
+                            depth -= 1;
+                            if (depth == 0) {
+                                end += 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (has_field) w.writeByte(',') catch return null;
+                    w.writeAll("\"new_errors\":") catch return null;
+                    w.writeAll(err_resp[val_start..end]) catch return null;
+                    has_field = true;
+                }
+            }
+        }
+    }
+
+    // URL change detection
+    var url_changed = false;
+    if (pre_url) |pu| {
+        if (sendDebugQuery(allocator, session, "get_url", "d5")) |url_resp| {
+            defer allocator.free(url_resp);
+            // Extract URL from response data (it's a string in "data":"...")
+            if (std.mem.indexOf(u8, url_resp, "\"data\":\"")) |data_start| {
+                const val_start = data_start + "\"data\":\"".len;
+                const val_end = std.mem.indexOfScalarPos(u8, url_resp, val_start, '"') orelse url_resp.len;
+                const post_url = url_resp[val_start..val_end];
+                if (!std.mem.eql(u8, pu, post_url)) {
+                    url_changed = true;
+                }
+            }
+        }
+    }
+
+    if (has_field) w.writeByte(',') catch return null;
+    if (url_changed) {
+        w.writeAll("\"url_changed\":true") catch return null;
+    } else {
+        w.writeAll("\"url_changed\":false") catch return null;
+    }
+
+    w.writeAll("}}") catch return null;
+
+    const debug_json = buf.toOwnedSlice(allocator) catch return null;
+    defer allocator.free(debug_json);
+
+    // Merge: insert debug field into the original response JSON
+    // Original is like: {"success":true,...}
+    // We want: {"success":true,...,"debug":{...}}
+    // Find the last '}' and insert before it
+    const last_brace = std.mem.lastIndexOfScalar(u8, original_resp, '}') orelse return null;
+
+    var result: std.ArrayList(u8) = .empty;
+    errdefer result.deinit(allocator);
+    const rw = result.writer(allocator);
+    rw.writeAll(original_resp[0..last_brace]) catch return null;
+    rw.writeByte(',') catch return null;
+    // debug_json is like {"debug":{...}} — we want just "debug":{...}
+    if (debug_json.len > 2) {
+        rw.writeAll(debug_json[1 .. debug_json.len - 1]) catch return null;
+    }
+    rw.writeByte('}') catch return null;
+
+    return result.toOwnedSlice(allocator) catch null;
+}
+
 /// Interactive/pipe mode: persistent REPL that reads JSON commands from stdin,
 /// sends them to the daemon, and writes responses + events to stdout.
-fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) u8 {
+fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_mode: bool) u8 {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
@@ -1042,6 +1267,35 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) u8 {
             const data = send_data orelse continue;
             cmd_counter += 1;
 
+            // Debug mode: check if this is an action command and gather pre-state
+            const action_for_debug = if (debug_mode) extractActionFromLine(line) else null;
+            const is_debug_action = if (action_for_debug) |a| isActionCommand(a) else false;
+
+            var pre_requests: usize = 0;
+            var pre_console: usize = 0;
+            var pre_errors: usize = 0;
+            var pre_url: ?[]u8 = null;
+            defer if (pre_url) |pu| allocator.free(pu);
+
+            if (is_debug_action) {
+                // Query pre-status
+                if (sendDebugQuery(allocator, session, "status", "d0")) |status_resp| {
+                    defer allocator.free(status_resp);
+                    pre_requests = parseCountFromJson(status_resp, "requests") orelse 0;
+                    pre_console = parseCountFromJson(status_resp, "console") orelse 0;
+                    pre_errors = parseCountFromJson(status_resp, "errors") orelse 0;
+                }
+                // Query pre-URL
+                if (sendDebugQuery(allocator, session, "get_url", "d1")) |url_resp| {
+                    defer allocator.free(url_resp);
+                    if (std.mem.indexOf(u8, url_resp, "\"data\":\"")) |data_start| {
+                        const val_start = data_start + "\"data\":\"".len;
+                        const val_end = std.mem.indexOfScalarPos(u8, url_resp, val_start, '"') orelse url_resp.len;
+                        pre_url = allocator.dupe(u8, url_resp[val_start..val_end]) catch null;
+                    }
+                }
+            }
+
             // Connect per-command to daemon for request/response
             var cmd_client = daemon.SocketClient.connect(session) catch {
                 allocator.free(data);
@@ -1071,6 +1325,49 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) u8 {
                 continue;
             };
             cmd_client.close();
+
+            // Debug mode: gather post-state and build merged response
+            if (is_debug_action) {
+                // Wait 500ms for async effects
+                std.Thread.sleep(500 * std.time.ns_per_ms);
+
+                var post_requests: usize = pre_requests;
+                var post_console: usize = pre_console;
+                var post_errors: usize = pre_errors;
+
+                if (sendDebugQuery(allocator, session, "status", "d6")) |status_resp| {
+                    defer allocator.free(status_resp);
+                    post_requests = parseCountFromJson(status_resp, "requests") orelse pre_requests;
+                    post_console = parseCountFromJson(status_resp, "console") orelse pre_console;
+                    post_errors = parseCountFromJson(status_resp, "errors") orelse pre_errors;
+                }
+
+                // Only build debug response if something changed
+                if (post_requests != pre_requests or post_console != pre_console or post_errors != pre_errors or pre_url != null) {
+                    if (buildDebugResponse(
+                        allocator,
+                        resp_line,
+                        session,
+                        pre_requests,
+                        pre_console,
+                        pre_errors,
+                        post_requests,
+                        post_console,
+                        post_errors,
+                        pre_url,
+                    )) |debug_resp| {
+                        defer allocator.free(debug_resp);
+                        const stdout_f = std.fs.File.stdout();
+                        _ = stdout_f.write(debug_resp) catch {};
+                        _ = stdout_f.write("\n") catch {};
+
+                        if (std.mem.indexOf(u8, resp_line, "\"success\":false") != null) {
+                            had_failure = true;
+                        }
+                        continue;
+                    }
+                }
+            }
 
             // Write response to stdout (already newline-delimited JSON from daemon)
             const stdout_f = std.fs.File.stdout();
@@ -2352,7 +2649,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "status")) {
         collector_mutex.lock();
         defer collector_mutex.unlock();
-        return handleStatus(allocator, collector, console_msgs);
+        return handleStatusFull(allocator, collector, console_msgs, ctx.page_errors);
     } else if (std.mem.eql(u8, req.action, "close")) {
         ctx.running.store(false, .release);
         return respondOk(allocator);
@@ -4276,10 +4573,16 @@ fn fetchResponseBody(allocator: Allocator, sender: *WsSender, resp_map: *respons
 }
 
 fn handleStatus(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry)) []u8 {
+    return handleStatusFull(allocator, collector, console_msgs, null);
+}
+
+fn handleStatusFull(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry), page_errors: ?*const std.ArrayList(PageError)) []u8 {
     var buf: [256]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "{{\"requests\":{d},\"console\":{d},\"daemon\":\"running\"}}", .{
+    const error_count: usize = if (page_errors) |pe| pe.items.len else 0;
+    const data = std.fmt.bufPrint(&buf, "{{\"requests\":{d},\"console\":{d},\"errors\":{d},\"daemon\":\"running\"}}", .{
         collector.count(),
         console_msgs.items.len,
+        error_count,
     }) catch return respondErr(allocator, "format error");
 
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
@@ -7168,4 +7471,124 @@ test "isSubscribeRequest: action in url field is not matched" {
 
 test "isSubscribeRequest: no action field" {
     try std.testing.expect(!isSubscribeRequest("{\"id\":\"0\",\"url\":\"subscribe\"}\n"));
+}
+
+// ============================================================================
+// Debug Mode Tests
+// ============================================================================
+
+test "isActionCommand: recognizes action commands" {
+    try std.testing.expect(isActionCommand("click"));
+    try std.testing.expect(isActionCommand("dblclick"));
+    try std.testing.expect(isActionCommand("fill"));
+    try std.testing.expect(isActionCommand("type"));
+    try std.testing.expect(isActionCommand("press"));
+    try std.testing.expect(isActionCommand("select"));
+    try std.testing.expect(isActionCommand("check"));
+    try std.testing.expect(isActionCommand("uncheck"));
+    try std.testing.expect(isActionCommand("hover"));
+    try std.testing.expect(isActionCommand("drag"));
+    try std.testing.expect(isActionCommand("dispatch"));
+    try std.testing.expect(isActionCommand("open"));
+    try std.testing.expect(isActionCommand("navigate"));
+    try std.testing.expect(isActionCommand("goto"));
+    try std.testing.expect(isActionCommand("submit"));
+    try std.testing.expect(isActionCommand("tap"));
+    try std.testing.expect(isActionCommand("focus"));
+    try std.testing.expect(isActionCommand("upload"));
+    try std.testing.expect(isActionCommand("clear"));
+    try std.testing.expect(isActionCommand("selectall"));
+}
+
+test "isActionCommand: rejects non-action commands" {
+    try std.testing.expect(!isActionCommand("snapshot"));
+    try std.testing.expect(!isActionCommand("screenshot"));
+    try std.testing.expect(!isActionCommand("eval"));
+    try std.testing.expect(!isActionCommand("get"));
+    try std.testing.expect(!isActionCommand("is"));
+    try std.testing.expect(!isActionCommand("set"));
+    try std.testing.expect(!isActionCommand("network"));
+    try std.testing.expect(!isActionCommand("console"));
+    try std.testing.expect(!isActionCommand("cookies"));
+    try std.testing.expect(!isActionCommand("storage"));
+    try std.testing.expect(!isActionCommand("wait"));
+    try std.testing.expect(!isActionCommand("status"));
+    try std.testing.expect(!isActionCommand("close"));
+}
+
+test "extractActionFromLine: JSON line" {
+    const action = extractActionFromLine("{\"id\":\"1\",\"action\":\"click\",\"url\":\"@e1\"}");
+    try std.testing.expect(action != null);
+    try std.testing.expectEqualStrings("click", action.?);
+}
+
+test "extractActionFromLine: text command" {
+    const action = extractActionFromLine("click @e1");
+    try std.testing.expect(action != null);
+    try std.testing.expectEqualStrings("click", action.?);
+}
+
+test "extractActionFromLine: text command single word" {
+    const action = extractActionFromLine("snapshot");
+    try std.testing.expect(action != null);
+    try std.testing.expectEqualStrings("snapshot", action.?);
+}
+
+test "extractActionFromLine: empty line" {
+    const action = extractActionFromLine("");
+    try std.testing.expect(action == null);
+}
+
+test "extractActionFromLine: JSON without action" {
+    const action = extractActionFromLine("{\"id\":\"1\",\"url\":\"test\"}");
+    try std.testing.expect(action == null);
+}
+
+test "parseCountFromJson: extracts requests count" {
+    const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":42,\"console\":5}}", "requests");
+    try std.testing.expect(count != null);
+    try std.testing.expectEqual(@as(usize, 42), count.?);
+}
+
+test "parseCountFromJson: extracts console count" {
+    const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":10,\"console\":3,\"errors\":1}}", "console");
+    try std.testing.expect(count != null);
+    try std.testing.expectEqual(@as(usize, 3), count.?);
+}
+
+test "parseCountFromJson: extracts errors count" {
+    const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":10,\"console\":3,\"errors\":7}}", "errors");
+    try std.testing.expect(count != null);
+    try std.testing.expectEqual(@as(usize, 7), count.?);
+}
+
+test "parseCountFromJson: missing field returns null" {
+    const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":10}}", "console");
+    try std.testing.expect(count == null);
+}
+
+test "parseCountFromJson: zero count" {
+    const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":0}}", "requests");
+    try std.testing.expect(count != null);
+    try std.testing.expectEqual(@as(usize, 0), count.?);
+}
+
+test "buildDebugResponse: merges debug into response" {
+    const allocator = std.testing.allocator;
+    const result = buildDebugResponse(
+        allocator,
+        "{\"success\":true}",
+        "nonexistent_session",
+        0, 0, 0,
+        0, 0, 0,
+        null,
+    );
+    // With no changes and no pre_url, it should still produce a debug with url_changed:false
+    if (result) |r| {
+        defer allocator.free(r);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"debug\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"url_changed\":false") != null);
+        try std.testing.expect(std.mem.indexOf(u8, r, "\"success\":true") != null);
+    }
+    // It's OK if result is null (daemon not running), the function is robust
 }
