@@ -11,11 +11,12 @@ const network_mod = @import("network.zig");
 
 pub const Endpoint = struct {
     method: []const u8,
-    path_pattern: []const u8, // e.g. "/api/users/{id}"
+    path_pattern: []const u8, // e.g. "/api/users/{userId}"
     example_url: []const u8,
     status: ?i64,
     mime_type: []const u8,
     count: usize,
+    response_schema: ?[]const u8, // JSON schema string, null if not JSON or not fetched
 };
 
 pub const AnalysisResult = struct {
@@ -31,6 +32,7 @@ pub const AnalysisResult = struct {
             self.allocator.free(ep.example_url);
             self.allocator.free(ep.method);
             self.allocator.free(ep.mime_type);
+            if (ep.response_schema) |s| self.allocator.free(s);
         }
         self.allocator.free(self.endpoints);
         self.allocator.free(self.base_url);
@@ -302,6 +304,7 @@ pub fn analyzeRequests(allocator: Allocator, collector: *const network_mod.Colle
             .status = accum.last_status,
             .mime_type = mime_type,
             .count = accum.count,
+            .response_schema = null, // Set later by enrichWithResponseBodies
         }) catch {
             allocator.free(method);
             allocator.free(path_pattern);
@@ -327,6 +330,53 @@ const EndpointAccum = struct {
     mime_type: []const u8,
     count: usize,
 };
+
+/// Infer a JSON schema from a JSON string.
+/// Returns a simplified schema description like:
+///   {"type":"object","properties":{"id":"number","name":"string","items":"array"}}
+pub fn inferJsonSchema(allocator: Allocator, json_body: []const u8) ?[]u8 {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch return null;
+    defer parsed.deinit();
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    inferSchemaValue(allocator, buf.writer(allocator), parsed.value) catch return null;
+
+    return buf.toOwnedSlice(allocator) catch null;
+}
+
+fn inferSchemaValue(allocator: Allocator, writer: anytype, value: std.json.Value) !void {
+    switch (value) {
+        .null => try writer.writeAll("{\"type\":\"null\"}"),
+        .bool => try writer.writeAll("{\"type\":\"boolean\"}"),
+        .integer => try writer.writeAll("{\"type\":\"integer\"}"),
+        .float => try writer.writeAll("{\"type\":\"number\"}"),
+        .number_string => try writer.writeAll("{\"type\":\"number\"}"),
+        .string => try writer.writeAll("{\"type\":\"string\"}"),
+        .array => |arr| {
+            try writer.writeAll("{\"type\":\"array\"");
+            if (arr.items.len > 0) {
+                try writer.writeAll(",\"items\":");
+                try inferSchemaValue(allocator, writer, arr.items[0]);
+            }
+            try writer.writeByte('}');
+        },
+        .object => |obj| {
+            try writer.writeAll("{\"type\":\"object\",\"properties\":{");
+            var it = obj.iterator();
+            var first = true;
+            while (it.next()) |entry| {
+                if (!first) try writer.writeByte(',');
+                first = false;
+                try cdp.writeJsonString(writer, entry.key_ptr.*);
+                try writer.writeByte(':');
+                try inferSchemaValue(allocator, writer, entry.value_ptr.*);
+            }
+            try writer.writeAll("}}");
+        },
+    }
+}
 
 /// Serialize analysis result to JSON.
 pub fn serializeResult(allocator: Allocator, result: *const AnalysisResult) ![]u8 {
@@ -360,6 +410,10 @@ pub fn serializeResult(allocator: Allocator, result: *const AnalysisResult) ![]u
         try cdp.writeJsonString(writer, ep.mime_type);
         try writer.writeAll(",\"count\":");
         try std.fmt.format(writer, "{d}", .{ep.count});
+        if (ep.response_schema) |schema| {
+            try writer.writeAll(",\"responseSchema\":");
+            try writer.writeAll(schema); // Already JSON
+        }
         try writer.writeByte('}');
     }
 
@@ -529,4 +583,65 @@ test "serializeResult: empty" {
     try testing.expect(parsed.value == .object);
 
     _ = &result;
+}
+
+test "inferJsonSchema: simple object" {
+    const schema = inferJsonSchema(testing.allocator,
+        \\{"id":1,"name":"test","active":true}
+    ).?;
+    defer testing.allocator.free(schema);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"type\":\"object\"") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"id\":{\"type\":\"integer\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"name\":{\"type\":\"string\"}") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"active\":{\"type\":\"boolean\"}") != null);
+}
+
+test "inferJsonSchema: array of objects" {
+    const schema = inferJsonSchema(testing.allocator,
+        \\[{"id":1,"title":"post"}]
+    ).?;
+    defer testing.allocator.free(schema);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"type\":\"array\"") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"items\":{\"type\":\"object\"") != null);
+}
+
+test "inferJsonSchema: nested object" {
+    const schema = inferJsonSchema(testing.allocator,
+        \\{"user":{"id":1,"name":"test"},"count":5}
+    ).?;
+    defer testing.allocator.free(schema);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"user\":{\"type\":\"object\"") != null);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"count\":{\"type\":\"integer\"}") != null);
+}
+
+test "inferJsonSchema: null value" {
+    const schema = inferJsonSchema(testing.allocator,
+        \\{"data":null}
+    ).?;
+    defer testing.allocator.free(schema);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"data\":{\"type\":\"null\"}") != null);
+}
+
+test "inferJsonSchema: number (float)" {
+    const schema = inferJsonSchema(testing.allocator,
+        \\{"price":9.99}
+    ).?;
+    defer testing.allocator.free(schema);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"price\":{\"type\":\"number\"}") != null);
+}
+
+test "inferJsonSchema: empty array" {
+    const schema = inferJsonSchema(testing.allocator, "[]").?;
+    defer testing.allocator.free(schema);
+    try testing.expect(std.mem.indexOf(u8, schema, "\"type\":\"array\"") != null);
+}
+
+test "inferJsonSchema: invalid JSON returns null" {
+    try testing.expect(inferJsonSchema(testing.allocator, "not json") == null);
+}
+
+test "inferJsonSchema: string value" {
+    const schema = inferJsonSchema(testing.allocator, "\"hello\"").?;
+    defer testing.allocator.free(schema);
+    try testing.expectEqualStrings("{\"type\":\"string\"}", schema);
 }

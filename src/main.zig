@@ -548,7 +548,7 @@ fn handleCommand(
         console_msgs.clearRetainingCapacity();
         return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "analyze")) {
-        return handleAnalyze(allocator, collector);
+        return handleAnalyze(allocator, ws, cmd_id, session_id, collector);
     } else if (std.mem.eql(u8, req.action, "status")) {
         return handleStatus(allocator, collector, console_msgs);
     } else if (std.mem.eql(u8, req.action, "close")) {
@@ -741,10 +741,29 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
         respondErr(allocator, "serialize error");
 }
 
-fn handleAnalyze(allocator: Allocator, collector: *const network.Collector) []u8 {
+fn handleAnalyze(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, collector: *network.Collector) []u8 {
     var result = analyzer.analyzeRequests(allocator, collector) catch
         return respondErr(allocator, "analysis failed");
     defer result.deinit();
+
+    // Enrich endpoints with response body schema
+    for (result.endpoints) |*ep| {
+        if (!std.mem.startsWith(u8, ep.mime_type, "application/json")) continue;
+
+        // Find the requestId for this endpoint's example URL
+        var req_it = collector.requests.iterator();
+        while (req_it.next()) |entry| {
+            const info = entry.value_ptr.info;
+            if (std.mem.eql(u8, info.url, ep.example_url)) {
+                // Fetch response body
+                if (fetchResponseBody(allocator, ws, cmd_id, session_id, info.request_id, collector)) |body| {
+                    defer allocator.free(body);
+                    ep.response_schema = analyzer.inferJsonSchema(allocator, body);
+                }
+                break;
+            }
+        }
+    }
 
     const data = analyzer.serializeResult(allocator, &result) catch
         return respondErr(allocator, "serialize failed");
@@ -752,6 +771,44 @@ fn handleAnalyze(allocator: Allocator, collector: *const network.Collector) []u8
 
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
         respondErr(allocator, "response failed");
+}
+
+/// Fetch response body for a request via CDP. Returns owned slice or null.
+fn fetchResponseBody(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, request_id: []const u8, collector: *network.Collector) ?[]u8 {
+    const get_body_cmd = cdp.networkGetResponseBody(allocator, cmd_id.next(), request_id, session_id) catch return null;
+    defer allocator.free(get_body_cmd);
+
+    ws.sendText(get_body_cmd) catch return null;
+
+    ws.setReadTimeout(3000);
+    defer ws.setReadTimeout(100);
+
+    for (0..20) |_| {
+        const msg = ws.recvMessage() catch return null;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| {
+                    _ = collector.processEvent(method, params) catch {};
+                }
+            }
+            continue;
+        }
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |res| {
+                if (cdp.getString(res, "body")) |b| {
+                    return allocator.dupe(u8, b) catch null;
+                }
+            }
+            return null;
+        }
+    }
+    return null;
 }
 
 fn handleStatus(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry)) []u8 {
