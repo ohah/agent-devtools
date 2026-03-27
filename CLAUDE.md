@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 329개 (`zig build test`)
+- **테스트**: 339개 (`zig build test`)
 
 ## Architecture
 
@@ -93,8 +93,26 @@ Browser DevTools CLI for AI agents, built with Zig.
 - `--headed` — 브라우저 창 표시 옵션
 - `--port=PORT` — 기존 Chrome 연결 (/json/version discovery)
 
+### ✅ Snapshot + 페이지 조작
+- AX 트리 스냅샷 (Accessibility.getFullAXTree) + @ref 자동 할당
+- Interactive roles: button, link, textbox, checkbox 등 17개
+- Content roles: heading, cell, listitem 등 10개
+- `snapshot [-i]` — AX 트리 출력 (interactive-only 옵션)
+- `click @ref` — @ref → 좌표 → mousePressed + mouseReleased
+- `fill @ref "text"` — focus → selectAll → insertText
+- `type @ref "text"` — fill과 동일
+- `press <key>` — keyDown + keyUp
+- `hover @ref` — mouseMoved
+
+### ✅ 기본 명령어
+- `screenshot [path]` — Page.captureScreenshot → PNG 저장
+- `eval <expression>` — Runtime.evaluate
+- `get url` / `get title` — 페이지 정보
+- `back` / `forward` / `reload` — 네비게이션
+- `wait <ms>` — 대기
+
 ### ⬜ 추가 계획
-- 기본 명령어: screenshot, eval, back/forward/reload, get url/title, wait
+- scroll, select, drag, upload 등 추가 조작
 - Collector 용량 제한 (LRU eviction)
 - console.zig 분리 (main.zig에서 독립 모듈로)
 - OpenAPI YAML 출력 (현재 JSON, YAML은 외부 도구로 변환 가능)
@@ -116,6 +134,7 @@ src/
 ├── analyzer.zig      # API 엔드포인트 분석 + JSON 스키마 추론 (isApiRequest, pathToPattern, inferJsonSchema)
 ├── interceptor.zig   # 네트워크 인터셉트 (InterceptorState, matchPattern, Rule)
 ├── recorder.zig      # 플로우 녹화/재생/비교 (saveRecording, loadRecording, diffRequests)
+├── snapshot.zig      # AX 트리 스냅샷 + @ref 시스템 + 페이지 조작 CDP 명령
 └── root.zig          # 모듈 루트
 
 docs/
@@ -129,7 +148,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 사용 (`test` 블록, 소스 파일 내 작성)
-- `zig build test`로 전체 실행 (현재 329개)
+- `zig build test`로 전체 실행 (현재 339개)
 - 유닛: WebSocket 프레임, CDP 메시지, 네트워크 필터링, 데몬 프로토콜, API 분석, 인터셉트 매칭, 플로우 비교, RemoteObject 변환
 - 통합: 실제 Chrome 스폰 + CDP 연결 (E2E 동작 확인)
 
@@ -146,6 +165,7 @@ reference/            # 참조 코드 (gitignored)
 | interceptor.zig | 12 | matchPattern, InterceptorState add/remove/find, buildFetchPatterns |
 | network.zig | 11 | Collector lifecycle, filterByUrl, formatRequestLine |
 | recorder.zig | 7 | saveRecording, loadRecording, diffRequests, serializeDiff |
+| snapshot.zig | 10 | RefMap, buildSnapshot, extractBoxCenter, isInteractiveRole |
 | root.zig | 1 | 모듈 참조 |
 
 ### 테스트 작성 원칙
@@ -166,7 +186,7 @@ reference/            # 참조 코드 (gitignored)
 ```bash
 zig build              # 빌드
 zig build run          # 실행
-zig build test         # 테스트 (329개)
+zig build test         # 테스트 (339개)
 ./zig-out/bin/agent-devtools   # 직접 실행
 ```
 
@@ -175,7 +195,25 @@ zig build test         # 테스트 (329개)
 ```bash
 # Navigation
 agent-devtools open <url>                          # 페이지 열기 (데몬 자동 시작)
+agent-devtools back                                # 뒤로 가기
+agent-devtools forward                             # 앞으로 가기
+agent-devtools reload                              # 새로고침
 agent-devtools close                               # 브라우저 + 데몬 종료
+
+# Snapshot + Interaction
+agent-devtools snapshot [-i]                       # AX 트리 스냅샷 (-i: interactive only)
+agent-devtools click @ref                          # 요소 클릭
+agent-devtools fill @ref "text"                    # 입력 필드에 텍스트 입력
+agent-devtools type @ref "text"                    # 텍스트 타이핑
+agent-devtools press <key>                         # 키 입력 (Enter, Tab 등)
+agent-devtools hover @ref                          # 요소 호버
+
+# Info
+agent-devtools get url                             # 현재 URL
+agent-devtools get title                           # 페이지 제목
+agent-devtools eval <expression>                   # JS 실행
+agent-devtools screenshot [path]                   # 스크린샷
+agent-devtools wait <ms>                           # 대기
 
 # Network
 agent-devtools network list [pattern]              # 네트워크 요청 목록 (URL 필터)
@@ -215,10 +253,10 @@ agent-devtools --help / --version                  # 도움말 / 버전
 ### 구현 예정
 
 ```bash
-agent-devtools screenshot [path]                   # 스크린샷
-agent-devtools eval <expression>                   # JS 실행
-agent-devtools back / forward / reload             # 네비게이션
-agent-devtools get url / get title                 # 페이지 정보
-agent-devtools wait <ms>                           # 대기
+agent-devtools scroll <direction> [px]             # 스크롤
+agent-devtools select @ref "value"                 # 드롭다운 선택
+agent-devtools check/uncheck @ref                  # 체크박스
+agent-devtools upload @ref <file>                  # 파일 업로드
+agent-devtools drag @ref1 @ref2                    # 드래그 앤 드롭
 agent-devtools replay <name>                       # record + open + diff 자동화
 ```
