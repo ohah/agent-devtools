@@ -10,13 +10,11 @@ const Allocator = std.mem.Allocator;
 const version = "0.1.0";
 
 pub fn main() void {
-    // Daemon mode: same binary, triggered by env var
     if (std.posix.getenv("AGENT_DEVTOOLS_DAEMON")) |_| {
         runDaemon();
         return;
     }
 
-    // CLI mode
     var args_iter = std.process.args();
     _ = args_iter.next();
 
@@ -188,7 +186,6 @@ fn runDaemon() void {
     var session_id: ?[]u8 = null;
     defer if (session_id) |s| allocator.free(s);
 
-    // Get targetId from createTarget response, then attach
     for (0..20) |_| {
         const msg = ws.recvMessage() catch break;
         defer allocator.free(msg);
@@ -209,7 +206,11 @@ fn runDaemon() void {
         }
     }
 
-    // Enable Network on the page session
+    if (session_id == null) {
+        std.debug.print("Daemon: Failed to attach to page target\n", .{});
+        return;
+    }
+
     const net_enable = cdp.networkEnable(allocator, cmd_id.next(), session_id) catch return;
     ws.sendText(net_enable) catch return;
     allocator.free(net_enable);
@@ -238,21 +239,30 @@ fn runDaemon() void {
     // Set read timeout on WebSocket so we can poll for socket clients
     ws.setReadTimeout(100);
 
-    // Main loop: accept CLI connections, process commands, collect network events
-    var running = true;
-    while (running) {
-        // Drain CDP events (non-blocking due to 100ms timeout)
-        drainCdpEvents(&ws, allocator, &collector, session_id);
+    // Set accept timeout once (100ms)
+    const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 };
+    std.posix.setsockopt(server.fd, std.posix.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
-        // Non-blocking accept: use SO_RCVTIMEO on the listening socket
-        const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 }; // 100ms
-        const bytes = std.mem.asBytes(&timeval);
-        std.posix.setsockopt(server.fd, std.posix.SOL.SOCKET, std.c.SO.RCVTIMEO, bytes) catch {};
+    var running = true;
+    var cdp_fail_count: usize = 0;
+
+    while (running) {
+        const drained = drainCdpEvents(&ws, allocator, &collector);
+        if (drained == 0) {
+            cdp_fail_count += 1;
+        } else {
+            cdp_fail_count = 0;
+        }
+
+        // Chrome crash detection: 30 consecutive failures (~3 seconds)
+        if (cdp_fail_count > 30) {
+            std.debug.print("Daemon: Chrome connection lost, shutting down\n", .{});
+            break;
+        }
 
         if (server.accept()) |client_fd| {
             defer std.posix.close(client_fd);
 
-            // Read request
             var req_buf: [4096]u8 = undefined;
             var req_len: usize = 0;
             while (req_len < req_buf.len) {
@@ -263,23 +273,21 @@ fn runDaemon() void {
             }
 
             if (req_len > 0) {
-                const line = req_buf[0..req_len];
-                const resp = handleCommand(allocator, line, &ws, &collector, &cmd_id, session_id, &running);
+                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &cmd_id, session_id, &running);
                 defer allocator.free(resp);
                 _ = std.posix.write(client_fd, resp) catch {};
             }
-        } else |_| {
-            // EAGAIN/EWOULDBLOCK — no client waiting, sleep briefly
-            std.Thread.sleep(50 * std.time.ns_per_ms);
-        }
+        } else |_| {}
     }
 }
 
-fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *network.Collector, session_id: ?[]const u8) void {
-    _ = session_id;
-    for (0..20) |_| {
-        const msg = ws.recvMessage() catch return;
+/// Drain pending CDP events. Returns number of messages processed.
+fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *network.Collector) usize {
+    var count: usize = 0;
+    for (0..50) |_| {
+        const msg = ws.recvMessage() catch return count;
         defer allocator.free(msg);
+        count += 1;
 
         const parsed = cdp.parseMessage(allocator, msg) catch continue;
         defer parsed.parsed.deinit();
@@ -292,6 +300,19 @@ fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *netwo
             }
         }
     }
+    return count;
+}
+
+const error_fallback = "{\"success\":false,\"error\":\"internal error\"}\n";
+
+fn respondOk(allocator: Allocator) []u8 {
+    return daemon.serializeResponse(allocator, .{ .success = true }) catch
+        allocator.dupe(u8, "{\"success\":true}\n") catch @constCast(error_fallback);
+}
+
+fn respondErr(allocator: Allocator, msg: []const u8) []u8 {
+    return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = msg }) catch
+        allocator.dupe(u8, error_fallback) catch @constCast(error_fallback);
 }
 
 fn handleCommand(
@@ -304,8 +325,7 @@ fn handleCommand(
     running: *bool,
 ) []u8 {
     const req = daemon.parseRequest(allocator, line) catch {
-        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Invalid request" }) catch
-            allocator.dupe(u8, "{\"success\":false,\"error\":\"Internal error\"}\n") catch &.{};
+        return respondErr(allocator, "Invalid request");
     };
     defer daemon.freeRequest(allocator, req);
 
@@ -315,44 +335,37 @@ fn handleCommand(
         return handleNetworkList(allocator, collector, req.pattern);
     } else if (std.mem.eql(u8, req.action, "close")) {
         running.* = false;
-        return daemon.serializeResponse(allocator, .{ .success = true }) catch &.{};
+        return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "ping")) {
-        return daemon.serializeResponse(allocator, .{ .success = true }) catch &.{};
+        return respondOk(allocator);
     } else {
-        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Unknown action" }) catch &.{};
+        return respondErr(allocator, "Unknown action");
     }
 }
 
 fn handleOpen(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, url: ?[]const u8) []u8 {
-    const target_url = url orelse {
-        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "url required" }) catch &.{};
-    };
+    const target_url = url orelse return respondErr(allocator, "url required");
 
-    const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), target_url, session_id) catch {
-        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Failed to build navigate command" }) catch &.{};
-    };
+    const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), target_url, session_id) catch
+        return respondErr(allocator, "Failed to build navigate command");
     defer allocator.free(nav_cmd);
 
-    ws.sendText(nav_cmd) catch {
-        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Failed to send navigate" }) catch &.{};
-    };
+    ws.sendText(nav_cmd) catch return respondErr(allocator, "Failed to send navigate");
 
-    return daemon.serializeResponse(allocator, .{ .success = true }) catch &.{};
+    return respondOk(allocator);
 }
 
 fn handleNetworkList(allocator: Allocator, collector: *network.Collector, pattern: ?[]const u8) []u8 {
-    // Build JSON array of requests
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
 
-    writer.writeByte('[') catch return &.{};
+    writer.writeByte('[') catch return respondErr(allocator, "write error");
     var it = collector.requests.iterator();
     var first = true;
     while (it.next()) |entry| {
         const info = entry.value_ptr.info;
 
-        // Apply filter
         if (pattern) |p| {
             if (std.mem.indexOf(u8, info.url, p) == null) continue;
         }
@@ -360,22 +373,28 @@ fn handleNetworkList(allocator: Allocator, collector: *network.Collector, patter
         if (!first) writer.writeByte(',') catch {};
         first = false;
 
-        std.fmt.format(writer, "{{\"url\":\"{s}\",\"method\":\"{s}\",\"status\":{s},\"state\":\"{s}\"}}", .{
-            info.url,
-            info.method,
-            if (info.status) |s| blk: {
-                var num_buf: [8]u8 = undefined;
-                break :blk std.fmt.bufPrint(&num_buf, "{d}", .{s}) catch "null";
-            } else "null",
-            @tagName(info.state),
-        }) catch {};
+        // Use proper JSON escaping for all string values
+        writer.writeAll("{\"url\":") catch {};
+        cdp.writeJsonString(writer, info.url) catch {};
+        writer.writeAll(",\"method\":") catch {};
+        cdp.writeJsonString(writer, info.method) catch {};
+        writer.writeAll(",\"status\":") catch {};
+        if (info.status) |s| {
+            std.fmt.format(writer, "{d}", .{s}) catch {};
+        } else {
+            writer.writeAll("null") catch {};
+        }
+        writer.writeAll(",\"state\":") catch {};
+        cdp.writeJsonString(writer, @tagName(info.state)) catch {};
+        writer.writeByte('}') catch {};
     }
     writer.writeByte(']') catch {};
 
-    const data = buf.toOwnedSlice(allocator) catch return &.{};
+    const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
     defer allocator.free(data);
 
-    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch &.{};
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "serialize error");
 }
 
 // ============================================================================
