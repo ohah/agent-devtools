@@ -55,14 +55,23 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "network")) {
         const subcmd = args_iter.next() orelse "list";
         if (std.mem.eql(u8, subcmd, "list")) {
-            const pattern = args_iter.next();
-            sendAction(session, "network_list", null, pattern);
+            sendAction(session, "network_list", null, args_iter.next());
+        } else if (std.mem.eql(u8, subcmd, "get")) {
+            const req_id = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools network get <requestId>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "network_get", req_id, null);
+        } else if (std.mem.eql(u8, subcmd, "clear")) {
+            sendAction(session, "network_clear", null, null);
         } else if (std.mem.eql(u8, subcmd, "help")) {
             write(
                 \\Usage: agent-devtools network <subcommand>
                 \\
                 \\Subcommands:
-                \\  list [pattern]    List captured network requests (optional URL filter)
+                \\  list [pattern]    List network requests (optional URL filter)
+                \\  get <requestId>   Get request details (headers, body)
+                \\  clear             Clear collected requests
                 \\  help              Show this help
                 \\
             , .{});
@@ -70,6 +79,8 @@ pub fn main() void {
             writeErr("Unknown network subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
         }
+    } else if (std.mem.eql(u8, cmd, "status")) {
+        sendAction(session, "status", null, null);
     } else if (std.mem.eql(u8, cmd, "close")) {
         sendAction(session, "close", null, null);
     } else if (isPlannedCommand(cmd)) {
@@ -243,6 +254,9 @@ fn runDaemon() void {
     const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 };
     std.posix.setsockopt(server.fd, std.posix.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
 
+    // Idle timeout: 10 minutes without CLI commands → auto-shutdown
+    const idle_timeout_ns: i128 = 10 * 60 * std.time.ns_per_s;
+    var last_command_time = std.time.nanoTimestamp();
     var running = true;
     var cdp_fail_count: usize = 0;
 
@@ -254,9 +268,14 @@ fn runDaemon() void {
             cdp_fail_count = 0;
         }
 
-        // Chrome crash detection: 30 consecutive failures (~3 seconds)
         if (cdp_fail_count > 30) {
             std.debug.print("Daemon: Chrome connection lost, shutting down\n", .{});
+            break;
+        }
+
+        // Idle timeout check
+        if (std.time.nanoTimestamp() - last_command_time > idle_timeout_ns) {
+            std.debug.print("Daemon: Idle timeout (10 min), shutting down\n", .{});
             break;
         }
 
@@ -273,6 +292,7 @@ fn runDaemon() void {
             }
 
             if (req_len > 0) {
+                last_command_time = std.time.nanoTimestamp();
                 const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &cmd_id, session_id, &running);
                 defer allocator.free(resp);
                 _ = std.posix.write(client_fd, resp) catch {};
@@ -333,6 +353,14 @@ fn handleCommand(
         return handleOpen(allocator, ws, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "network_list")) {
         return handleNetworkList(allocator, collector, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "network_get")) {
+        return handleNetworkGet(allocator, ws, cmd_id, session_id, collector, req.url);
+    } else if (std.mem.eql(u8, req.action, "network_clear")) {
+        collector.deinit();
+        collector.* = network.Collector.init(allocator);
+        return respondOk(allocator);
+    } else if (std.mem.eql(u8, req.action, "status")) {
+        return handleStatus(allocator, collector);
     } else if (std.mem.eql(u8, req.action, "close")) {
         running.* = false;
         return respondOk(allocator);
@@ -374,7 +402,9 @@ fn handleNetworkList(allocator: Allocator, collector: *network.Collector, patter
         first = false;
 
         // Use proper JSON escaping for all string values
-        writer.writeAll("{\"url\":") catch {};
+        writer.writeAll("{\"requestId\":") catch {};
+        cdp.writeJsonString(writer, info.request_id) catch {};
+        writer.writeAll(",\"url\":") catch {};
         cdp.writeJsonString(writer, info.url) catch {};
         writer.writeAll(",\"method\":") catch {};
         cdp.writeJsonString(writer, info.method) catch {};
@@ -392,6 +422,105 @@ fn handleNetworkList(allocator: Allocator, collector: *network.Collector, patter
 
     const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
     defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "serialize error");
+}
+
+fn handleNetworkGet(
+    allocator: Allocator,
+    ws: *websocket.Client,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    collector: *network.Collector,
+    request_id_opt: ?[]const u8,
+) []u8 {
+    const request_id = request_id_opt orelse return respondErr(allocator, "requestId required (pass as url param)");
+
+    const info = collector.getById(request_id) orelse return respondErr(allocator, "request not found");
+
+    // Fetch response body via CDP
+    const get_body_cmd = cdp.networkGetResponseBody(allocator, cmd_id.next(), request_id, session_id) catch
+        return respondErr(allocator, "failed to build getResponseBody");
+    defer allocator.free(get_body_cmd);
+
+    ws.sendText(get_body_cmd) catch return respondErr(allocator, "failed to send getResponseBody");
+
+    // Wait for response (up to 5 seconds)
+    ws.setReadTimeout(5000);
+    defer ws.setReadTimeout(100);
+
+    var body_owned: ?[]u8 = null;
+    defer if (body_owned) |b| allocator.free(b);
+    var base64_encoded = false;
+
+    for (0..30) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getString(result, "body")) |b| {
+                    body_owned = allocator.dupe(u8, b) catch null;
+                    base64_encoded = cdp.getBool(result, "base64Encoded") orelse false;
+                    break;
+                }
+            }
+            if (parsed.message.isErrorResponse()) break;
+        }
+    }
+
+    const body_str = body_owned orelse "";
+
+    // Build response JSON
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const writer = buf.writer(allocator);
+
+    writer.writeAll("{\"requestId\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(writer, info.request_id) catch {};
+    writer.writeAll(",\"url\":") catch {};
+    cdp.writeJsonString(writer, info.url) catch {};
+    writer.writeAll(",\"method\":") catch {};
+    cdp.writeJsonString(writer, info.method) catch {};
+    writer.writeAll(",\"status\":") catch {};
+    if (info.status) |s| {
+        std.fmt.format(writer, "{d}", .{s}) catch {};
+    } else {
+        writer.writeAll("null") catch {};
+    }
+    writer.writeAll(",\"mimeType\":") catch {};
+    cdp.writeJsonString(writer, info.mime_type) catch {};
+    writer.writeAll(",\"state\":") catch {};
+    cdp.writeJsonString(writer, @tagName(info.state)) catch {};
+    writer.writeAll(",\"body\":") catch {};
+    cdp.writeJsonString(writer, body_str) catch {};
+    writer.writeAll(",\"base64Encoded\":") catch {};
+    writer.writeAll(if (base64_encoded) "true" else "false") catch {};
+    if (info.encoded_data_length) |len| {
+        writer.writeAll(",\"encodedDataLength\":") catch {};
+        std.fmt.format(writer, "{d}", .{len}) catch {};
+    }
+    if (info.error_text.len > 0) {
+        writer.writeAll(",\"errorText\":") catch {};
+        cdp.writeJsonString(writer, info.error_text) catch {};
+    }
+    writer.writeByte('}') catch {};
+
+    const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "serialize error");
+}
+
+fn handleStatus(allocator: Allocator, collector: *const network.Collector) []u8 {
+    var buf: [256]u8 = undefined;
+    const data = std.fmt.bufPrint(&buf, "{{\"requests\":{d},\"daemon\":\"running\"}}", .{collector.count()}) catch
+        return respondErr(allocator, "format error");
 
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
         respondErr(allocator, "serialize error");
@@ -429,6 +558,9 @@ fn printUsage() void {
         \\Commands:
         \\  open <url>              Navigate to URL (starts daemon if needed)
         \\  network list [pattern]  List captured network requests
+        \\  network get <requestId> Get request details with response body
+        \\  network clear           Clear collected requests
+        \\  status                  Show daemon status
         \\  close                   Close browser and stop daemon
         \\  find-chrome             Find Chrome executable on the system
         \\
