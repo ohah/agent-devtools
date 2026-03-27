@@ -83,7 +83,8 @@ pub fn main() void {
     };
 
     if (interactive) {
-        runInteractive(session, daemon_opts);
+        const exit_code = runInteractive(session, daemon_opts);
+        if (exit_code != 0) std.process.exit(exit_code);
         return;
     }
 
@@ -920,7 +921,7 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
 
 /// Interactive/pipe mode: persistent REPL that reads JSON commands from stdin,
 /// sends them to the daemon, and writes responses + events to stdout.
-fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
+fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) u8 {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
@@ -979,6 +980,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
     var line_buf: [65536]u8 = undefined;
     var line_filled: usize = 0;
     var cmd_counter: u64 = 1;
+    var had_failure = false;
 
     while (true) {
         // Read more data from stdin
@@ -1045,6 +1047,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
                 allocator.free(data);
                 const stdout_f = std.fs.File.stdout();
                 _ = stdout_f.write("{\"success\":false,\"error\":\"daemon connection failed\"}\n") catch {};
+                had_failure = true;
                 continue;
             };
 
@@ -1053,6 +1056,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
                 cmd_client.close();
                 const stdout_f = std.fs.File.stdout();
                 _ = stdout_f.write("{\"success\":false,\"error\":\"send failed\"}\n") catch {};
+                had_failure = true;
                 continue;
             };
             allocator.free(data);
@@ -1063,6 +1067,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
                 cmd_client.close();
                 const stdout_f = std.fs.File.stdout();
                 _ = stdout_f.write("{\"success\":false,\"error\":\"read failed\"}\n") catch {};
+                had_failure = true;
                 continue;
             };
             cmd_client.close();
@@ -1071,6 +1076,11 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
             const stdout_f = std.fs.File.stdout();
             _ = stdout_f.write(resp_line) catch {};
             _ = stdout_f.write("\n") catch {};
+
+            // Track failures for exit code
+            if (std.mem.indexOf(u8, resp_line, "\"success\":false") != null) {
+                had_failure = true;
+            }
         }
 
         // Prevent buffer overflow
@@ -1082,6 +1092,8 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions) void {
     // Close event connection — will cause reader thread to exit
     event_client.close();
     reader_handle.join();
+
+    return if (had_failure) 1 else 0;
 }
 
 // ============================================================================
