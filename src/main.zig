@@ -1231,26 +1231,103 @@ fn handleSelectOption(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.
 
 fn handleGetElementProp(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8, action: []const u8) []u8 {
     const ref_id = target orelse return respondErr(allocator, "target required");
-    _ = collector;
 
-    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found");
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found — run 'snapshot -i' first");
     const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
 
-    // Build expression based on action
-    var expr_buf: [256]u8 = undefined;
+    // Step 1: DOM.resolveNode → get objectId
+    var resolve_buf: [128]u8 = undefined;
+    const resolve_params = std.fmt.bufPrint(&resolve_buf, "{{\"backendNodeId\":{d}}}", .{backend_id}) catch
+        return respondErr(allocator, "format error");
+
+    const resolve_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "DOM.resolveNode", resolve_params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(resolve_cmd);
+    ws.sendText(resolve_cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(3000);
+    defer ws.setReadTimeout(100);
+
+    var object_id: ?[]u8 = null;
+    defer if (object_id) |o| allocator.free(o);
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| {
+                    _ = collector.processEvent(method, params) catch {};
+                }
+            }
+            continue;
+        }
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "object")) |obj| {
+                    if (cdp.getString(obj, "objectId")) |oid| {
+                        object_id = allocator.dupe(u8, oid) catch null;
+                    }
+                }
+            }
+            break;
+        }
+    }
+
+    const oid = object_id orelse return respondErr(allocator, "failed to resolve element");
+
+    // Step 2: Runtime.callFunctionOn → get property value
     const prop = if (std.mem.eql(u8, action, "get_text"))
-        "innerText"
+        "function(){return this.innerText||this.textContent||''}"
     else if (std.mem.eql(u8, action, "get_html"))
-        "innerHTML"
+        "function(){return this.innerHTML||''}"
     else
-        "value";
+        "function(){return this.value||''}";
 
-    const expr = std.fmt.bufPrint(&expr_buf,
-        \\(function(){{var r=document.querySelector('[data-backend-node-id="{d}"]');return r?r.{s}:'element not found'}})()
-    , .{ backend_id, prop }) catch return respondErr(allocator, "expr too long");
+    var call_buf: std.ArrayList(u8) = .empty;
+    defer call_buf.deinit(allocator);
+    const cw = call_buf.writer(allocator);
+    cw.writeAll("{\"objectId\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(cw, oid) catch return respondErr(allocator, "write error");
+    cw.writeAll(",\"functionDeclaration\":") catch {};
+    cdp.writeJsonString(cw, prop) catch {};
+    cw.writeAll(",\"returnByValue\":true}") catch {};
 
-    // Reuse handleEval
-    return handleEval(allocator, ws, cmd_id, session_id, @constCast(@as(*const network.Collector, &network.Collector.init(allocator))), expr);
+    const call_params = call_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(call_params);
+
+    const call_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Runtime.callFunctionOn", call_params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(call_cmd);
+    ws.sendText(call_cmd) catch return respondErr(allocator, "send error");
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                if (cdp.getObject(result, "result")) |remote_obj| {
+                    if (cdp.getString(remote_obj, "value")) |v| {
+                        var resp: std.ArrayList(u8) = .empty;
+                        defer resp.deinit(allocator);
+                        cdp.writeJsonString(resp.writer(allocator), v) catch return respondErr(allocator, "write error");
+                        const data = resp.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                        defer allocator.free(data);
+                        return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+                    }
+                }
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "get property timeout");
 }
 
 fn handleScreenshot(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
