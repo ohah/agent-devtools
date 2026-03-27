@@ -237,7 +237,7 @@ fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
 }
 
 /// Write a JSON-escaped string (with quotes) to a writer.
-fn writeJsonString(writer: anytype, s: []const u8) !void {
+pub fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
     for (s) |c| {
         switch (c) {
