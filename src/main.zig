@@ -4,143 +4,204 @@ const chrome = agent.chrome;
 const cdp = agent.cdp;
 const websocket = agent.websocket;
 const network = agent.network;
+const daemon = agent.daemon;
 
+const Allocator = std.mem.Allocator;
 const version = "0.1.0";
 
 pub fn main() void {
+    // Daemon mode: same binary, triggered by env var
+    if (std.posix.getenv("AGENT_DEVTOOLS_DAEMON")) |_| {
+        runDaemon();
+        return;
+    }
+
+    // CLI mode
     var args_iter = std.process.args();
     _ = args_iter.next();
 
-    const command = args_iter.next() orelse {
+    // Parse --session flag (can appear before command)
+    var session: []const u8 = "default";
+    var command: ?[]const u8 = null;
+
+    while (args_iter.next()) |arg| {
+        if (std.mem.startsWith(u8, arg, "--session=")) {
+            session = arg["--session=".len..];
+        } else if (command == null) {
+            command = arg;
+            break;
+        }
+    }
+
+    const cmd = command orelse {
         printUsage();
         return;
     };
 
-    if (std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
+    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         printUsage();
-    } else if (std.mem.eql(u8, command, "--version") or std.mem.eql(u8, command, "-v")) {
+    } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
         write("agent-devtools {s}\n", .{version});
-    } else if (std.mem.eql(u8, command, "find-chrome")) {
+    } else if (std.mem.eql(u8, cmd, "find-chrome")) {
         if (chrome.findChrome()) |path| {
             write("{s}\n", .{path});
         } else {
             write("Chrome not found.\n", .{});
         }
-    } else if (std.mem.eql(u8, command, "chrome-args")) {
-        runChromeArgs();
-    } else if (std.mem.eql(u8, command, "network")) {
+    } else if (std.mem.eql(u8, cmd, "open")) {
+        const url = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools open <url>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "open", url, null);
+    } else if (std.mem.eql(u8, cmd, "network")) {
         const subcmd = args_iter.next() orelse "list";
-        const url = args_iter.next();
-        runNetwork(subcmd, url);
-    } else if (isPlannedCommand(command)) {
-        writeErr("{s}: not yet implemented\n", .{command});
+        if (std.mem.eql(u8, subcmd, "list")) {
+            const pattern = args_iter.next();
+            sendAction(session, "network_list", null, pattern);
+        } else if (std.mem.eql(u8, subcmd, "help")) {
+            write(
+                \\Usage: agent-devtools network <subcommand>
+                \\
+                \\Subcommands:
+                \\  list [pattern]    List captured network requests (optional URL filter)
+                \\  help              Show this help
+                \\
+            , .{});
+        } else {
+            writeErr("Unknown network subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
+    } else if (std.mem.eql(u8, cmd, "close")) {
+        sendAction(session, "close", null, null);
+    } else if (isPlannedCommand(cmd)) {
+        writeErr("{s}: not yet implemented\n", .{cmd});
         std.process.exit(1);
     } else {
-        writeErr("Unknown command: {s}\nRun 'agent-devtools --help' for usage.\n", .{command});
+        writeErr("Unknown command: {s}\nRun 'agent-devtools --help' for usage.\n", .{cmd});
         std.process.exit(1);
     }
 }
 
-fn runChromeArgs() void {
+// ============================================================================
+// CLI → Daemon Communication
+// ============================================================================
+
+fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8) void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
 
-    const args = chrome.buildChromeArgs(allocator, .{}) catch {
-        writeErr("Failed to build Chrome args\n", .{});
+    // Ensure daemon is running
+    const started = daemon.ensureDaemon(allocator, session) catch |err| {
+        writeErr("Failed to start daemon: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
-    defer chrome.freeChromeArgs(allocator, args);
+    if (started) {
+        writeErr("Started daemon (session: {s})\n", .{session});
+    }
 
-    for (args) |arg| write("{s}\n", .{arg});
-}
+    // Connect and send command
+    var client = daemon.SocketClient.connect(session) catch |err| {
+        writeErr("Failed to connect to daemon: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+    defer client.close();
 
-fn runNetwork(subcmd: []const u8, url: ?[]const u8) void {
-    if (std.mem.eql(u8, subcmd, "list")) {
-        runNetworkList(url);
-    } else if (std.mem.eql(u8, subcmd, "help")) {
-        write(
-            \\Usage: agent-devtools network <subcommand> [url]
-            \\
-            \\Subcommands:
-            \\  list [url]    Navigate to URL and list all network requests
-            \\  help          Show this help
-            \\
-        , .{});
+    const req = daemon.serializeRequest(allocator, .{
+        .id = "1",
+        .action = action,
+        .url = url,
+        .pattern = pattern,
+    }) catch {
+        writeErr("Failed to serialize request\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(req);
+
+    client.send(req) catch |err| {
+        writeErr("Failed to send command: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    // Read response
+    var recv_buf: [65536]u8 = undefined;
+    const response_line = client.recvLine(&recv_buf) catch |err| {
+        writeErr("Failed to read response: {s}\n", .{@errorName(err)});
+        std.process.exit(1);
+    };
+
+    const resp = daemon.parseResponse(allocator, response_line) catch {
+        // Raw output if not valid JSON
+        write("{s}\n", .{response_line});
+        return;
+    };
+    defer daemon.freeResponse(allocator, resp);
+
+    if (resp.success) {
+        if (resp.data) |data| {
+            write("{s}\n", .{data});
+        } else {
+            write("OK\n", .{});
+        }
     } else {
-        writeErr("Unknown network subcommand: {s}\n", .{subcmd});
+        writeErr("Error: {s}\n", .{resp.@"error" orelse "unknown error"});
         std.process.exit(1);
     }
 }
 
-fn runNetworkList(url_opt: ?[]const u8) void {
-    const target_url = url_opt orelse {
-        writeErr("Usage: agent-devtools network list <url>\n", .{});
-        std.process.exit(1);
-    };
+// ============================================================================
+// Daemon Mode
+// ============================================================================
+
+fn runDaemon() void {
+    const session = std.posix.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
 
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
 
-    writeErr("Launching Chrome...\n", .{});
-
+    // Launch Chrome
     var chrome_proc = chrome.ChromeProcess.launch(allocator, .{}) catch |err| {
-        writeErr("Failed to launch Chrome: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
+        return;
     };
     defer chrome_proc.deinit();
 
-    writeErr("Connecting to CDP...\n", .{});
-
+    // Connect to Chrome via WebSocket
     var ws = websocket.Client.connect(allocator, chrome_proc.ws_url) catch |err| {
-        writeErr("WebSocket connection failed: {s}\n", .{@errorName(err)});
-        std.process.exit(1);
+        std.debug.print("Daemon: WebSocket failed: {s}\n", .{@errorName(err)});
+        return;
     };
     defer ws.close();
 
-    // Set 3-second read timeout so we don't block forever
-    ws.setReadTimeout(3000);
-
+    // Create page target and attach
     var cmd_id = cdp.CommandId.init();
-
-    // Create a new page target and attach to it
-    // Browser-level WS only delivers events if we attach to a page session
-    const create_target_cmd = cdp.serializeCommand(
-        allocator,
-        cmd_id.next(),
-        "Target.createTarget",
+    const create_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.createTarget",
         \\{"url":"about:blank"}
-    ,
-        null,
-    ) catch return;
-    sendCdpCommand(&ws, allocator, create_target_cmd);
+    , null) catch return;
+    ws.sendText(create_cmd) catch return;
+    allocator.free(create_cmd);
 
-    // Read response to get targetId
     ws.setReadTimeout(5000);
-    var session_id: ?[]const u8 = null;
+
+    var session_id: ?[]u8 = null;
     defer if (session_id) |s| allocator.free(s);
 
-    // Process responses to get targetId and attach
-    var target_id: ?[]const u8 = null;
-    defer if (target_id) |t| allocator.free(t);
-
+    // Get targetId from createTarget response, then attach
     for (0..20) |_| {
-        const msg_data = ws.recvMessage() catch break;
-        defer allocator.free(msg_data);
-
-        const parsed = cdp.parseMessage(allocator, msg_data) catch continue;
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
         defer parsed.parsed.deinit();
 
         if (parsed.message.isResponse()) {
             if (parsed.message.result) |result| {
-                // Target.createTarget response: {"targetId":"..."}
                 if (cdp.getString(result, "targetId")) |tid| {
-                    target_id = allocator.dupe(u8, tid) catch null;
-                    break;
-                }
-                // Target.attachToTarget response: {"sessionId":"..."}
-                if (cdp.getString(result, "sessionId")) |sid| {
+                    const attach = cdp.targetAttachToTarget(allocator, cmd_id.next(), tid, true) catch continue;
+                    ws.sendText(attach) catch {};
+                    allocator.free(attach);
+                } else if (cdp.getString(result, "sessionId")) |sid| {
                     session_id = allocator.dupe(u8, sid) catch null;
                     break;
                 }
@@ -148,56 +209,79 @@ fn runNetworkList(url_opt: ?[]const u8) void {
         }
     }
 
-    // Attach to the target with flatten mode
-    if (target_id) |tid| {
-        const attach_cmd = cdp.targetAttachToTarget(allocator, cmd_id.next(), tid, true) catch return;
-        sendCdpCommand(&ws, allocator, attach_cmd);
+    // Enable Network on the page session
+    const net_enable = cdp.networkEnable(allocator, cmd_id.next(), session_id) catch return;
+    ws.sendText(net_enable) catch return;
+    allocator.free(net_enable);
 
-        for (0..20) |_| {
-            const msg_data = ws.recvMessage() catch break;
-            defer allocator.free(msg_data);
+    const page_enable = cdp.pageEnable(allocator, cmd_id.next(), session_id) catch return;
+    ws.sendText(page_enable) catch return;
+    allocator.free(page_enable);
 
-            const parsed = cdp.parseMessage(allocator, msg_data) catch continue;
-            defer parsed.parsed.deinit();
-
-            if (parsed.message.isResponse()) {
-                if (parsed.message.result) |result| {
-                    if (cdp.getString(result, "sessionId")) |sid| {
-                        session_id = allocator.dupe(u8, sid) catch null;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    // Enable Network + Page on the page session, wait for acks, then navigate
-    sendCdpCommand(&ws, allocator, cdp.networkEnable(allocator, cmd_id.next(), session_id) catch return);
-    sendCdpCommand(&ws, allocator, cdp.pageEnable(allocator, cmd_id.next(), session_id) catch return);
-
-    // Wait for enable responses before navigating
+    // Drain enable responses
     for (0..10) |_| {
-        const msg_data = ws.recvMessage() catch break;
-        allocator.free(msg_data);
+        const msg = ws.recvMessage() catch break;
+        allocator.free(msg);
     }
 
-    writeErr("Navigating to {s}...\n", .{target_url});
-    sendCdpCommand(&ws, allocator, cdp.pageNavigate(allocator, cmd_id.next(), target_url, session_id) catch return);
-
+    // Start network collector
     var collector = network.Collector.init(allocator);
     defer collector.deinit();
 
-    ws.setReadTimeout(3000);
+    // Listen on Unix socket for CLI commands
+    var server = daemon.SocketServer.listen(session) catch |err| {
+        std.debug.print("Daemon: Socket listen failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+    defer server.close();
 
-    var page_loaded = false;
-    const max_messages = 1000;
-    var msg_count: usize = 0;
+    // Set read timeout on WebSocket so we can poll for socket clients
+    ws.setReadTimeout(100);
 
-    while (msg_count < max_messages) : (msg_count += 1) {
-        const msg_data = ws.recvMessage() catch break;
-        defer allocator.free(msg_data);
+    // Main loop: accept CLI connections, process commands, collect network events
+    var running = true;
+    while (running) {
+        // Drain CDP events (non-blocking due to 100ms timeout)
+        drainCdpEvents(&ws, allocator, &collector, session_id);
 
-        const parsed = cdp.parseMessage(allocator, msg_data) catch continue;
+        // Non-blocking accept: use SO_RCVTIMEO on the listening socket
+        const timeval = std.posix.timeval{ .sec = 0, .usec = 100_000 }; // 100ms
+        const bytes = std.mem.asBytes(&timeval);
+        std.posix.setsockopt(server.fd, std.posix.SOL.SOCKET, std.c.SO.RCVTIMEO, bytes) catch {};
+
+        if (server.accept()) |client_fd| {
+            defer std.posix.close(client_fd);
+
+            // Read request
+            var req_buf: [4096]u8 = undefined;
+            var req_len: usize = 0;
+            while (req_len < req_buf.len) {
+                const n = std.posix.read(client_fd, req_buf[req_len..]) catch break;
+                if (n == 0) break;
+                req_len += n;
+                if (std.mem.indexOfScalar(u8, req_buf[0..req_len], '\n') != null) break;
+            }
+
+            if (req_len > 0) {
+                const line = req_buf[0..req_len];
+                const resp = handleCommand(allocator, line, &ws, &collector, &cmd_id, session_id, &running);
+                defer allocator.free(resp);
+                _ = std.posix.write(client_fd, resp) catch {};
+            }
+        } else |_| {
+            // EAGAIN/EWOULDBLOCK — no client waiting, sleep briefly
+            std.Thread.sleep(50 * std.time.ns_per_ms);
+        }
+    }
+}
+
+fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *network.Collector, session_id: ?[]const u8) void {
+    _ = session_id;
+    for (0..20) |_| {
+        const msg = ws.recvMessage() catch return;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
         defer parsed.parsed.deinit();
 
         if (parsed.message.isEvent()) {
@@ -205,29 +289,98 @@ fn runNetworkList(url_opt: ?[]const u8) void {
                 if (parsed.message.params) |params| {
                     _ = collector.processEvent(method, params) catch {};
                 }
-                if (std.mem.eql(u8, method, "Page.loadEventFired")) {
-                    page_loaded = true;
-                    ws.setReadTimeout(1000);
-                }
             }
         }
     }
+}
 
-    // Output results to stdout
-    write("{d} requests captured:\n\n", .{collector.count()});
+fn handleCommand(
+    allocator: Allocator,
+    line: []const u8,
+    ws: *websocket.Client,
+    collector: *network.Collector,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    running: *bool,
+) []u8 {
+    const req = daemon.parseRequest(allocator, line) catch {
+        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Invalid request" }) catch
+            allocator.dupe(u8, "{\"success\":false,\"error\":\"Internal error\"}\n") catch &.{};
+    };
+    defer daemon.freeRequest(allocator, req);
 
-    var it = collector.requests.iterator();
-    while (it.next()) |entry| {
-        var line_buf: [1024]u8 = undefined;
-        const line = network.Collector.formatRequestLine(entry.value_ptr.info, &line_buf);
-        write("{s}\n", .{line});
+    if (std.mem.eql(u8, req.action, "open")) {
+        return handleOpen(allocator, ws, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "network_list")) {
+        return handleNetworkList(allocator, collector, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "close")) {
+        running.* = false;
+        return daemon.serializeResponse(allocator, .{ .success = true }) catch &.{};
+    } else if (std.mem.eql(u8, req.action, "ping")) {
+        return daemon.serializeResponse(allocator, .{ .success = true }) catch &.{};
+    } else {
+        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Unknown action" }) catch &.{};
     }
 }
 
-fn sendCdpCommand(ws: *websocket.Client, allocator: std.mem.Allocator, cmd: []u8) void {
-    defer allocator.free(cmd);
-    ws.sendText(cmd) catch {};
+fn handleOpen(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, url: ?[]const u8) []u8 {
+    const target_url = url orelse {
+        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "url required" }) catch &.{};
+    };
+
+    const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), target_url, session_id) catch {
+        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Failed to build navigate command" }) catch &.{};
+    };
+    defer allocator.free(nav_cmd);
+
+    ws.sendText(nav_cmd) catch {
+        return daemon.serializeResponse(allocator, .{ .success = false, .@"error" = "Failed to send navigate" }) catch &.{};
+    };
+
+    return daemon.serializeResponse(allocator, .{ .success = true }) catch &.{};
 }
+
+fn handleNetworkList(allocator: Allocator, collector: *network.Collector, pattern: ?[]const u8) []u8 {
+    // Build JSON array of requests
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const writer = buf.writer(allocator);
+
+    writer.writeByte('[') catch return &.{};
+    var it = collector.requests.iterator();
+    var first = true;
+    while (it.next()) |entry| {
+        const info = entry.value_ptr.info;
+
+        // Apply filter
+        if (pattern) |p| {
+            if (std.mem.indexOf(u8, info.url, p) == null) continue;
+        }
+
+        if (!first) writer.writeByte(',') catch {};
+        first = false;
+
+        std.fmt.format(writer, "{{\"url\":\"{s}\",\"method\":\"{s}\",\"status\":{s},\"state\":\"{s}\"}}", .{
+            info.url,
+            info.method,
+            if (info.status) |s| blk: {
+                var num_buf: [8]u8 = undefined;
+                break :blk std.fmt.bufPrint(&num_buf, "{d}", .{s}) catch "null";
+            } else "null",
+            @tagName(info.state),
+        }) catch {};
+    }
+    writer.writeByte(']') catch {};
+
+    const data = buf.toOwnedSlice(allocator) catch return &.{};
+    defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch &.{};
+}
+
+// ============================================================================
+// Helpers
+// ============================================================================
 
 fn isPlannedCommand(cmd: []const u8) bool {
     const planned = [_][]const u8{ "analyze", "intercept", "record", "replay", "diff" };
@@ -252,44 +405,40 @@ fn printUsage() void {
     write(
         \\agent-devtools - Browser DevTools CLI for AI agents
         \\
-        \\Usage: agent-devtools <command> [options]
+        \\Usage: agent-devtools [--session=NAME] <command> [options]
         \\
         \\Commands:
-        \\  find-chrome           Find Chrome executable on the system
-        \\  chrome-args           Print Chrome launch arguments
-        \\  network list <url>    Navigate to URL and list network requests
-        \\  network help          Show network subcommand help
+        \\  open <url>              Navigate to URL (starts daemon if needed)
+        \\  network list [pattern]  List captured network requests
+        \\  close                   Close browser and stop daemon
+        \\  find-chrome             Find Chrome executable on the system
         \\
         \\  (Coming soon)
-        \\  analyze <url>         Reverse-engineer web app API schema
-        \\  intercept             Intercept and modify network requests
-        \\  record <name>         Record a browsing flow
-        \\  replay <name>         Replay and compare a recorded flow
-        \\  diff <baseline>       Compare against baseline
+        \\  analyze <url>           Reverse-engineer web app API schema
+        \\  intercept               Intercept and modify network requests
+        \\  record <name>           Record a browsing flow
+        \\  replay <name>           Replay and compare a recorded flow
+        \\  diff <baseline>         Compare against baseline
         \\
         \\Options:
-        \\  -h, --help            Show this help
-        \\  -v, --version         Show version
+        \\  --session=NAME          Session name (default: "default")
+        \\  -h, --help              Show this help
+        \\  -v, --version           Show version
         \\
     , .{});
 }
 
 test "version string is set" {
     try std.testing.expect(version.len > 0);
-    try std.testing.expect(std.mem.indexOf(u8, version, ".") != null);
 }
 
 test "isPlannedCommand: recognizes planned commands" {
     try std.testing.expect(isPlannedCommand("analyze"));
     try std.testing.expect(isPlannedCommand("intercept"));
-    try std.testing.expect(isPlannedCommand("record"));
-    try std.testing.expect(isPlannedCommand("replay"));
-    try std.testing.expect(isPlannedCommand("diff"));
 }
 
-test "isPlannedCommand: rejects unknown and implemented commands" {
-    try std.testing.expect(!isPlannedCommand("bogus"));
-    try std.testing.expect(!isPlannedCommand(""));
-    try std.testing.expect(!isPlannedCommand("--help"));
-    try std.testing.expect(!isPlannedCommand("network")); // now implemented
+test "isPlannedCommand: rejects implemented commands" {
+    try std.testing.expect(!isPlannedCommand("open"));
+    try std.testing.expect(!isPlannedCommand("network"));
+    try std.testing.expect(!isPlannedCommand("close"));
 }

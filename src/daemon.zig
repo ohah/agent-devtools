@@ -233,7 +233,7 @@ pub const SocketServer = struct {
         errdefer posix.close(fd);
 
         try posix.bind(fd, &addr.any, addr.getOsSockLen());
-        try posix.listen(fd, .{ .backlog = 5 });
+        try posix.listen(fd, 5);
 
         var server = SocketServer{
             .fd = fd,
@@ -246,7 +246,7 @@ pub const SocketServer = struct {
     }
 
     pub fn accept(self: *SocketServer) AcceptError!posix.socket_t {
-        return posix.accept(self.fd, null, null, .{});
+        return posix.accept(self.fd, null, null, 0);
     }
 
     pub fn close(self: *SocketServer) void {
@@ -336,7 +336,7 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8) !bool {
     var child = std.process.Child.init(&argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
-    child.stderr_behavior = .Ignore;
+    child.stderr_behavior = .Inherit;
 
     var env_map = try std.process.getEnvMap(allocator);
     defer env_map.deinit();
@@ -344,11 +344,20 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8) !bool {
     try env_map.put("AGENT_DEVTOOLS_SESSION", session);
     child.env_map = &env_map;
 
+    // Ensure socket directory exists before spawning
+    var dir_buf: [512]u8 = undefined;
+    const socket_dir = getSocketDir(&dir_buf);
+    std.fs.makeDirAbsolute(socket_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return err,
+    };
+
     try child.spawn();
 
-    // Poll for readiness (50 × 100ms = 5 seconds)
-    const poll_interval = 100 * std.time.ns_per_ms;
-    for (0..50) |_| {
+    // Poll for readiness (150 × 200ms = 30 seconds)
+    // Chrome + CDP setup can take 10+ seconds on first launch
+    const poll_interval = 200 * std.time.ns_per_ms;
+    for (0..150) |_| {
         if (SocketClient.isReady(session)) return true;
         std.Thread.sleep(poll_interval);
     }
