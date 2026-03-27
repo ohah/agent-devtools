@@ -57,13 +57,17 @@ pub const Message = struct {
 };
 
 /// CDP error object.
+/// `code` is optional — JSON-RPC spec requires it, but defensive parsing
+/// handles cases where Chrome omits it (agent-browser uses Option<i64>).
 pub const CdpError = struct {
-    code: i32,
+    code: ?i64,
     message: []const u8,
     data: ?[]const u8,
 
-    pub fn errorCode(self: CdpError) ErrorCode {
-        return @enumFromInt(self.code);
+    pub fn errorCode(self: CdpError) ?ErrorCode {
+        const c = self.code orelse return null;
+        const c32 = std.math.cast(i32, c) orelse return null;
+        return @enumFromInt(c32);
     }
 };
 
@@ -91,59 +95,26 @@ pub fn parseMessage(allocator: Allocator, json_bytes: []const u8) ParseError!str
     const root = parsed.value;
     if (root != .object) return error.InvalidMessageFormat;
 
-    const obj = root.object;
-
-    // Extract id (number or null)
-    const id: ?u64 = if (obj.get("id")) |v| switch (v) {
+    // id needs special handling: accepts integer or integer-valued float
+    const id: ?u64 = if (root.object.get("id")) |v| switch (v) {
         .integer => |n| if (n >= 0) @intCast(n) else null,
         .float => |f| if (f >= 0 and f == @trunc(f)) @intFromFloat(f) else null,
         else => null,
     } else null;
 
-    // Extract method (string)
-    const method: ?[]const u8 = if (obj.get("method")) |v| switch (v) {
-        .string => |s| s,
-        else => null,
-    } else null;
+    const method = getString(root, "method");
+    const result = root.object.get("result");
+    const session_id = getString(root, "sessionId");
+    const params = root.object.get("params");
 
-    // Extract result
-    const result: ?std.json.Value = obj.get("result");
-
-    // Extract error
-    const cdp_error: ?CdpError = if (obj.get("error")) |err_val| blk: {
-        if (err_val != .object) break :blk null;
-        const err_obj = err_val.object;
-
-        const code: i32 = if (err_obj.get("code")) |v| switch (v) {
-            .integer => |n| @intCast(n),
-            else => break :blk null,
-        } else break :blk null;
-
-        const message: []const u8 = if (err_obj.get("message")) |v| switch (v) {
-            .string => |s| s,
-            else => break :blk null,
-        } else break :blk null;
-
-        const data: ?[]const u8 = if (err_obj.get("data")) |v| switch (v) {
-            .string => |s| s,
-            else => null,
-        } else null;
-
+    const cdp_error: ?CdpError = if (getObject(root, "error")) |err_val| blk: {
+        const message = getString(err_val, "message") orelse break :blk null;
         break :blk CdpError{
-            .code = code,
+            .code = getInt(err_val, "code"),
             .message = message,
-            .data = data,
+            .data = getString(err_val, "data"),
         };
     } else null;
-
-    // Extract sessionId
-    const session_id: ?[]const u8 = if (obj.get("sessionId")) |v| switch (v) {
-        .string => |s| s,
-        else => null,
-    } else null;
-
-    // Extract params
-    const params: ?std.json.Value = obj.get("params");
 
     return .{
         .message = .{
@@ -224,13 +195,13 @@ pub fn networkDisable(allocator: Allocator, id: u64, session_id: ?[]const u8) ![
 }
 
 pub fn networkGetResponseBody(allocator: Allocator, id: u64, request_id: []const u8, session_id: ?[]const u8) ![]u8 {
-    const params = try std.fmt.allocPrint(allocator, "{{\"requestId\":\"{s}\"}}", .{request_id});
+    const params = try jsonObject1(allocator, "requestId", request_id);
     defer allocator.free(params);
     return serializeCommand(allocator, id, "Network.getResponseBody", params, session_id);
 }
 
 pub fn pageNavigate(allocator: Allocator, id: u64, url: []const u8, session_id: ?[]const u8) ![]u8 {
-    const params = try std.fmt.allocPrint(allocator, "{{\"url\":\"{s}\"}}", .{url});
+    const params = try jsonObject1(allocator, "url", url);
     defer allocator.free(params);
     return serializeCommand(allocator, id, "Page.navigate", params, session_id);
 }
@@ -248,6 +219,21 @@ pub fn runtimeEvaluate(allocator: Allocator, id: u64, expression: []const u8, se
     const params = try std.fmt.allocPrint(allocator, "{{\"expression\":{s}}}", .{escaped.items});
     defer allocator.free(params);
     return serializeCommand(allocator, id, "Runtime.evaluate", params, session_id);
+}
+
+/// Build a JSON object with a single string key-value pair, properly escaped.
+fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+
+    const writer = buf.writer(allocator);
+    try writer.writeAll("{\"");
+    try writer.writeAll(key);
+    try writer.writeAll("\":");
+    try writeJsonString(writer, value);
+    try writer.writeByte('}');
+
+    return buf.toOwnedSlice(allocator);
 }
 
 /// Write a JSON-escaped string (with quotes) to a writer.
@@ -297,9 +283,9 @@ pub fn fetchFulfillRequest(
     defer buf.deinit(allocator);
 
     const writer = buf.writer(allocator);
-    try writer.writeAll("{\"requestId\":\"");
-    try writer.writeAll(request_id);
-    try writer.writeAll("\",\"responseCode\":");
+    try writer.writeAll("{\"requestId\":");
+    try writeJsonString(writer, request_id);
+    try writer.writeAll(",\"responseCode\":");
     try std.fmt.format(writer, "{d}", .{response_code});
 
     if (body) |b| {
@@ -321,8 +307,19 @@ pub fn fetchFulfillRequest(
 }
 
 pub fn fetchFailRequest(allocator: Allocator, id: u64, request_id: []const u8, error_reason: []const u8, session_id: ?[]const u8) ![]u8 {
-    const params = try std.fmt.allocPrint(allocator, "{{\"requestId\":\"{s}\",\"errorReason\":\"{s}\"}}", .{ request_id, error_reason });
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const writer = buf.writer(allocator);
+    try writer.writeAll("{\"requestId\":");
+    try writeJsonString(writer, request_id);
+    try writer.writeAll(",\"errorReason\":");
+    try writeJsonString(writer, error_reason);
+    try writer.writeByte('}');
+
+    const params = try buf.toOwnedSlice(allocator);
     defer allocator.free(params);
+
     return serializeCommand(allocator, id, "Fetch.failRequest", params, session_id);
 }
 
@@ -338,20 +335,17 @@ pub fn fetchContinueRequest(
     defer buf.deinit(allocator);
 
     const writer = buf.writer(allocator);
-    try writer.writeAll("{\"requestId\":\"");
-    try writer.writeAll(request_id);
-    try writer.writeByte('"');
+    try writer.writeAll("{\"requestId\":");
+    try writeJsonString(writer, request_id);
 
     if (url) |u| {
-        try writer.writeAll(",\"url\":\"");
-        try writer.writeAll(u);
-        try writer.writeByte('"');
+        try writer.writeAll(",\"url\":");
+        try writeJsonString(writer, u);
     }
 
     if (method_override) |m| {
-        try writer.writeAll(",\"method\":\"");
-        try writer.writeAll(m);
-        try writer.writeByte('"');
+        try writer.writeAll(",\"method\":");
+        try writeJsonString(writer, m);
     }
 
     try writer.writeByte('}');
@@ -372,10 +366,17 @@ pub fn targetGetTargets(allocator: Allocator, id: u64) ![]u8 {
 }
 
 pub fn targetAttachToTarget(allocator: Allocator, id: u64, target_id: []const u8, flatten: bool) ![]u8 {
-    const params = try std.fmt.allocPrint(allocator, "{{\"targetId\":\"{s}\",\"flatten\":{s}}}", .{
-        target_id,
-        if (flatten) "true" else "false",
-    });
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+
+    const writer = buf.writer(allocator);
+    try writer.writeAll("{\"targetId\":");
+    try writeJsonString(writer, target_id);
+    try writer.writeAll(",\"flatten\":");
+    try writer.writeAll(if (flatten) "true" else "false");
+    try writer.writeByte('}');
+
+    const params = try buf.toOwnedSlice(allocator);
     defer allocator.free(params);
     return serializeCommand(allocator, id, "Target.attachToTarget", params, null);
 }
@@ -505,8 +506,8 @@ test "parse: error response - method not found" {
     try testing.expectEqual(@as(u64, 3), msg.id.?);
 
     const err = msg.@"error".?;
-    try testing.expectEqual(@as(i32, -32601), err.code);
-    try testing.expectEqual(ErrorCode.method_not_found, err.errorCode());
+    try testing.expectEqual(@as(i64, -32601), err.code.?);
+    try testing.expectEqual(ErrorCode.method_not_found, err.errorCode().?);
     try testing.expectEqualStrings("'Network.bogus' wasn't found", err.message);
     try testing.expect(err.data == null);
 }
@@ -520,7 +521,7 @@ test "parse: error response - invalid params" {
     defer result.parsed.deinit();
     const err = result.message.@"error".?;
 
-    try testing.expectEqual(ErrorCode.invalid_params, err.errorCode());
+    try testing.expectEqual(ErrorCode.invalid_params, err.errorCode().?);
     try testing.expectEqualStrings("requestId is required", err.data.?);
 }
 
@@ -531,7 +532,7 @@ test "parse: error response - parse error" {
     const result = try parseMessage(testing.allocator, json);
     defer result.parsed.deinit();
 
-    try testing.expectEqual(ErrorCode.parse_error, result.message.@"error".?.errorCode());
+    try testing.expectEqual(ErrorCode.parse_error, result.message.@"error".?.errorCode().?);
 }
 
 test "parse: error response - server error" {
@@ -541,7 +542,22 @@ test "parse: error response - server error" {
     const result = try parseMessage(testing.allocator, json);
     defer result.parsed.deinit();
 
-    try testing.expectEqual(ErrorCode.server_error, result.message.@"error".?.errorCode());
+    try testing.expectEqual(ErrorCode.server_error, result.message.@"error".?.errorCode().?);
+}
+
+test "parse: error response without code (defensive)" {
+    // agent-browser treats code as optional — handle gracefully
+    const json =
+        \\{"id":11,"error":{"message":"Something went wrong"}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expect(result.message.isErrorResponse());
+    const err = result.message.@"error".?;
+    try testing.expect(err.code == null);
+    try testing.expect(err.errorCode() == null);
+    try testing.expectEqualStrings("Something went wrong", err.message);
 }
 
 test "parse: event - Network.requestWillBeSent" {

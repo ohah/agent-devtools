@@ -64,27 +64,17 @@ pub fn decode(data: []const u8) DecodeError!DecodeResult {
     const byte0 = data[0];
     const byte1 = data[1];
 
-    // FIN bit
     const fin = byte0 & 0x80 != 0;
-
-    // RSV bits (must be 0 unless extension negotiated)
     if (byte0 & 0x70 != 0) return error.ReservedBitsSet;
 
-    // Opcode
     const opcode: Opcode = @enumFromInt(@as(u4, @truncate(byte0)));
-
-    // Reject reserved opcodes (0x3-0x7, 0xB-0xF)
     switch (opcode) {
         .continuation, .text, .binary, .close, .ping, .pong => {},
         _ => return error.ReservedOpcode,
     }
 
-    // Validate control frames
-    if (isControlOpcode(opcode)) {
-        if (!fin) return error.FragmentedControlFrame;
-    }
+    if (isControlOpcode(opcode) and !fin) return error.FragmentedControlFrame;
 
-    // Mask bit and payload length
     const masked = byte1 & 0x80 != 0;
     const len7: u7 = @truncate(byte1);
 
@@ -111,17 +101,14 @@ pub fn decode(data: []const u8) DecodeError!DecodeResult {
         else => len7,
     };
 
-    // Control frames must not exceed 125 bytes
     if (isControlOpcode(opcode) and payload_len > 125) {
         return error.ControlFrameTooLarge;
     }
 
-    // Close frame payload must be 0 or >= 2 bytes (status code is 2 bytes)
     if (opcode == .close and payload_len == 1) {
         return error.InvalidClosePayload;
     }
 
-    // Mask key
     var mask_key: [4]u8 = .{ 0, 0, 0, 0 };
     if (masked) {
         if (data.len < offset + 4) return error.InsufficientData;
@@ -129,7 +116,6 @@ pub fn decode(data: []const u8) DecodeError!DecodeResult {
         offset += 4;
     }
 
-    // Payload
     const payload_usize: usize = std.math.cast(usize, payload_len) orelse
         return error.InsufficientData;
 
@@ -188,9 +174,11 @@ pub fn encodeWithMask(allocator: Allocator, opcode: Opcode, payload: []const u8,
     @memcpy(buf[offset..][0..4], &mask_key);
     offset += 4;
 
-    // Masked payload
-    @memcpy(buf[offset..][0..payload.len], payload);
-    applyMask(buf[offset..][0..payload.len], mask_key);
+    // Copy and mask in a single pass
+    const dest = buf[offset..][0..payload.len];
+    for (dest, payload, 0..) |*d, p, i| {
+        d.* = p ^ mask_key[i % 4];
+    }
 
     return buf;
 }
@@ -203,14 +191,15 @@ pub fn encode(allocator: Allocator, opcode: Opcode, payload: []const u8) EncodeE
 }
 
 /// Encode a close frame with status code and reason.
+/// Uses stack buffer since close payloads are at most 125 bytes (RFC 6455).
 pub fn encodeClose(allocator: Allocator, status_code: u16, reason: []const u8) EncodeError![]u8 {
-    const payload = try allocator.alloc(u8, 2 + reason.len);
-    defer allocator.free(payload);
+    if (2 + reason.len > 125) return error.PayloadTooLarge;
 
-    std.mem.writeInt(u16, payload[0..2], status_code, .big);
-    @memcpy(payload[2..], reason);
+    var payload_buf: [125]u8 = undefined;
+    std.mem.writeInt(u16, payload_buf[0..2], status_code, .big);
+    @memcpy(payload_buf[2..][0..reason.len], reason);
 
-    return encode(allocator, .close, payload);
+    return encode(allocator, .close, payload_buf[0 .. 2 + reason.len]);
 }
 
 /// Apply or remove XOR masking in-place.
@@ -292,11 +281,8 @@ pub fn isValidCloseCode(code: u16) bool {
 /// Tracks WebSocket connection state for protocol-level validation.
 /// Validates fragmentation sequence, close codes, and frame ordering.
 pub const Connection = struct {
-    /// Fragmentation state
-    in_fragment: bool,
-    fragment_opcode: Opcode,
-
-    /// Connection state
+    /// Non-null when a fragmented message is in progress; holds the original opcode.
+    fragment_opcode: ?Opcode,
     close_sent: bool,
     close_received: bool,
 
@@ -311,68 +297,53 @@ pub const Connection = struct {
 
     pub fn init() Connection {
         return .{
-            .in_fragment = false,
-            .fragment_opcode = .continuation,
+            .fragment_opcode = null,
             .close_sent = false,
             .close_received = false,
         };
     }
 
+    pub fn inFragment(self: Connection) bool {
+        return self.fragment_opcode != null;
+    }
+
     /// Validate a decoded frame against connection state.
-    /// Updates internal state and returns error if protocol is violated.
     pub fn validateFrame(self: *Connection, frame: Frame) ConnectionError!void {
-        // RFC 6455 5.1: client MUST close connection if server frame is masked
         if (frame.masked) return error.ServerFrameMasked;
 
-        // No data frames after close
         if (self.close_received and !isControlOpcode(frame.opcode)) {
             return error.FrameAfterClose;
         }
 
-        // Handle control frames (can appear mid-fragment, don't affect state)
         if (isControlOpcode(frame.opcode)) {
             if (frame.opcode == .close) {
-                try self.validateClosePayload(frame.payload);
+                try validateClosePayload(frame.payload);
                 self.close_received = true;
             }
             return;
         }
 
-        // Fragmentation validation (RFC 6455 Section 5.4)
         if (frame.opcode == .continuation) {
-            // Continuation without a started fragment
-            if (!self.in_fragment) return error.UnexpectedContinuation;
-            // FIN=1 ends the fragment
-            if (frame.fin) {
-                self.in_fragment = false;
-            }
+            if (self.fragment_opcode == null) return error.UnexpectedContinuation;
+            if (frame.fin) self.fragment_opcode = null;
         } else {
-            // Non-continuation data frame
-            if (self.in_fragment) {
-                // New data frame while fragment is in progress
-                return error.ExpectedContinuation;
-            }
-            if (!frame.fin) {
-                // Start of fragmented message
-                self.in_fragment = true;
-                self.fragment_opcode = frame.opcode;
-            }
+            if (self.fragment_opcode != null) return error.ExpectedContinuation;
+            if (!frame.fin) self.fragment_opcode = frame.opcode;
         }
-    }
-
-    fn validateClosePayload(self: *Connection, payload: []const u8) ConnectionError!void {
-        _ = self;
-        if (payload.len == 0) return; // empty close is valid
-        if (payload.len < 2) return error.ClosePayloadTooShort;
-
-        const code = std.mem.readInt(u16, payload[0..2], .big);
-        if (!isValidCloseCode(code)) return error.InvalidCloseCode;
     }
 
     pub fn markCloseSent(self: *Connection) void {
         self.close_sent = true;
     }
 };
+
+fn validateClosePayload(payload: []const u8) Connection.ConnectionError!void {
+    if (payload.len == 0) return;
+    if (payload.len < 2) return error.ClosePayloadTooShort;
+
+    const code = std.mem.readInt(u16, payload[0..2], .big);
+    if (!isValidCloseCode(code)) return error.InvalidCloseCode;
+}
 
 // ============================================================================
 // Tests: Frame Decoding
@@ -1197,13 +1168,13 @@ fn makeFrame(fin: bool, opcode: Opcode, masked: bool, payload: []const u8) Frame
 test "connection: single unfragmented text frame" {
     var conn = Connection.init();
     try conn.validateFrame(makeFrame(true, .text, false, "hello"));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 }
 
 test "connection: single unfragmented binary frame" {
     var conn = Connection.init();
     try conn.validateFrame(makeFrame(true, .binary, false, "data"));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 }
 
 test "connection: fragmented message (text + continuation + fin)" {
@@ -1211,16 +1182,16 @@ test "connection: fragmented message (text + continuation + fin)" {
 
     // First fragment: FIN=0, opcode=text
     try conn.validateFrame(makeFrame(false, .text, false, "hel"));
-    try testing.expect(conn.in_fragment);
-    try testing.expectEqual(Opcode.text, conn.fragment_opcode);
+    try testing.expect(conn.inFragment());
+    try testing.expectEqual(Opcode.text, conn.fragment_opcode.?);
 
     // Middle fragment: FIN=0, opcode=continuation
     try conn.validateFrame(makeFrame(false, .continuation, false, "lo "));
-    try testing.expect(conn.in_fragment);
+    try testing.expect(conn.inFragment());
 
     // Final fragment: FIN=1, opcode=continuation
     try conn.validateFrame(makeFrame(true, .continuation, false, "world"));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 }
 
 test "connection: control frame mid-fragment" {
@@ -1228,19 +1199,19 @@ test "connection: control frame mid-fragment" {
 
     // Start fragment
     try conn.validateFrame(makeFrame(false, .text, false, "hel"));
-    try testing.expect(conn.in_fragment);
+    try testing.expect(conn.inFragment());
 
     // Ping in the middle — MUST be allowed (RFC 6455 Section 5.4)
     try conn.validateFrame(makeFrame(true, .ping, false, ""));
-    try testing.expect(conn.in_fragment); // fragment state preserved
+    try testing.expect(conn.inFragment()); // fragment state preserved
 
     // Pong in the middle — also allowed
     try conn.validateFrame(makeFrame(true, .pong, false, ""));
-    try testing.expect(conn.in_fragment);
+    try testing.expect(conn.inFragment());
 
     // Continue fragment
     try conn.validateFrame(makeFrame(true, .continuation, false, "lo"));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 }
 
 test "connection error: unexpected continuation (no fragment started)" {
@@ -1346,22 +1317,22 @@ test "connection: multiple fragments then new message" {
     // First fragmented message
     try conn.validateFrame(makeFrame(false, .text, false, "a"));
     try conn.validateFrame(makeFrame(true, .continuation, false, "b"));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 
     // Second message — should work fine
     try conn.validateFrame(makeFrame(true, .binary, false, "c"));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 }
 
 test "connection: fragmented binary message" {
     var conn = Connection.init();
 
     try conn.validateFrame(makeFrame(false, .binary, false, &[_]u8{0x00}));
-    try testing.expect(conn.in_fragment);
-    try testing.expectEqual(Opcode.binary, conn.fragment_opcode);
+    try testing.expect(conn.inFragment());
+    try testing.expectEqual(Opcode.binary, conn.fragment_opcode.?);
 
     try conn.validateFrame(makeFrame(false, .continuation, false, &[_]u8{0x01}));
     try conn.validateFrame(makeFrame(false, .continuation, false, &[_]u8{0x02}));
     try conn.validateFrame(makeFrame(true, .continuation, false, &[_]u8{0x03}));
-    try testing.expect(!conn.in_fragment);
+    try testing.expect(!conn.inFragment());
 }
