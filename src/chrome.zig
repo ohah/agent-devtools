@@ -184,6 +184,135 @@ pub fn freeChromeArgs(allocator: Allocator, args: []const []const u8) void {
 }
 
 // ============================================================================
+// Chrome Process
+// ============================================================================
+
+pub const ChromeProcess = struct {
+    child: std.process.Child,
+    ws_url: []u8,
+    temp_dir: ?[]u8,
+    allocator: Allocator,
+
+    pub const LaunchError = error{
+        ChromeNotFound,
+        LaunchFailed,
+        TimeoutWaitingForDevTools,
+    } || Allocator.Error;
+
+    /// Launch Chrome and wait for the CDP WebSocket URL.
+    pub fn launch(allocator: Allocator, options: LaunchOptions) LaunchError!ChromeProcess {
+        const chrome_path = options.executable_path orelse findChrome() orelse
+            return error.ChromeNotFound;
+
+        // Create temp user-data-dir if none provided
+        var temp_dir: ?[]u8 = null;
+        var effective_options = options;
+
+        if (options.user_data_dir == null) {
+            temp_dir = createTempDir(allocator) catch return error.LaunchFailed;
+            effective_options.user_data_dir = temp_dir;
+        }
+        errdefer if (temp_dir) |d| {
+            std.fs.deleteTreeAbsolute(d) catch {};
+            allocator.free(d);
+        };
+
+        const args = buildChromeArgs(allocator, effective_options) catch return error.LaunchFailed;
+        defer freeChromeArgs(allocator, args);
+
+        // Build argv: [chrome_path] ++ args
+        var argv: std.ArrayList([]const u8) = .empty;
+        defer argv.deinit(allocator);
+        argv.append(allocator, chrome_path) catch return error.LaunchFailed;
+        argv.appendSlice(allocator, args) catch return error.LaunchFailed;
+
+        var child = std.process.Child.init(argv.items, allocator);
+        child.stdin_behavior = .ignore;
+        child.stdout_behavior = .ignore;
+        child.stderr_behavior = .pipe;
+
+        child.spawn() catch return error.LaunchFailed;
+        errdefer {
+            _ = child.kill() catch {};
+            _ = child.wait() catch {};
+        }
+
+        // Wait for DevToolsActivePort file or stderr URL
+        const ws_url = waitForWsUrl(allocator, &child, effective_options.user_data_dir) catch
+            return error.TimeoutWaitingForDevTools;
+
+        return ChromeProcess{
+            .child = child,
+            .ws_url = ws_url,
+            .temp_dir = temp_dir,
+            .allocator = allocator,
+        };
+    }
+
+    pub fn kill(self: *ChromeProcess) void {
+        _ = self.child.kill() catch {};
+        _ = self.child.wait() catch {};
+    }
+
+    pub fn deinit(self: *ChromeProcess) void {
+        self.kill();
+        self.allocator.free(self.ws_url);
+        if (self.temp_dir) |d| {
+            std.fs.deleteTreeAbsolute(d) catch {};
+            self.allocator.free(d);
+        }
+    }
+};
+
+/// Wait for Chrome to write the DevToolsActivePort file, then build the WS URL.
+fn waitForWsUrl(allocator: Allocator, child: *std.process.Child, user_data_dir: ?[]const u8) ![]u8 {
+    _ = child;
+    const max_polls = 100; // 100 * 50ms = 5 seconds
+    const poll_interval_ns: u64 = 50 * std.time.ns_per_ms;
+
+    if (user_data_dir) |dir| {
+        var port_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const port_path = std.fmt.bufPrint(&port_path_buf, "{s}/DevToolsActivePort", .{dir}) catch return error.Overflow;
+
+        for (0..max_polls) |_| {
+            var content_buf: [256]u8 = undefined;
+            if (std.fs.cwd().readFile(port_path, &content_buf)) |content| {
+                if (parseDevToolsActivePort(content)) |info| {
+                    return std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}{s}", .{ info.port, info.ws_path });
+                }
+            } else |_| {}
+
+            std.time.sleep(poll_interval_ns);
+        }
+    }
+
+    return error.TimedOut;
+}
+
+fn createTempDir(allocator: Allocator) ![]u8 {
+    var prng = std.Random.DefaultPrng.init(@bitCast(std.time.nanoTimestamp()));
+    const random = prng.random();
+
+    var suffix: [8]u8 = undefined;
+    for (&suffix) |*c| {
+        c.* = "abcdefghijklmnopqrstuvwxyz0123456789"[random.intRangeAtMost(u8, 0, 35)];
+    }
+
+    const tmp_base = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const path = try std.fmt.allocPrint(allocator, "{s}/agent-devtools-{s}", .{ tmp_base, &suffix });
+
+    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            allocator.free(path);
+            return err;
+        },
+    };
+
+    return path;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
