@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 302개 (`zig build test`)
+- **테스트**: 310개 (`zig build test`)
 
 ## Architecture
 
@@ -60,7 +60,9 @@ Browser DevTools CLI for AI agents, built with Zig.
 - URL → 패턴 변환: /users/123 → /users/{userId}
 - 의미 있는 파라미터명 (이전 세그먼트 기반, 복수형 자동 단수화)
 - UUID, hex hash, 숫자 ID 자동 감지
+- 응답 JSON 스키마 자동 추론 (재귀적 object/array/nested 지원)
 - `analyze` 명령어
+- OpenAPI YAML 출력은 미구현 (JSON 출력 제공, YAML은 외부 도구 `yq` 등으로 변환 가능)
 
 ### ✅ Phase 6: 데몬 아키텍처 (순서 앞당김)
 - CLI/Daemon 같은 바이너리, 환경변수로 모드 분기
@@ -91,8 +93,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - 기본 명령어: screenshot, eval, back/forward/reload, get url/title, wait
 - Collector 용량 제한 (LRU eviction)
 - console.zig 분리 (main.zig에서 독립 모듈로)
-- analyze 응답 본문 JSON 스키마 추론
-- OpenAPI YAML 출력
+- OpenAPI YAML 출력 (현재 JSON, YAML 변환은 외부 도구로 가능)
 - Skills (SKILL.md) — Claude Code 연동
 - npm 배포 구조
 - CI 테스트 (GitHub Actions)
@@ -121,7 +122,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 사용 (`test` 블록, 소스 파일 내 작성)
-- `zig build test`로 전체 실행 (현재 302개)
+- `zig build test`로 전체 실행 (현재 310개)
 - 유닛: WebSocket 프레임, CDP 메시지, 네트워크 필터링, 데몬 프로토콜, API 분석, RemoteObject 변환
 - 통합: 실제 Chrome 스폰 + CDP 연결 (E2E 동작 확인)
 
@@ -133,7 +134,7 @@ reference/            # 참조 코드 (gitignored)
 | cdp.zig | 67 | 메시지 파싱/직렬화, 에러 코드, 편의 명령, JSON 이스케이프 |
 | chrome.zig | 41 | DevToolsActivePort, /json/version, URL 재작성, Chrome 인자, discovery |
 | main.zig | 31 | RemoteObject 변환 (18개 JS 타입), isPlannedCommand |
-| analyzer.zig | 27 | isApiRequest, extractPath, isLikelyId, pathToPattern, serialize |
+| analyzer.zig | 35 | isApiRequest, extractPath, isLikelyId, pathToPattern, inferJsonSchema, serialize |
 | daemon.zig | 18 | 소켓 경로, 직렬화, 파싱, 라운드트립, writeJsonValue |
 | network.zig | 11 | Collector lifecycle, filterByUrl, formatRequestLine |
 | root.zig | 1 | 모듈 참조 |
@@ -156,7 +157,7 @@ reference/            # 참조 코드 (gitignored)
 ```bash
 zig build              # 빌드
 zig build run          # 실행
-zig build test         # 테스트 (302개)
+zig build test         # 테스트 (310개)
 ./zig-out/bin/agent-devtools   # 직접 실행
 ```
 
