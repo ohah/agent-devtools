@@ -6,6 +6,7 @@ const websocket = agent.websocket;
 const network = agent.network;
 const daemon = agent.daemon;
 const analyzer = agent.analyzer;
+const interceptor = agent.interceptor;
 
 const Allocator = std.mem.Allocator;
 const version = "0.1.0";
@@ -105,6 +106,60 @@ pub fn main() void {
             sendAction(session, "console_clear", null, null, daemon_opts);
         } else {
             writeErr("Unknown console subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
+    } else if (std.mem.eql(u8, cmd, "intercept")) {
+        const subcmd = args_iter.next() orelse {
+            write(
+                \\Usage: agent-devtools intercept <subcommand> <pattern> [options]
+                \\
+                \\Subcommands:
+                \\  mock <pattern> <json>     Return mock response for matching URLs
+                \\  fail <pattern>            Block matching requests
+                \\  delay <pattern> <ms>      Delay matching requests
+                \\  remove <pattern>          Remove intercept rule
+                \\  list                      List active rules
+                \\  clear                     Remove all rules
+                \\
+                \\Examples:
+                \\  agent-devtools intercept mock "*api/users*" '{{"users":[]}}'
+                \\  agent-devtools intercept fail "*analytics*"
+                \\  agent-devtools intercept delay "*api*" 2000
+                \\
+            , .{});
+            return;
+        };
+
+        if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "clear")) {
+            sendAction(session, if (std.mem.eql(u8, subcmd, "list")) "intercept_list" else "intercept_clear", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "remove")) {
+            const pattern = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools intercept remove <pattern>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "intercept_remove", pattern, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "mock")) {
+            const pattern = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools intercept mock <pattern> <json>\n", .{});
+                std.process.exit(1);
+            };
+            const body = args_iter.next() orelse "{}";
+            sendAction(session, "intercept_mock", pattern, body, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "fail")) {
+            const pattern = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools intercept fail <pattern>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "intercept_fail", pattern, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "delay")) {
+            const pattern = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools intercept delay <pattern> <ms>\n", .{});
+                std.process.exit(1);
+            };
+            const ms = args_iter.next() orelse "1000";
+            sendAction(session, "intercept_delay", pattern, ms, daemon_opts);
+        } else {
+            writeErr("Unknown intercept subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
         }
     } else if (std.mem.eql(u8, cmd, "analyze")) {
@@ -295,7 +350,9 @@ fn runDaemon() void {
     var collector = network.Collector.init(allocator);
     defer collector.deinit();
 
-    // Console message storage
+    var intercept_state = interceptor.InterceptorState.init(allocator);
+    defer intercept_state.deinit();
+
     var console_messages: std.ArrayList(ConsoleEntry) = .empty;
     defer {
         for (console_messages.items) |entry| {
@@ -326,7 +383,7 @@ fn runDaemon() void {
     var cdp_fail_count: usize = 0;
 
     while (running) {
-        const drained = drainCdpEvents(&ws, allocator, &collector, &console_messages);
+        const drained = drainCdpEvents(&ws, allocator, &collector, &console_messages, &intercept_state, &cmd_id, session_id);
         if (drained == 0) {
             cdp_fail_count += 1;
         } else {
@@ -358,7 +415,7 @@ fn runDaemon() void {
 
             if (req_len > 0) {
                 last_command_time = std.time.nanoTimestamp();
-                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &console_messages, &cmd_id, session_id, &running);
+                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &console_messages, &intercept_state, &cmd_id, session_id, &running);
                 defer allocator.free(resp);
                 _ = std.posix.write(client_fd, resp) catch {};
             }
@@ -366,7 +423,15 @@ fn runDaemon() void {
     }
 }
 
-fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *network.Collector, console_msgs: *std.ArrayList(ConsoleEntry)) usize {
+fn drainCdpEvents(
+    ws: *websocket.Client,
+    allocator: Allocator,
+    collector: *network.Collector,
+    console_msgs: *std.ArrayList(ConsoleEntry),
+    intercept_state: *interceptor.InterceptorState,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+) usize {
     var count: usize = 0;
     for (0..50) |_| {
         const msg = ws.recvMessage() catch return count;
@@ -381,15 +446,63 @@ fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *netwo
                 if (parsed.message.params) |params| {
                     _ = collector.processEvent(method, params) catch {};
 
-                    // Collect console messages (Runtime.consoleAPICalled)
                     if (std.mem.eql(u8, method, "Runtime.consoleAPICalled")) {
                         collectConsoleEvent(allocator, params, console_msgs);
+                    }
+
+                    // Handle intercepted requests
+                    if (std.mem.eql(u8, method, "Fetch.requestPaused")) {
+                        handleRequestPaused(allocator, ws, intercept_state, cmd_id, session_id, params);
                     }
                 }
             }
         }
     }
     return count;
+}
+
+fn handleRequestPaused(
+    allocator: Allocator,
+    ws: *websocket.Client,
+    intercept_state: *const interceptor.InterceptorState,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    params: std.json.Value,
+) void {
+    const request_id = cdp.getString(params, "requestId") orelse return;
+    const request = cdp.getObject(params, "request") orelse return;
+    const url = cdp.getString(request, "url") orelse return;
+
+    if (intercept_state.findMatch(url)) |rule| {
+        switch (rule.action) {
+            .mock => {
+                const cmd = interceptor.buildFulfillCommand(allocator, cmd_id.next(), request_id, rule, session_id) catch return;
+                defer allocator.free(cmd);
+                ws.sendText(cmd) catch {};
+            },
+            .fail => {
+                const cmd = interceptor.buildFailCommand(allocator, cmd_id.next(), request_id, rule.error_reason, session_id) catch return;
+                defer allocator.free(cmd);
+                ws.sendText(cmd) catch {};
+            },
+            .delay => {
+                std.Thread.sleep(@as(u64, rule.delay_ms) * std.time.ns_per_ms);
+                const cmd = interceptor.buildContinueCommand(allocator, cmd_id.next(), request_id, session_id) catch return;
+                defer allocator.free(cmd);
+                ws.sendText(cmd) catch {};
+            },
+            .pass => {
+                const cmd = interceptor.buildContinueCommand(allocator, cmd_id.next(), request_id, session_id) catch return;
+                defer allocator.free(cmd);
+                ws.sendText(cmd) catch {};
+            },
+        }
+    } else {
+        // No matching rule — continue the request
+        const cmd = interceptor.buildContinueCommand(allocator, cmd_id.next(), request_id, session_id) catch return;
+        defer allocator.free(cmd);
+        ws.sendText(cmd) catch {};
+    }
 }
 
 fn collectConsoleEvent(allocator: Allocator, params: std.json.Value, console_msgs: *std.ArrayList(ConsoleEntry)) void {
@@ -519,6 +632,7 @@ fn handleCommand(
     ws: *websocket.Client,
     collector: *network.Collector,
     console_msgs: *std.ArrayList(ConsoleEntry),
+    intercept_state: *interceptor.InterceptorState,
     cmd_id: *cdp.CommandId,
     session_id: ?[]const u8,
     running: *bool,
@@ -549,6 +663,24 @@ fn handleCommand(
         return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "analyze")) {
         return handleAnalyze(allocator, ws, cmd_id, session_id, collector);
+    } else if (std.mem.eql(u8, req.action, "intercept_mock")) {
+        return handleInterceptAdd(allocator, ws, cmd_id, session_id, intercept_state, req.url, .mock, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "intercept_fail")) {
+        return handleInterceptAdd(allocator, ws, cmd_id, session_id, intercept_state, req.url, .fail, null);
+    } else if (std.mem.eql(u8, req.action, "intercept_delay")) {
+        return handleInterceptAdd(allocator, ws, cmd_id, session_id, intercept_state, req.url, .delay, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "intercept_remove")) {
+        return handleInterceptRemove(allocator, ws, cmd_id, session_id, intercept_state, req.url);
+    } else if (std.mem.eql(u8, req.action, "intercept_list")) {
+        return handleInterceptList(allocator, intercept_state);
+    } else if (std.mem.eql(u8, req.action, "intercept_clear")) {
+        intercept_state.deinit();
+        intercept_state.* = interceptor.InterceptorState.init(allocator);
+        // Disable Fetch
+        const disable = cdp.fetchDisable(allocator, cmd_id.next(), session_id) catch return respondOk(allocator);
+        defer allocator.free(disable);
+        ws.sendText(disable) catch {};
+        return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "status")) {
         return handleStatus(allocator, collector, console_msgs);
     } else if (std.mem.eql(u8, req.action, "close")) {
@@ -741,6 +873,112 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
         respondErr(allocator, "serialize error");
 }
 
+fn handleInterceptAdd(
+    allocator: Allocator,
+    ws: *websocket.Client,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    intercept_state: *interceptor.InterceptorState,
+    url_pattern: ?[]const u8,
+    action: interceptor.Action,
+    extra: ?[]const u8, // mock body or delay ms
+) []u8 {
+    const pattern = url_pattern orelse return respondErr(allocator, "URL pattern required");
+
+    var rule = interceptor.Rule{
+        .url_pattern = allocator.dupe(u8, pattern) catch return respondErr(allocator, "alloc error"),
+        .action = action,
+        .mock_body = null,
+        .mock_status = 200,
+        .mock_content_type = allocator.dupe(u8, "application/json") catch return respondErr(allocator, "alloc error"),
+        .delay_ms = 0,
+        .error_reason = allocator.dupe(u8, "BlockedByClient") catch return respondErr(allocator, "alloc error"),
+    };
+
+    switch (action) {
+        .mock => {
+            if (extra) |body| {
+                rule.mock_body = allocator.dupe(u8, body) catch null;
+            }
+        },
+        .delay => {
+            if (extra) |ms_str| {
+                rule.delay_ms = std.fmt.parseInt(u32, ms_str, 10) catch 1000;
+            }
+        },
+        else => {},
+    }
+
+    intercept_state.addRule(rule) catch return respondErr(allocator, "failed to add rule");
+
+    // Enable Fetch with updated patterns
+    const patterns = intercept_state.buildFetchPatterns(allocator) catch return respondErr(allocator, "pattern error");
+    defer allocator.free(patterns);
+
+    const enable_cmd = cdp.fetchEnable(allocator, cmd_id.next(), patterns, session_id) catch return respondErr(allocator, "cmd error");
+    defer allocator.free(enable_cmd);
+    ws.sendText(enable_cmd) catch {};
+
+    return respondOk(allocator);
+}
+
+fn handleInterceptRemove(
+    allocator: Allocator,
+    ws: *websocket.Client,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    intercept_state: *interceptor.InterceptorState,
+    url_pattern: ?[]const u8,
+) []u8 {
+    const pattern = url_pattern orelse return respondErr(allocator, "URL pattern required");
+    const removed = intercept_state.removeRule(pattern);
+    _ = removed;
+
+    if (intercept_state.ruleCount() == 0) {
+        const disable = cdp.fetchDisable(allocator, cmd_id.next(), session_id) catch return respondOk(allocator);
+        defer allocator.free(disable);
+        ws.sendText(disable) catch {};
+    } else {
+        const patterns = intercept_state.buildFetchPatterns(allocator) catch return respondOk(allocator);
+        defer allocator.free(patterns);
+        const enable_cmd = cdp.fetchEnable(allocator, cmd_id.next(), patterns, session_id) catch return respondOk(allocator);
+        defer allocator.free(enable_cmd);
+        ws.sendText(enable_cmd) catch {};
+    }
+
+    return respondOk(allocator);
+}
+
+fn handleInterceptList(allocator: Allocator, intercept_state: *const interceptor.InterceptorState) []u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const writer = buf.writer(allocator);
+
+    writer.writeByte('[') catch return respondErr(allocator, "write error");
+    for (intercept_state.rules.items, 0..) |rule, i| {
+        if (i > 0) writer.writeByte(',') catch {};
+        writer.writeAll("{\"pattern\":") catch {};
+        cdp.writeJsonString(writer, rule.url_pattern) catch {};
+        writer.writeAll(",\"action\":") catch {};
+        cdp.writeJsonString(writer, @tagName(rule.action)) catch {};
+        if (rule.action == .mock and rule.mock_body != null) {
+            writer.writeAll(",\"body\":") catch {};
+            cdp.writeJsonString(writer, rule.mock_body.?) catch {};
+        }
+        if (rule.action == .delay) {
+            std.fmt.format(writer, ",\"delayMs\":{d}", .{rule.delay_ms}) catch {};
+        }
+        writer.writeByte('}') catch {};
+    }
+    writer.writeByte(']') catch {};
+
+    const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "serialize error");
+}
+
 fn handleAnalyze(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, collector: *network.Collector) []u8 {
     var result = analyzer.analyzeRequests(allocator, collector) catch
         return respondErr(allocator, "analysis failed");
@@ -827,7 +1065,7 @@ fn handleStatus(allocator: Allocator, collector: *const network.Collector, conso
 // ============================================================================
 
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{ "intercept", "record", "replay", "diff" };
+    const planned = [_][]const u8{ "record", "replay", "diff" };
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
@@ -884,13 +1122,16 @@ test "version string is set" {
 }
 
 test "isPlannedCommand: recognizes planned commands" {
-    try std.testing.expect(isPlannedCommand("intercept"));
     try std.testing.expect(isPlannedCommand("record"));
+    try std.testing.expect(isPlannedCommand("replay"));
     try std.testing.expect(isPlannedCommand("diff"));
 }
 
-test "isPlannedCommand: analyze is now implemented" {
+test "isPlannedCommand: implemented commands are not planned" {
     try std.testing.expect(!isPlannedCommand("analyze"));
+    try std.testing.expect(!isPlannedCommand("intercept"));
+    try std.testing.expect(!isPlannedCommand("open"));
+    try std.testing.expect(!isPlannedCommand("network"));
 }
 
 test "isPlannedCommand: rejects implemented commands" {

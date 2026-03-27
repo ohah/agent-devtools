@@ -4,6 +4,7 @@ pub const chrome = @import("chrome.zig");
 pub const network = @import("network.zig");
 pub const daemon = @import("daemon.zig");
 pub const analyzer = @import("analyzer.zig");
+pub const interceptor = @import("interceptor.zig");
 
 test {
     _ = websocket;
@@ -12,4 +13,5 @@ test {
     _ = network;
     _ = daemon;
     _ = analyzer;
+    _ = interceptor;
 }
