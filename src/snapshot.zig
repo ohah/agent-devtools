@@ -392,3 +392,69 @@ test "extractAxValue: normal AXValue" {
     try testing.expectEqualStrings("button", extractAxValue(parsed.value, "role").?);
     try testing.expectEqualStrings("Submit", extractAxValue(parsed.value, "name").?);
 }
+
+test "buildBackendNodeCmd: produces valid CDP command" {
+    const cmd = try buildBackendNodeCmd(testing.allocator, 1, "DOM.getBoxModel", 42, null);
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "DOM.getBoxModel") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "42") != null);
+}
+
+test "buildClickCmd: produces mouse event" {
+    const cmd = try buildClickCmd(testing.allocator, 1, 100.5, 200.5, "mousePressed", null);
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "mousePressed") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "Input.dispatchMouseEvent") != null);
+}
+
+test "buildInsertTextCmd: escapes text" {
+    const cmd = try buildInsertTextCmd(testing.allocator, 1, "hello \"world\"", null);
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "Input.insertText") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "hello") != null);
+}
+
+test "buildSnapshot: tree depth preserved" {
+    // Node with parentId should be indented deeper
+    const json =
+        \\{"nodes":[{"nodeId":"root","ignored":false,"role":{"type":"role","value":"RootWebArea"},"name":{"type":"computedString","value":"Page"}},{"nodeId":"child","parentId":"root","ignored":false,"role":{"type":"role","value":"button"},"name":{"type":"computedString","value":"Click"},"backendDOMNodeId":1}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    var ref_map = RefMap.init(testing.allocator);
+    defer ref_map.deinit();
+
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true);
+    defer testing.allocator.free(snap);
+
+    // Child button should have indentation (depth 1 = 2 spaces)
+    try testing.expect(std.mem.indexOf(u8, snap, "  @e1 [button]") != null);
+}
+
+test "extractBoxCenter: missing content returns null" {
+    const json =
+        \\{"model":{"width":90,"height":60}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expect(extractBoxCenter(parsed.value) == null);
+}
+
+test "extractBoxCenter: insufficient items returns null" {
+    const json =
+        \\{"model":{"content":[10,20],"width":90,"height":60}}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    try testing.expect(extractBoxCenter(parsed.value) == null);
+}
+
+test "RefMap: deinit cleans up all memory" {
+    var ref_map = RefMap.init(testing.allocator);
+    _ = try ref_map.addRef(1, "button", "A");
+    _ = try ref_map.addRef(2, "link", "B");
+    _ = try ref_map.addRef(3, "textbox", "C");
+    ref_map.deinit();
+    // testing.allocator detects leaks automatically
+}

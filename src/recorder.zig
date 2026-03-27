@@ -435,3 +435,56 @@ test "serializeDiff: produces valid JSON" {
     try testing.expect(parsed.value == .object);
     try testing.expectEqual(@as(i64, 0), cdp.getInt(parsed.value, "added").?);
 }
+
+test "saveRecording + loadRecording: roundtrip with collector" {
+    var collector = network_mod.Collector.init(testing.allocator);
+    defer collector.deinit();
+
+    const req_json =
+        \\{"requestId":"RT1","request":{"url":"https://test.com/api","method":"POST","headers":{}},"type":"XHR","timestamp":1.0,"loaderId":"L","documentURL":"","initiator":{"type":"other"},"wallTime":0,"redirectHasExtraInfo":false}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, req_json, .{});
+    defer parsed.deinit();
+    _ = try collector.processEvent("Network.requestWillBeSent", parsed.value);
+
+    const json = try saveRecording(testing.allocator, "roundtrip-test", &collector, 5);
+    defer testing.allocator.free(json);
+
+    var rec = try loadRecording(testing.allocator, json);
+    defer freeRecording(testing.allocator, &rec);
+
+    try testing.expectEqualStrings("roundtrip-test", rec.name);
+    try testing.expectEqual(@as(usize, 1), rec.requests.len);
+    try testing.expectEqualStrings("POST", rec.requests[0].method);
+    try testing.expectEqual(@as(usize, 5), rec.console_count);
+}
+
+test "diffRequests: changed status" {
+    var collector = network_mod.Collector.init(testing.allocator);
+    defer collector.deinit();
+
+    // Add request with different status than baseline
+    const req_json =
+        \\{"requestId":"C1","request":{"url":"https://api.test.com/data","method":"GET","headers":{}},"type":"XHR","timestamp":1.0,"loaderId":"L","documentURL":"","initiator":{"type":"other"},"wallTime":0,"redirectHasExtraInfo":false}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, req_json, .{});
+    defer parsed.deinit();
+    _ = try collector.processEvent("Network.requestWillBeSent", parsed.value);
+
+    // Baseline has same URL but different status
+    const baseline = [_]RequestSnapshot{.{
+        .request_id = "C1",
+        .url = "https://api.test.com/data",
+        .method = "GET",
+        .status = 200, // baseline had 200
+        .mime_type = "",
+        .state = "finished",
+    }};
+
+    // Current has null status (pending)
+    var diff = try diffRequests(testing.allocator, &baseline, &collector);
+    defer diff.deinit();
+
+    try testing.expectEqual(@as(usize, 1), diff.changed);
+    try testing.expectEqual(@as(usize, 0), diff.unchanged);
+}

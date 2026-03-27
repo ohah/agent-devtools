@@ -336,3 +336,41 @@ test "buildFetchPatterns: generates correct JSON" {
     try testing.expect(std.mem.indexOf(u8, patterns, "\"urlPattern\":\"*api*\"") != null);
     try testing.expect(std.mem.indexOf(u8, patterns, "\"requestStage\":\"Request\"") != null);
 }
+
+test "matchPattern: multiple wildcards" {
+    try testing.expect(matchPattern("https://*.example.com/*/data", "https://api.example.com/v1/data"));
+    try testing.expect(!matchPattern("https://*.example.com/*/data", "https://api.other.com/v1/data"));
+}
+
+test "matchPattern: consecutive wildcards" {
+    try testing.expect(matchPattern("**api**", "https://api.test.com/data"));
+}
+
+test "buildFulfillCommand: produces valid CDP" {
+    const rule = Rule{
+        .url_pattern = @constCast("*"),
+        .action = .mock,
+        .mock_body = @constCast("{\"ok\":true}"),
+        .mock_status = 200,
+        .mock_content_type = @constCast("application/json"),
+        .delay_ms = 0,
+        .error_reason = @constCast(""),
+    };
+    const cmd = try buildFulfillCommand(testing.allocator, 1, "req-1", &rule, null);
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "Fetch.fulfillRequest") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "responseCode") != null);
+}
+
+test "buildFailCommand: produces valid CDP" {
+    const cmd = try buildFailCommand(testing.allocator, 1, "req-1", "BlockedByClient", null);
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "Fetch.failRequest") != null);
+    try testing.expect(std.mem.indexOf(u8, cmd, "BlockedByClient") != null);
+}
+
+test "buildContinueCommand: produces valid CDP" {
+    const cmd = try buildContinueCommand(testing.allocator, 1, "req-1", null);
+    defer testing.allocator.free(cmd);
+    try testing.expect(std.mem.indexOf(u8, cmd, "Fetch.continueRequest") != null);
+}
