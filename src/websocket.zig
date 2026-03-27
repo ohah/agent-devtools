@@ -346,6 +346,286 @@ fn validateClosePayload(payload: []const u8) Connection.ConnectionError!void {
 }
 
 // ============================================================================
+// WebSocket Client (TCP + Handshake + Frame I/O)
+// ============================================================================
+
+pub const Client = struct {
+    stream: std.net.Stream,
+    allocator: Allocator,
+    recv_buf: []u8,
+    recv_len: usize,
+    conn_state: Connection,
+
+    pub const ConnectError = error{
+        HandshakeFailed,
+        InvalidAcceptKey,
+    } || Allocator.Error || std.net.TcpConnectToHostError || std.net.Stream.ReadError;
+
+    pub const SendError = EncodeError || std.net.Stream.WriteError;
+    pub const RecvError = DecodeError || std.net.Stream.ReadError || error{ConnectionClosed};
+
+    const RECV_BUF_SIZE = 64 * 1024; // 64KB receive buffer
+
+    /// Connect to a WebSocket server at the given URL.
+    /// URL format: ws://host:port/path
+    pub fn connect(allocator: Allocator, url: []const u8) ConnectError!Client {
+        const parsed = parseWsUrl(url) orelse return error.HandshakeFailed;
+
+        const stream = try std.net.tcpConnectToHost(allocator, parsed.host, parsed.port);
+        errdefer stream.close();
+
+        const recv_buf = try allocator.alloc(u8, RECV_BUF_SIZE);
+        errdefer allocator.free(recv_buf);
+
+        var client = Client{
+            .stream = stream,
+            .allocator = allocator,
+            .recv_buf = recv_buf,
+            .recv_len = 0,
+            .conn_state = Connection.init(),
+        };
+
+        try client.performHandshake(parsed.host, parsed.port, parsed.path);
+
+        return client;
+    }
+
+    pub fn close(self: *Client) void {
+        self.stream.close();
+        self.allocator.free(self.recv_buf);
+    }
+
+    /// Send a text message over WebSocket.
+    pub fn sendText(self: *Client, payload: []const u8) SendError!void {
+        const frame = try encode(self.allocator, .text, payload);
+        defer self.allocator.free(frame);
+
+        var total_written: usize = 0;
+        while (total_written < frame.len) {
+            total_written += self.stream.write(frame[total_written..]) catch |err| switch (err) {
+                error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+                else => return err,
+            };
+        }
+    }
+
+    /// Send a ping frame.
+    pub fn sendPing(self: *Client) SendError!void {
+        const frame = try encode(self.allocator, .ping, "");
+        defer self.allocator.free(frame);
+
+        _ = self.stream.write(frame) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+            else => return err,
+        };
+    }
+
+    /// Send a close frame.
+    pub fn sendClose(self: *Client, code: u16, reason: []const u8) SendError!void {
+        const frame = try encodeClose(self.allocator, code, reason);
+        defer self.allocator.free(frame);
+
+        _ = self.stream.write(frame) catch |err| switch (err) {
+            error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
+            else => return err,
+        };
+        self.conn_state.markCloseSent();
+    }
+
+    /// Receive the next text/binary message. Handles ping/pong/close automatically.
+    /// Returns the payload as an owned slice (caller must free).
+    pub fn recvMessage(self: *Client) (RecvError || Allocator.Error)![]u8 {
+        while (true) {
+            // Try to decode a frame from the buffer
+            if (self.recv_len > 0) {
+                const result = decode(self.recv_buf[0..self.recv_len]) catch |err| switch (err) {
+                    error.InsufficientData => {
+                        // Need more data, fall through to read
+                        if (self.recv_len >= self.recv_buf.len) {
+                            // Buffer full but still insufficient — frame too large
+                            return error.InsufficientData;
+                        }
+                        const n = self.stream.read(self.recv_buf[self.recv_len..]) catch |e| return e;
+                        if (n == 0) return error.ConnectionClosed;
+                        self.recv_len += n;
+                        continue;
+                    },
+                    else => return err,
+                };
+
+                const frame = result.frame;
+
+                // Shift consumed bytes
+                const remaining = self.recv_len - result.bytes_consumed;
+                if (remaining > 0) {
+                    std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[result.bytes_consumed..self.recv_len]);
+                }
+                self.recv_len = remaining;
+
+                // Handle control frames automatically
+                switch (frame.opcode) {
+                    .ping => {
+                        // Respond with pong (same payload)
+                        const pong = encode(self.allocator, .pong, frame.payload) catch continue;
+                        defer self.allocator.free(pong);
+                        _ = self.stream.write(pong) catch {};
+                        continue;
+                    },
+                    .pong => continue,
+                    .close => {
+                        self.conn_state.close_received = true;
+                        return error.ConnectionClosed;
+                    },
+                    .text, .binary => {
+                        // Return the payload as an owned copy
+                        const payload = try self.allocator.alloc(u8, frame.payload.len);
+                        @memcpy(payload, frame.payload);
+                        return payload;
+                    },
+                    .continuation => continue, // TODO: fragmentation support
+                    _ => continue,
+                }
+            }
+
+            // Buffer empty, read from socket
+            const n = self.stream.read(self.recv_buf[self.recv_len..]) catch |err| return err;
+            if (n == 0) return error.ConnectionClosed;
+            self.recv_len += n;
+        }
+    }
+
+    fn performHandshake(self: *Client, host: []const u8, port: u16, path: []const u8) ConnectError!void {
+        const key = generateHandshakeKey();
+
+        // Build host header value
+        var host_buf: [256]u8 = undefined;
+        const host_header = std.fmt.bufPrint(&host_buf, "{s}:{d}", .{ host, port }) catch return error.HandshakeFailed;
+
+        const request = buildHandshakeRequest(self.allocator, host_header, path, &key) catch return error.HandshakeFailed;
+        defer self.allocator.free(request);
+
+        // Send handshake request
+        var written: usize = 0;
+        while (written < request.len) {
+            written += self.stream.write(request[written..]) catch |err| return err;
+        }
+
+        // Read response
+        var response_buf: [4096]u8 = undefined;
+        var response_len: usize = 0;
+
+        while (response_len < response_buf.len) {
+            const n = self.stream.read(response_buf[response_len..]) catch |err| return err;
+            if (n == 0) return error.HandshakeFailed;
+            response_len += n;
+
+            // Check if we have the complete response (ends with \r\n\r\n)
+            if (std.mem.indexOf(u8, response_buf[0..response_len], "\r\n\r\n")) |header_end| {
+                const response = response_buf[0 .. header_end + 4];
+
+                // Verify HTTP 101
+                if (!std.mem.startsWith(u8, response, "HTTP/1.1 101")) return error.HandshakeFailed;
+
+                // Verify Sec-WebSocket-Accept
+                const expected_accept = computeAcceptKey(&key);
+                if (std.mem.indexOf(u8, response, &expected_accept) == null) return error.InvalidAcceptKey;
+
+                // Move any leftover data (after headers) into recv_buf
+                const leftover_start = header_end + 4;
+                const leftover_len = response_len - leftover_start;
+                if (leftover_len > 0) {
+                    @memcpy(self.recv_buf[0..leftover_len], response_buf[leftover_start..response_len]);
+                    self.recv_len = leftover_len;
+                }
+
+                return;
+            }
+        }
+
+        return error.HandshakeFailed;
+    }
+};
+
+/// Parse ws://host:port/path URL into components.
+fn parseWsUrl(url: []const u8) ?struct { host: []const u8, port: u16, path: []const u8 } {
+    const prefix_len: usize = if (std.mem.startsWith(u8, url, "ws://"))
+        5
+    else if (std.mem.startsWith(u8, url, "wss://"))
+        6
+    else
+        return null;
+
+    const rest = url[prefix_len..];
+
+    // Find path
+    const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
+    const path = if (path_start < rest.len) rest[path_start..] else "/";
+    const host_port = rest[0..path_start];
+
+    // Split host:port
+    if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
+        const host = host_port[0..colon];
+        const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return null;
+        return .{ .host = host, .port = port, .path = path };
+    }
+
+    // No port — default based on scheme
+    const default_port: u16 = if (prefix_len == 6) 443 else 80;
+    return .{ .host = host_port, .port = default_port, .path = path };
+}
+
+// ============================================================================
+// Tests: parseWsUrl
+// ============================================================================
+
+test "parseWsUrl: full URL" {
+    const r = parseWsUrl("ws://127.0.0.1:9222/devtools/browser/abc").?;
+    try testing.expectEqualStrings("127.0.0.1", r.host);
+    try testing.expectEqual(@as(u16, 9222), r.port);
+    try testing.expectEqualStrings("/devtools/browser/abc", r.path);
+}
+
+test "parseWsUrl: no path" {
+    const r = parseWsUrl("ws://localhost:9222").?;
+    try testing.expectEqualStrings("localhost", r.host);
+    try testing.expectEqual(@as(u16, 9222), r.port);
+    try testing.expectEqualStrings("/", r.path);
+}
+
+test "parseWsUrl: no port defaults to 80" {
+    const r = parseWsUrl("ws://example.com/path").?;
+    try testing.expectEqualStrings("example.com", r.host);
+    try testing.expectEqual(@as(u16, 80), r.port);
+    try testing.expectEqualStrings("/path", r.path);
+}
+
+test "parseWsUrl: wss defaults to 443" {
+    const r = parseWsUrl("wss://example.com/path").?;
+    try testing.expectEqual(@as(u16, 443), r.port);
+}
+
+test "parseWsUrl: invalid scheme" {
+    try testing.expect(parseWsUrl("http://example.com") == null);
+}
+
+test "parseWsUrl: empty" {
+    try testing.expect(parseWsUrl("") == null);
+}
+
+test "parseWsUrl: root path" {
+    const r = parseWsUrl("ws://host:1234/").?;
+    try testing.expectEqualStrings("/", r.path);
+}
+
+test "parseWsUrl: port only no host (edge)" {
+    // ":9222" is not valid
+    const r = parseWsUrl("ws://:9222/path");
+    if (r) |result| {
+        try testing.expectEqualStrings("", result.host);
+    }
+}
+
+// ============================================================================
 // Tests: Frame Decoding
 // ============================================================================
 
