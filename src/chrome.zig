@@ -72,23 +72,14 @@ pub fn parseJsonList(allocator: Allocator, body: []const u8) ?[]const u8 {
     return null;
 }
 
+const websocket = @import("websocket.zig");
+
 /// Rewrite host and port in a WebSocket URL.
 /// Chrome's /json/version always returns ws://127.0.0.1:<local-port>/...
 /// which is unreachable when behind port-forward or on remote machine.
 pub fn rewriteWsHost(allocator: Allocator, ws_url: []const u8, host: []const u8, port: u16) ![]u8 {
-    const prefix: usize = if (std.mem.startsWith(u8, ws_url, "wss://"))
-        6
-    else if (std.mem.startsWith(u8, ws_url, "ws://"))
-        5
-    else
-        return allocator.dupe(u8, ws_url);
-
-    const scheme = ws_url[0..prefix];
-    const rest = ws_url[prefix..];
-    const path_start = std.mem.indexOfScalar(u8, rest, '/') orelse rest.len;
-    const path = rest[path_start..];
-
-    return std.fmt.allocPrint(allocator, "{s}{s}:{d}{s}", .{ scheme, host, port, path });
+    const parts = websocket.parseWsUrl(ws_url) orelse return allocator.dupe(u8, ws_url);
+    return std.fmt.allocPrint(allocator, "{s}{s}:{d}{s}", .{ parts.scheme, host, port, parts.path });
 }
 
 /// Extract WebSocket debugger URL from stderr line.
@@ -290,23 +281,21 @@ fn waitForWsUrl(allocator: Allocator, child: *std.process.Child, user_data_dir: 
 }
 
 fn createTempDir(allocator: Allocator) ![]u8 {
-    var prng = std.Random.DefaultPrng.init(@bitCast(std.time.nanoTimestamp()));
-    const random = prng.random();
-
-    var suffix: [8]u8 = undefined;
+    const charset = "abcdefghijklmnopqrstuvwxyz0123456789";
+    var suffix: [12]u8 = undefined;
+    std.crypto.random.bytes(&suffix);
     for (&suffix) |*c| {
-        c.* = "abcdefghijklmnopqrstuvwxyz0123456789"[random.intRangeAtMost(u8, 0, 35)];
+        c.* = charset[c.* % charset.len];
     }
 
     const tmp_base = std.posix.getenv("TMPDIR") orelse "/tmp";
     const path = try std.fmt.allocPrint(allocator, "{s}/agent-devtools-{s}", .{ tmp_base, &suffix });
+    errdefer allocator.free(path);
 
-    std.fs.makeDirAbsolute(path) catch |err| switch (err) {
-        error.PathAlreadyExists => {},
-        else => {
-            allocator.free(path);
-            return err;
-        },
+    // Use exclusive creation — if path exists, it's a collision, retry would be needed.
+    // With 12 chars from 36-char alphabet, collision probability is ~1 in 4.7 trillion.
+    std.fs.makeDirAbsolute(path) catch |err| {
+        return err;
     };
 
     return path;
@@ -443,10 +432,10 @@ test "rewriteWsHost: preserves wss scheme" {
     try testing.expectEqualStrings("wss://remote.host:8443/devtools/browser/abc", result);
 }
 
-test "rewriteWsHost: no path" {
+test "rewriteWsHost: no path gets default /" {
     const result = try rewriteWsHost(testing.allocator, "ws://127.0.0.1:9222", "other", 1234);
     defer testing.allocator.free(result);
-    try testing.expectEqualStrings("ws://other:1234", result);
+    try testing.expectEqualStrings("ws://other:1234/", result);
 }
 
 test "rewriteWsHost: non-ws URL returned as-is" {

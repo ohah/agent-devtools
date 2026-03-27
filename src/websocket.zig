@@ -395,59 +395,40 @@ pub const Client = struct {
         self.allocator.free(self.recv_buf);
     }
 
-    /// Send a text message over WebSocket.
     pub fn sendText(self: *Client, payload: []const u8) SendError!void {
         const frame = try encode(self.allocator, .text, payload);
         defer self.allocator.free(frame);
-
-        var total_written: usize = 0;
-        while (total_written < frame.len) {
-            total_written += self.stream.write(frame[total_written..]) catch |err| switch (err) {
-                error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
-                else => return err,
-            };
-        }
+        try self.writeAll(frame);
     }
 
-    /// Send a ping frame.
     pub fn sendPing(self: *Client) SendError!void {
         const frame = try encode(self.allocator, .ping, "");
         defer self.allocator.free(frame);
-
-        _ = self.stream.write(frame) catch |err| switch (err) {
-            error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
-            else => return err,
-        };
+        try self.writeAll(frame);
     }
 
-    /// Send a close frame.
     pub fn sendClose(self: *Client, code: u16, reason: []const u8) SendError!void {
         const frame = try encodeClose(self.allocator, code, reason);
         defer self.allocator.free(frame);
-
-        _ = self.stream.write(frame) catch |err| switch (err) {
-            error.ConnectionResetByPeer => return error.ConnectionResetByPeer,
-            else => return err,
-        };
+        try self.writeAll(frame);
         self.conn_state.markCloseSent();
+    }
+
+    fn writeAll(self: *Client, data: []const u8) SendError!void {
+        var written: usize = 0;
+        while (written < data.len) {
+            written += self.stream.write(data[written..]) catch |err| return err;
+        }
     }
 
     /// Receive the next text/binary message. Handles ping/pong/close automatically.
     /// Returns the payload as an owned slice (caller must free).
     pub fn recvMessage(self: *Client) (RecvError || Allocator.Error)![]u8 {
         while (true) {
-            // Try to decode a frame from the buffer
             if (self.recv_len > 0) {
                 const result = decode(self.recv_buf[0..self.recv_len]) catch |err| switch (err) {
                     error.InsufficientData => {
-                        // Need more data, fall through to read
-                        if (self.recv_len >= self.recv_buf.len) {
-                            // Buffer full but still insufficient — frame too large
-                            return error.InsufficientData;
-                        }
-                        const n = self.stream.read(self.recv_buf[self.recv_len..]) catch |e| return e;
-                        if (n == 0) return error.ConnectionClosed;
-                        self.recv_len += n;
+                        try self.growOrRead();
                         continue;
                     },
                     else => return err,
@@ -455,43 +436,76 @@ pub const Client = struct {
 
                 const frame = result.frame;
 
-                // Shift consumed bytes
-                const remaining = self.recv_len - result.bytes_consumed;
-                if (remaining > 0) {
-                    std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[result.bytes_consumed..self.recv_len]);
-                }
-                self.recv_len = remaining;
-
-                // Handle control frames automatically
+                // CRITICAL: copy payload BEFORE shifting buffer.
+                // frame.payload is a slice into recv_buf — shifting invalidates it.
                 switch (frame.opcode) {
                     .ping => {
-                        // Respond with pong (same payload)
-                        const pong = encode(self.allocator, .pong, frame.payload) catch continue;
+                        const ping_data = try self.allocator.alloc(u8, frame.payload.len);
+                        defer self.allocator.free(ping_data);
+                        @memcpy(ping_data, frame.payload);
+                        self.shiftBuffer(result.bytes_consumed);
+                        const pong = encode(self.allocator, .pong, ping_data) catch continue;
                         defer self.allocator.free(pong);
-                        _ = self.stream.write(pong) catch {};
+                        self.writeAll(pong) catch {};
                         continue;
                     },
-                    .pong => continue,
+                    .pong => {
+                        self.shiftBuffer(result.bytes_consumed);
+                        continue;
+                    },
                     .close => {
+                        self.shiftBuffer(result.bytes_consumed);
                         self.conn_state.close_received = true;
                         return error.ConnectionClosed;
                     },
                     .text, .binary => {
-                        // Return the payload as an owned copy
                         const payload = try self.allocator.alloc(u8, frame.payload.len);
                         @memcpy(payload, frame.payload);
+                        self.shiftBuffer(result.bytes_consumed);
                         return payload;
                     },
-                    .continuation => continue, // TODO: fragmentation support
-                    _ => continue,
+                    .continuation => {
+                        self.shiftBuffer(result.bytes_consumed);
+                        continue;
+                    },
+                    _ => {
+                        self.shiftBuffer(result.bytes_consumed);
+                        continue;
+                    },
                 }
             }
 
-            // Buffer empty, read from socket
             const n = self.stream.read(self.recv_buf[self.recv_len..]) catch |err| return err;
             if (n == 0) return error.ConnectionClosed;
             self.recv_len += n;
         }
+    }
+
+    fn shiftBuffer(self: *Client, consumed: usize) void {
+        const remaining = self.recv_len - consumed;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.recv_buf[0..remaining], self.recv_buf[consumed..self.recv_len]);
+        }
+        self.recv_len = remaining;
+    }
+
+    /// Grow buffer or read more data when frame is incomplete.
+    fn growOrRead(self: *Client) (RecvError || Allocator.Error)!void {
+        if (self.recv_len >= self.recv_buf.len) {
+            // Buffer full — grow it (double, up to 16MB max)
+            const max_size = 16 * 1024 * 1024;
+            if (self.recv_buf.len >= max_size) return error.InsufficientData;
+
+            const new_size = @min(self.recv_buf.len * 2, max_size);
+            const new_buf = try self.allocator.alloc(u8, new_size);
+            @memcpy(new_buf[0..self.recv_len], self.recv_buf[0..self.recv_len]);
+            self.allocator.free(self.recv_buf);
+            self.recv_buf = new_buf;
+        }
+
+        const n = self.stream.read(self.recv_buf[self.recv_len..]) catch |err| return err;
+        if (n == 0) return error.ConnectionClosed;
+        self.recv_len += n;
     }
 
     fn performHandshake(self: *Client, host: []const u8, port: u16, path: []const u8) ConnectError!void {
@@ -504,11 +518,7 @@ pub const Client = struct {
         const request = buildHandshakeRequest(self.allocator, host_header, path, &key) catch return error.HandshakeFailed;
         defer self.allocator.free(request);
 
-        // Send handshake request
-        var written: usize = 0;
-        while (written < request.len) {
-            written += self.stream.write(request[written..]) catch |err| return err;
-        }
+        self.writeAll(request) catch return error.HandshakeFailed;
 
         // Read response
         var response_buf: [4096]u8 = undefined;
@@ -546,8 +556,10 @@ pub const Client = struct {
     }
 };
 
+pub const WsUrlParts = struct { host: []const u8, port: u16, path: []const u8, scheme: []const u8 };
+
 /// Parse ws://host:port/path URL into components.
-fn parseWsUrl(url: []const u8) ?struct { host: []const u8, port: u16, path: []const u8 } {
+pub fn parseWsUrl(url: []const u8) ?WsUrlParts {
     const prefix_len: usize = if (std.mem.startsWith(u8, url, "ws://"))
         5
     else if (std.mem.startsWith(u8, url, "wss://"))
@@ -563,15 +575,16 @@ fn parseWsUrl(url: []const u8) ?struct { host: []const u8, port: u16, path: []co
     const host_port = rest[0..path_start];
 
     // Split host:port
+    const scheme = url[0..prefix_len];
+
     if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
         const host = host_port[0..colon];
         const port = std.fmt.parseInt(u16, host_port[colon + 1 ..], 10) catch return null;
-        return .{ .host = host, .port = port, .path = path };
+        return .{ .host = host, .port = port, .path = path, .scheme = scheme };
     }
 
-    // No port — default based on scheme
     const default_port: u16 = if (prefix_len == 6) 443 else 80;
-    return .{ .host = host_port, .port = default_port, .path = path };
+    return .{ .host = host_port, .port = default_port, .path = path, .scheme = scheme };
 }
 
 // ============================================================================
