@@ -8,6 +8,7 @@ const daemon = agent.daemon;
 const analyzer = agent.analyzer;
 const interceptor = agent.interceptor;
 const recorder = agent.recorder;
+const snapshot_mod = agent.snapshot;
 
 const Allocator = std.mem.Allocator;
 const version = "0.1.0";
@@ -168,6 +169,42 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "screenshot")) {
         const path = args_iter.next();
         sendAction(session, "screenshot", path, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "snapshot")) {
+        const flag = args_iter.next();
+        const interactive = if (flag) |f| std.mem.eql(u8, f, "-i") else false;
+        sendAction(session, if (interactive) "snapshot_interactive" else "snapshot", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "click")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools click <@ref or selector>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "click", target, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "fill")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools fill <@ref> <text>\n", .{});
+            std.process.exit(1);
+        };
+        const text = args_iter.next() orelse "";
+        sendAction(session, "fill", target, text, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "type")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools type <@ref> <text>\n", .{});
+            std.process.exit(1);
+        };
+        const text = args_iter.next() orelse "";
+        sendAction(session, "type_text", target, text, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "press")) {
+        const key = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools press <key>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "press", key, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "hover")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools hover <@ref>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "hover", target, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "eval")) {
         const expr = args_iter.next() orelse {
             writeErr("Usage: agent-devtools eval <expression>\n", .{});
@@ -397,6 +434,9 @@ fn runDaemon() void {
     var intercept_state = interceptor.InterceptorState.init(allocator);
     defer intercept_state.deinit();
 
+    var ref_map = snapshot_mod.RefMap.init(allocator);
+    defer ref_map.deinit();
+
     var console_messages: std.ArrayList(ConsoleEntry) = .empty;
     defer {
         for (console_messages.items) |entry| {
@@ -459,7 +499,7 @@ fn runDaemon() void {
 
             if (req_len > 0) {
                 last_command_time = std.time.nanoTimestamp();
-                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &console_messages, &intercept_state, &cmd_id, session_id, &running);
+                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &console_messages, &intercept_state, &ref_map, &cmd_id, session_id, &running);
                 defer allocator.free(resp);
                 _ = std.posix.write(client_fd, resp) catch {};
             }
@@ -677,6 +717,7 @@ fn handleCommand(
     collector: *network.Collector,
     console_msgs: *std.ArrayList(ConsoleEntry),
     intercept_state: *interceptor.InterceptorState,
+    ref_map: *snapshot_mod.RefMap,
     cmd_id: *cdp.CommandId,
     session_id: ?[]const u8,
     running: *bool,
@@ -707,6 +748,16 @@ fn handleCommand(
         return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "analyze")) {
         return handleAnalyze(allocator, ws, cmd_id, session_id, collector);
+    } else if (std.mem.eql(u8, req.action, "snapshot") or std.mem.eql(u8, req.action, "snapshot_interactive")) {
+        return handleSnapshot(allocator, ws, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"));
+    } else if (std.mem.eql(u8, req.action, "click")) {
+        return handleClick(allocator, ws, cmd_id, session_id, ref_map, collector, req.url);
+    } else if (std.mem.eql(u8, req.action, "fill") or std.mem.eql(u8, req.action, "type_text")) {
+        return handleFill(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "press")) {
+        return handlePress(allocator, ws, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "hover")) {
+        return handleClick(allocator, ws, cmd_id, session_id, ref_map, collector, req.url); // Same as click but mouseMoved only
     } else if (std.mem.eql(u8, req.action, "screenshot")) {
         return handleScreenshot(allocator, ws, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "eval")) {
@@ -938,6 +989,161 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
 
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
         respondErr(allocator, "serialize error");
+}
+
+fn handleSnapshot(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool) []u8 {
+    // Clear old refs
+    ref_map.deinit();
+    ref_map.* = snapshot_mod.RefMap.init(allocator);
+
+    // Get AX tree
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Accessibility.getFullAXTree", null, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(5000);
+    defer ws.setReadTimeout(100);
+
+    for (0..30) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                const snap = snapshot_mod.buildSnapshot(allocator, result, ref_map, interactive_only) catch
+                    return respondErr(allocator, "snapshot build error");
+                defer allocator.free(snap);
+
+                // Return snapshot text as JSON string
+                var resp_buf: std.ArrayList(u8) = .empty;
+                defer resp_buf.deinit(allocator);
+                cdp.writeJsonString(resp_buf.writer(allocator), snap) catch
+                    return respondErr(allocator, "serialize error");
+
+                const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                defer allocator.free(data);
+
+                return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+                    respondErr(allocator, "resp error");
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "snapshot timeout");
+}
+
+fn handleClick(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found — run 'snapshot -i' first");
+
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+
+    // Get element coordinates
+    const box_cmd = snapshot_mod.buildGetBoxModelCmd(allocator, cmd_id.next(), backend_id, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(box_cmd);
+    ws.sendText(box_cmd) catch return respondErr(allocator, "send error");
+
+    ws.setReadTimeout(3000);
+    defer ws.setReadTimeout(100);
+
+    for (0..10) |_| {
+        const msg = ws.recvMessage() catch break;
+        defer allocator.free(msg);
+
+        const parsed = cdp.parseMessage(allocator, msg) catch continue;
+        defer parsed.parsed.deinit();
+
+        if (parsed.message.isEvent()) {
+            if (parsed.message.method) |method| {
+                if (parsed.message.params) |params| {
+                    _ = collector.processEvent(method, params) catch {};
+                }
+            }
+            continue;
+        }
+
+        if (parsed.message.isResponse()) {
+            if (parsed.message.result) |result| {
+                const center = snapshot_mod.extractBoxCenter(result) orelse
+                    return respondErr(allocator, "element not visible");
+
+                // mousePressed + mouseReleased = click
+                const press_cmd = snapshot_mod.buildClickCmd(allocator, cmd_id.next(), center.x, center.y, "mousePressed", session_id) catch return respondErr(allocator, "cmd error");
+                defer allocator.free(press_cmd);
+                ws.sendText(press_cmd) catch {};
+
+                const release_cmd = snapshot_mod.buildClickCmd(allocator, cmd_id.next(), center.x, center.y, "mouseReleased", session_id) catch return respondErr(allocator, "cmd error");
+                defer allocator.free(release_cmd);
+                ws.sendText(release_cmd) catch {};
+
+                return respondOk(allocator);
+            }
+            break;
+        }
+    }
+    return respondErr(allocator, "click timeout");
+}
+
+fn handleFill(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8, text: ?[]const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    const fill_text = text orelse "";
+
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found — run 'snapshot -i' first");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+
+    // Focus the element
+    const focus_cmd = snapshot_mod.buildFocusCmd(allocator, cmd_id.next(), backend_id, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(focus_cmd);
+    ws.sendText(focus_cmd) catch return respondErr(allocator, "send error");
+
+    // Clear existing content (select all + delete)
+    const select_all = cdp.runtimeEvaluate(allocator, cmd_id.next(), "document.execCommand('selectAll')", session_id) catch return respondErr(allocator, "cmd error");
+    defer allocator.free(select_all);
+    ws.sendText(select_all) catch {};
+
+    _ = collector;
+
+    // Small delay for focus
+    std.Thread.sleep(50 * std.time.ns_per_ms);
+
+    // Insert text
+    const insert_cmd = snapshot_mod.buildInsertTextCmd(allocator, cmd_id.next(), fill_text, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(insert_cmd);
+    ws.sendText(insert_cmd) catch return respondErr(allocator, "send error");
+
+    return respondOk(allocator);
+}
+
+fn handlePress(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8) []u8 {
+    const key_name = key orelse return respondErr(allocator, "key required");
+
+    // Map common key names to CDP key event params
+    var buf: [256]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"keyDown\",\"key\":\"{s}\"}}", .{key_name}) catch
+        return respondErr(allocator, "key too long");
+
+    const cmd1 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd1);
+    ws.sendText(cmd1) catch {};
+
+    const params_up = std.fmt.bufPrint(&buf, "{{\"type\":\"keyUp\",\"key\":\"{s}\"}}", .{key_name}) catch
+        return respondErr(allocator, "key too long");
+
+    const cmd2 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params_up, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd2);
+    ws.sendText(cmd2) catch {};
+
+    return respondOk(allocator);
 }
 
 fn handleScreenshot(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {

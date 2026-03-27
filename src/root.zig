@@ -6,6 +6,7 @@ pub const daemon = @import("daemon.zig");
 pub const analyzer = @import("analyzer.zig");
 pub const interceptor = @import("interceptor.zig");
 pub const recorder = @import("recorder.zig");
+pub const snapshot = @import("snapshot.zig");
 
 test {
     _ = websocket;
@@ -16,4 +17,5 @@ test {
     _ = analyzer;
     _ = interceptor;
     _ = recorder;
+    _ = snapshot;
 }
