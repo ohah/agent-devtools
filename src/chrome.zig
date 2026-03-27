@@ -92,6 +92,67 @@ pub fn parseStderrForWsUrl(line: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Discover CDP WebSocket URL by querying /json/version on the given port.
+/// Does a raw HTTP GET and parses the JSON response.
+/// Fetch a URL via raw HTTP GET. Returns the response body.
+pub fn httpGet(allocator: Allocator, host: []const u8, port: u16, path: []const u8) ![]u8 {
+    const stream = try std.net.tcpConnectToHost(allocator, host, port);
+    defer stream.close();
+
+    // Set read timeout so we don't block forever if server keeps connection open
+    const timeval = std.posix.timeval{ .sec = 2, .usec = 0 };
+    std.posix.setsockopt(stream.handle, std.posix.SOL.SOCKET, std.c.SO.RCVTIMEO, std.mem.asBytes(&timeval)) catch {};
+
+    var req_buf: [512]u8 = undefined;
+    const request = std.fmt.bufPrint(&req_buf, "GET {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n\r\n", .{ path, host, port }) catch return error.Overflow;
+
+    var total_written: usize = 0;
+    while (total_written < request.len) {
+        total_written += stream.write(request[total_written..]) catch return error.ConnectionRefused;
+    }
+
+    var resp_buf: [8192]u8 = undefined;
+    var resp_len: usize = 0;
+    while (resp_len < resp_buf.len) {
+        const n = stream.read(resp_buf[resp_len..]) catch break;
+        if (n == 0) break;
+        resp_len += n;
+        // Early exit: if we have headers + body, no need to wait for close
+        if (std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n")) |hdr_end| {
+            // Check if we have Content-Length and got enough data
+            const headers = resp_buf[0..hdr_end];
+            if (std.mem.indexOf(u8, headers, "Content-Length: ")) |cl_start| {
+                const cl_val_start = cl_start + "Content-Length: ".len;
+                const cl_end = std.mem.indexOfScalarPos(u8, headers, cl_val_start, '\r') orelse continue;
+                const content_length = std.fmt.parseInt(usize, headers[cl_val_start..cl_end], 10) catch continue;
+                const body_start = hdr_end + 4;
+                if (resp_len - body_start >= content_length) break;
+            }
+        }
+    }
+
+    if (resp_len == 0) return error.EndOfStream;
+
+    // Find body after \r\n\r\n
+    const header_end = std.mem.indexOf(u8, resp_buf[0..resp_len], "\r\n\r\n") orelse return error.InvalidResponse;
+    const body = resp_buf[header_end + 4 .. resp_len];
+
+    return allocator.dupe(u8, body);
+}
+
+/// Discover CDP WebSocket URL by querying /json/version on the given port.
+pub fn discoverWsUrl(allocator: Allocator, host: []const u8, port: u16) ![]u8 {
+    const body = try httpGet(allocator, host, port, "/json/version");
+    defer allocator.free(body);
+
+    if (parseJsonVersion(allocator, body)) |ws_url| {
+        defer allocator.free(ws_url);
+        return rewriteWsHost(allocator, ws_url, host, port);
+    }
+
+    return error.InvalidResponse;
+}
+
 /// Find Chrome executable on the system.
 pub fn findChrome() ?[]const u8 {
     const candidates = switch (builtin.os.tag) {

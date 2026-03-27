@@ -204,14 +204,20 @@ fn runDaemon() void {
     var chrome_proc: ?chrome.ChromeProcess = null;
     defer if (chrome_proc) |*cp| cp.deinit();
 
-    var ws_url_buf: [256]u8 = undefined;
+    var discovered_url: ?[]u8 = null;
+    defer if (discovered_url) |u| allocator.free(u);
+
     const ws_url: []const u8 = if (ext_port) |port_str| blk: {
         const port = std.fmt.parseInt(u16, port_str, 10) catch {
             std.debug.print("Daemon: Invalid port: {s}\n", .{port_str});
             return;
         };
-        // TODO: use /json/version discovery for correct path with GUID
-        break :blk std.fmt.bufPrint(&ws_url_buf, "ws://127.0.0.1:{d}/devtools/browser", .{port}) catch return;
+        // Discover the correct WebSocket URL via /json/version
+        discovered_url = chrome.discoverWsUrl(allocator, "127.0.0.1", port) catch |err| {
+            std.debug.print("Daemon: Failed to discover CDP URL on port {d}: {s}\n", .{ port, @errorName(err) });
+            return;
+        };
+        break :blk discovered_url.?;
     } else blk: {
         chrome_proc = chrome.ChromeProcess.launch(allocator, .{ .headless = !is_headed }) catch |err| {
             std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
