@@ -9,6 +9,12 @@ const daemon = agent.daemon;
 const Allocator = std.mem.Allocator;
 const version = "0.1.0";
 
+const ConsoleEntry = struct {
+    log_type: []u8, // "log", "warn", "error", "info", "debug"
+    text: []u8,
+    timestamp: f64,
+};
+
 pub fn main() void {
     if (std.posix.getenv("AGENT_DEVTOOLS_DAEMON")) |_| {
         runDaemon();
@@ -20,11 +26,17 @@ pub fn main() void {
 
     // Parse --session flag (can appear before command)
     var session: []const u8 = "default";
+    var headed = false;
+    var cdp_port: ?[]const u8 = null;
     var command: ?[]const u8 = null;
 
     while (args_iter.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--session=")) {
             session = arg["--session=".len..];
+        } else if (std.mem.eql(u8, arg, "--headed")) {
+            headed = true;
+        } else if (std.mem.startsWith(u8, arg, "--port=")) {
+            cdp_port = arg["--port=".len..];
         } else if (command == null) {
             command = arg;
             break;
@@ -34,6 +46,11 @@ pub fn main() void {
     const cmd = command orelse {
         printUsage();
         return;
+    };
+
+    const daemon_opts = daemon.DaemonOptions{
+        .headed = headed,
+        .cdp_port = cdp_port,
     };
 
     if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -51,19 +68,19 @@ pub fn main() void {
             writeErr("Usage: agent-devtools open <url>\n", .{});
             std.process.exit(1);
         };
-        sendAction(session, "open", url, null);
+        sendAction(session, "open", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "network")) {
         const subcmd = args_iter.next() orelse "list";
         if (std.mem.eql(u8, subcmd, "list")) {
-            sendAction(session, "network_list", null, args_iter.next());
+            sendAction(session, "network_list", null, args_iter.next(), daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const req_id = args_iter.next() orelse {
                 writeErr("Usage: agent-devtools network get <requestId>\n", .{});
                 std.process.exit(1);
             };
-            sendAction(session, "network_get", req_id, null);
+            sendAction(session, "network_get", req_id, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "clear")) {
-            sendAction(session, "network_clear", null, null);
+            sendAction(session, "network_clear", null, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "help")) {
             write(
                 \\Usage: agent-devtools network <subcommand>
@@ -79,10 +96,20 @@ pub fn main() void {
             writeErr("Unknown network subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
         }
+    } else if (std.mem.eql(u8, cmd, "console")) {
+        const subcmd = args_iter.next() orelse "list";
+        if (std.mem.eql(u8, subcmd, "list")) {
+            sendAction(session, "console_list", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "clear")) {
+            sendAction(session, "console_clear", null, null, daemon_opts);
+        } else {
+            writeErr("Unknown console subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, cmd, "status")) {
-        sendAction(session, "status", null, null);
+        sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "close")) {
-        sendAction(session, "close", null, null);
+        sendAction(session, "close", null, null, daemon_opts);
     } else if (isPlannedCommand(cmd)) {
         writeErr("{s}: not yet implemented\n", .{cmd});
         std.process.exit(1);
@@ -96,13 +123,12 @@ pub fn main() void {
 // CLI → Daemon Communication
 // ============================================================================
 
-fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8) void {
+fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8, daemon_opts: daemon.DaemonOptions) void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
 
-    // Ensure daemon is running
-    const started = daemon.ensureDaemon(allocator, session) catch |err| {
+    const started = daemon.ensureDaemon(allocator, session, daemon_opts) catch |err| {
         writeErr("Failed to start daemon: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
@@ -165,20 +191,34 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
 
 fn runDaemon() void {
     const session = std.posix.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
+    const is_headed = std.posix.getenv("AGENT_DEVTOOLS_HEADED") != null;
+    const ext_port = std.posix.getenv("AGENT_DEVTOOLS_PORT");
 
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
 
-    // Launch Chrome
-    var chrome_proc = chrome.ChromeProcess.launch(allocator, .{}) catch |err| {
-        std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
-        return;
-    };
-    defer chrome_proc.deinit();
+    // Connect to existing Chrome or launch new one
+    var chrome_proc: ?chrome.ChromeProcess = null;
+    defer if (chrome_proc) |*cp| cp.deinit();
 
-    // Connect to Chrome via WebSocket
-    var ws = websocket.Client.connect(allocator, chrome_proc.ws_url) catch |err| {
+    var ws_url_buf: [256]u8 = undefined;
+    const ws_url: []const u8 = if (ext_port) |port_str| blk: {
+        // --port: connect to existing Chrome at given port
+        const port = std.fmt.parseInt(u16, port_str, 10) catch {
+            std.debug.print("Daemon: Invalid port: {s}\n", .{port_str});
+            return;
+        };
+        break :blk std.fmt.bufPrint(&ws_url_buf, "ws://127.0.0.1:{d}/devtools/browser", .{port}) catch return;
+    } else blk: {
+        chrome_proc = chrome.ChromeProcess.launch(allocator, .{ .headless = !is_headed }) catch |err| {
+            std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        break :blk chrome_proc.?.ws_url;
+    };
+
+    var ws = websocket.Client.connect(allocator, ws_url) catch |err| {
         std.debug.print("Daemon: WebSocket failed: {s}\n", .{@errorName(err)});
         return;
     };
@@ -230,15 +270,29 @@ fn runDaemon() void {
     ws.sendText(page_enable) catch return;
     allocator.free(page_enable);
 
+    // Enable Runtime for console events
+    const runtime_enable = cdp.serializeCommand(allocator, cmd_id.next(), "Runtime.enable", null, session_id) catch return;
+    ws.sendText(runtime_enable) catch return;
+    allocator.free(runtime_enable);
+
     // Drain enable responses
     for (0..10) |_| {
         const msg = ws.recvMessage() catch break;
         allocator.free(msg);
     }
 
-    // Start network collector
     var collector = network.Collector.init(allocator);
     defer collector.deinit();
+
+    // Console message storage
+    var console_messages: std.ArrayList(ConsoleEntry) = .empty;
+    defer {
+        for (console_messages.items) |entry| {
+            allocator.free(entry.log_type);
+            allocator.free(entry.text);
+        }
+        console_messages.deinit(allocator);
+    }
 
     // Listen on Unix socket for CLI commands
     var server = daemon.SocketServer.listen(session) catch |err| {
@@ -261,7 +315,7 @@ fn runDaemon() void {
     var cdp_fail_count: usize = 0;
 
     while (running) {
-        const drained = drainCdpEvents(&ws, allocator, &collector);
+        const drained = drainCdpEvents(&ws, allocator, &collector, &console_messages);
         if (drained == 0) {
             cdp_fail_count += 1;
         } else {
@@ -293,7 +347,7 @@ fn runDaemon() void {
 
             if (req_len > 0) {
                 last_command_time = std.time.nanoTimestamp();
-                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &cmd_id, session_id, &running);
+                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &console_messages, &cmd_id, session_id, &running);
                 defer allocator.free(resp);
                 _ = std.posix.write(client_fd, resp) catch {};
             }
@@ -301,8 +355,7 @@ fn runDaemon() void {
     }
 }
 
-/// Drain pending CDP events. Returns number of messages processed.
-fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *network.Collector) usize {
+fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *network.Collector, console_msgs: *std.ArrayList(ConsoleEntry)) usize {
     var count: usize = 0;
     for (0..50) |_| {
         const msg = ws.recvMessage() catch return count;
@@ -316,11 +369,56 @@ fn drainCdpEvents(ws: *websocket.Client, allocator: Allocator, collector: *netwo
             if (parsed.message.method) |method| {
                 if (parsed.message.params) |params| {
                     _ = collector.processEvent(method, params) catch {};
+
+                    // Collect console messages (Runtime.consoleAPICalled)
+                    if (std.mem.eql(u8, method, "Runtime.consoleAPICalled")) {
+                        collectConsoleEvent(allocator, params, console_msgs);
+                    }
                 }
             }
         }
     }
     return count;
+}
+
+fn collectConsoleEvent(allocator: Allocator, params: std.json.Value, console_msgs: *std.ArrayList(ConsoleEntry)) void {
+    const log_type_raw = cdp.getString(params, "type") orelse "log";
+    const timestamp = cdp.getFloat(params, "timestamp") orelse 0;
+
+    // Extract text from args array
+    var text_buf: std.ArrayList(u8) = .empty;
+    defer text_buf.deinit(allocator);
+
+    if (params == .object) {
+        if (params.object.get("args")) |args_val| {
+            if (args_val == .array) {
+                for (args_val.array.items, 0..) |arg, i| {
+                    if (i > 0) text_buf.append(allocator, ' ') catch {};
+                    if (cdp.getString(arg, "value")) |v| {
+                        text_buf.appendSlice(allocator, v) catch {};
+                    } else if (cdp.getString(arg, "description")) |d| {
+                        text_buf.appendSlice(allocator, d) catch {};
+                    } else if (cdp.getString(arg, "type")) |t| {
+                        text_buf.appendSlice(allocator, t) catch {};
+                    }
+                }
+            }
+        }
+    }
+
+    const text = text_buf.toOwnedSlice(allocator) catch return;
+    const log_type = allocator.dupe(u8, log_type_raw) catch {
+        allocator.free(text);
+        return;
+    };
+    console_msgs.append(allocator, .{
+        .log_type = log_type,
+        .text = text,
+        .timestamp = timestamp,
+    }) catch {
+        allocator.free(text);
+        allocator.free(log_type);
+    };
 }
 
 const error_fallback = "{\"success\":false,\"error\":\"internal error\"}\n";
@@ -340,6 +438,7 @@ fn handleCommand(
     line: []const u8,
     ws: *websocket.Client,
     collector: *network.Collector,
+    console_msgs: *std.ArrayList(ConsoleEntry),
     cmd_id: *cdp.CommandId,
     session_id: ?[]const u8,
     running: *bool,
@@ -359,8 +458,17 @@ fn handleCommand(
         collector.deinit();
         collector.* = network.Collector.init(allocator);
         return respondOk(allocator);
+    } else if (std.mem.eql(u8, req.action, "console_list")) {
+        return handleConsoleList(allocator, console_msgs);
+    } else if (std.mem.eql(u8, req.action, "console_clear")) {
+        for (console_msgs.items) |entry| {
+            allocator.free(entry.log_type);
+            allocator.free(entry.text);
+        }
+        console_msgs.clearRetainingCapacity();
+        return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "status")) {
-        return handleStatus(allocator, collector);
+        return handleStatus(allocator, collector, console_msgs);
     } else if (std.mem.eql(u8, req.action, "close")) {
         running.* = false;
         return respondOk(allocator);
@@ -517,10 +625,35 @@ fn handleNetworkGet(
         respondErr(allocator, "serialize error");
 }
 
-fn handleStatus(allocator: Allocator, collector: *const network.Collector) []u8 {
+fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(ConsoleEntry)) []u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const writer = buf.writer(allocator);
+
+    writer.writeByte('[') catch return respondErr(allocator, "write error");
+    for (console_msgs.items, 0..) |entry, i| {
+        if (i > 0) writer.writeByte(',') catch {};
+        writer.writeAll("{\"type\":") catch {};
+        cdp.writeJsonString(writer, entry.log_type) catch {};
+        writer.writeAll(",\"text\":") catch {};
+        cdp.writeJsonString(writer, entry.text) catch {};
+        writer.writeByte('}') catch {};
+    }
+    writer.writeByte(']') catch {};
+
+    const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "serialize error");
+}
+
+fn handleStatus(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry)) []u8 {
     var buf: [256]u8 = undefined;
-    const data = std.fmt.bufPrint(&buf, "{{\"requests\":{d},\"daemon\":\"running\"}}", .{collector.count()}) catch
-        return respondErr(allocator, "format error");
+    const data = std.fmt.bufPrint(&buf, "{{\"requests\":{d},\"console\":{d},\"daemon\":\"running\"}}", .{
+        collector.count(),
+        console_msgs.items.len,
+    }) catch return respondErr(allocator, "format error");
 
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
         respondErr(allocator, "serialize error");
@@ -557,12 +690,14 @@ fn printUsage() void {
         \\
         \\Commands:
         \\  open <url>              Navigate to URL (starts daemon if needed)
-        \\  network list [pattern]  List captured network requests
+        \\  network list [pattern]  List network requests (optional URL filter)
         \\  network get <requestId> Get request details with response body
         \\  network clear           Clear collected requests
+        \\  console list            List captured console messages
+        \\  console clear           Clear console messages
         \\  status                  Show daemon status
         \\  close                   Close browser and stop daemon
-        \\  find-chrome             Find Chrome executable on the system
+        \\  find-chrome             Find Chrome executable
         \\
         \\  (Coming soon)
         \\  analyze <url>           Reverse-engineer web app API schema
@@ -573,6 +708,8 @@ fn printUsage() void {
         \\
         \\Options:
         \\  --session=NAME          Session name (default: "default")
+        \\  --headed                Show browser window (default: headless)
+        \\  --port=PORT             Connect to existing Chrome at PORT
         \\  -h, --help              Show this help
         \\  -v, --version           Show version
         \\

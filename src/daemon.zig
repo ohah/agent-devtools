@@ -316,9 +316,14 @@ pub const SocketClient = struct {
 // Daemon Lifecycle
 // ============================================================================
 
+pub const DaemonOptions = struct {
+    headed: bool = false,
+    cdp_port: ?[]const u8 = null,
+};
+
 /// Ensure a daemon is running for the given session.
 /// Returns true if a new daemon was started.
-pub fn ensureDaemon(allocator: Allocator, session: []const u8) !bool {
+pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptions) !bool {
     if (SocketClient.isReady(session)) return false;
 
     // Clean stale files
@@ -342,6 +347,8 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8) !bool {
     defer env_map.deinit();
     try env_map.put("AGENT_DEVTOOLS_DAEMON", "1");
     try env_map.put("AGENT_DEVTOOLS_SESSION", session);
+    if (opts.headed) try env_map.put("AGENT_DEVTOOLS_HEADED", "1");
+    if (opts.cdp_port) |p| try env_map.put("AGENT_DEVTOOLS_PORT", p);
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning
