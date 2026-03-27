@@ -217,17 +217,52 @@ pub fn main() void {
         sendAction(session, "forward", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "reload")) {
         sendAction(session, "reload", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "scroll")) {
+        const dir = args_iter.next() orelse "down";
+        const px = args_iter.next() orelse "300";
+        sendAction(session, "scroll", dir, px, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "check") or std.mem.eql(u8, cmd, "uncheck")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools check <@ref>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "click", target, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "select")) {
+        const target = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools select <@ref> <value>\n", .{});
+            std.process.exit(1);
+        };
+        const value = args_iter.next() orelse "";
+        sendAction(session, "select_option", target, value, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "get")) {
         const what = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools get <url|title>\n", .{});
+            writeErr("Usage: agent-devtools get <url|title|text|html|value> [@ref]\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, what, "url")) {
             sendAction(session, "get_url", null, null, daemon_opts);
         } else if (std.mem.eql(u8, what, "title")) {
             sendAction(session, "get_title", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "text")) {
+            const target = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get text <@ref>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "get_text", target, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "html")) {
+            const target = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get html <@ref>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "get_html", target, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "value")) {
+            const target = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get value <@ref>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "get_value", target, null, daemon_opts);
         } else {
-            writeErr("Unknown: get {s}. Use: get url, get title\n", .{what});
+            writeErr("Unknown: get {s}\n", .{what});
             std.process.exit(1);
         }
     } else if (std.mem.eql(u8, cmd, "wait")) {
@@ -758,6 +793,12 @@ fn handleCommand(
         return handlePress(allocator, ws, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "hover")) {
         return handleClick(allocator, ws, cmd_id, session_id, ref_map, collector, req.url); // Same as click but mouseMoved only
+    } else if (std.mem.eql(u8, req.action, "scroll")) {
+        return handleScroll(allocator, ws, cmd_id, session_id, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "select_option")) {
+        return handleSelectOption(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "get_text") or std.mem.eql(u8, req.action, "get_html") or std.mem.eql(u8, req.action, "get_value")) {
+        return handleGetElementProp(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.action);
     } else if (std.mem.eql(u8, req.action, "screenshot")) {
         return handleScreenshot(allocator, ws, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "eval")) {
@@ -1144,6 +1185,72 @@ fn handlePress(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.Command
     ws.sendText(cmd2) catch {};
 
     return respondOk(allocator);
+}
+
+fn handleScroll(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, dir_opt: ?[]const u8, px_opt: ?[]const u8) []u8 {
+    const direction = dir_opt orelse "down";
+    const px_str = px_opt orelse "300";
+    const px = std.fmt.parseInt(i32, px_str, 10) catch 300;
+
+    const delta_x: i32 = if (std.mem.eql(u8, direction, "left")) -px else if (std.mem.eql(u8, direction, "right")) px else 0;
+    const delta_y: i32 = if (std.mem.eql(u8, direction, "up")) -px else if (std.mem.eql(u8, direction, "down")) px else 0;
+
+    var buf: [256]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"mouseWheel\",\"x\":400,\"y\":300,\"deltaX\":{d},\"deltaY\":{d}}}", .{ delta_x, delta_y }) catch
+        return respondErr(allocator, "format error");
+
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch {};
+
+    return respondOk(allocator);
+}
+
+fn handleSelectOption(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8, value: ?[]const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    const select_value = value orelse "";
+    _ = collector;
+
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+
+    // Use Runtime.evaluate to set the select value via DOM
+    var expr_buf: [512]u8 = undefined;
+    const expr = std.fmt.bufPrint(&expr_buf,
+        \\(function(){{var n=document.querySelector('[data-backend-node-id="{d}"]')||document.querySelectorAll('select')[0];if(n){{n.value='{s}';n.dispatchEvent(new Event('change',{{bubbles:true}}));return 'ok'}}return 'not found'}})()
+    , .{ backend_id, select_value }) catch return respondErr(allocator, "expr too long");
+
+    const cmd = cdp.runtimeEvaluate(allocator, cmd_id.next(), expr, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch {};
+
+    return respondOk(allocator);
+}
+
+fn handleGetElementProp(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, collector: *network.Collector, target: ?[]const u8, action: []const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    _ = collector;
+
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+
+    // Build expression based on action
+    var expr_buf: [256]u8 = undefined;
+    const prop = if (std.mem.eql(u8, action, "get_text"))
+        "innerText"
+    else if (std.mem.eql(u8, action, "get_html"))
+        "innerHTML"
+    else
+        "value";
+
+    const expr = std.fmt.bufPrint(&expr_buf,
+        \\(function(){{var r=document.querySelector('[data-backend-node-id="{d}"]');return r?r.{s}:'element not found'}})()
+    , .{ backend_id, prop }) catch return respondErr(allocator, "expr too long");
+
+    // Reuse handleEval
+    return handleEval(allocator, ws, cmd_id, session_id, @constCast(@as(*const network.Collector, &network.Collector.init(allocator))), expr);
 }
 
 fn handleScreenshot(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
