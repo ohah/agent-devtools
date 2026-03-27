@@ -7,6 +7,7 @@ const network = agent.network;
 const daemon = agent.daemon;
 const analyzer = agent.analyzer;
 const interceptor = agent.interceptor;
+const recorder = agent.recorder;
 
 const Allocator = std.mem.Allocator;
 const version = "0.1.0";
@@ -168,6 +169,18 @@ pub fn main() void {
         sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "close")) {
         sendAction(session, "close", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "record")) {
+        const name = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools record <name>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "record", name, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "diff")) {
+        const name = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools diff <recording-name>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "diff", name, null, daemon_opts);
     } else if (isPlannedCommand(cmd)) {
         writeErr("{s}: not yet implemented\n", .{cmd});
         std.process.exit(1);
@@ -663,6 +676,10 @@ fn handleCommand(
         return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "analyze")) {
         return handleAnalyze(allocator, ws, cmd_id, session_id, collector);
+    } else if (std.mem.eql(u8, req.action, "record")) {
+        return handleRecord(allocator, collector, console_msgs, req.url);
+    } else if (std.mem.eql(u8, req.action, "diff")) {
+        return handleDiff(allocator, collector, req.url);
     } else if (std.mem.eql(u8, req.action, "intercept_mock")) {
         return handleInterceptAdd(allocator, ws, cmd_id, session_id, intercept_state, req.url, .mock, req.pattern);
     } else if (std.mem.eql(u8, req.action, "intercept_fail")) {
@@ -873,6 +890,74 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
         respondErr(allocator, "serialize error");
 }
 
+fn handleRecord(allocator: Allocator, collector: *const network.Collector, console_msgs: *const std.ArrayList(ConsoleEntry), name: ?[]const u8) []u8 {
+    const rec_name = name orelse return respondErr(allocator, "recording name required");
+
+    const json = recorder.saveRecording(allocator, rec_name, collector, console_msgs.items.len) catch
+        return respondErr(allocator, "failed to save recording");
+    defer allocator.free(json);
+
+    // Save to ~/.agent-devtools/recordings/<name>.json
+    var dir_buf: [512]u8 = undefined;
+    const socket_dir = daemon.getSocketDir(&dir_buf);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const rec_dir = std.fmt.bufPrint(&path_buf, "{s}/recordings", .{socket_dir}) catch
+        return respondErr(allocator, "path error");
+
+    std.fs.makeDirAbsolute(rec_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => return respondErr(allocator, "failed to create recordings dir"),
+    };
+
+    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/{s}.json", .{ rec_dir, rec_name }) catch
+        return respondErr(allocator, "path error");
+
+    const file = std.fs.createFileAbsolute(file_path, .{}) catch
+        return respondErr(allocator, "failed to create file");
+    defer file.close();
+    _ = file.write(json) catch return respondErr(allocator, "failed to write file");
+
+    // Return success with file path
+    var resp_buf: [512]u8 = undefined;
+    const data = std.fmt.bufPrint(&resp_buf, "{{\"file\":\"{s}\",\"requests\":{d}}}", .{
+        file_path,
+        collector.count(),
+    }) catch return respondOk(allocator);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
+}
+
+fn handleDiff(allocator: Allocator, collector: *const network.Collector, name: ?[]const u8) []u8 {
+    const rec_name = name orelse return respondErr(allocator, "recording name required");
+
+    // Load recording from file
+    var dir_buf: [512]u8 = undefined;
+    const socket_dir = daemon.getSocketDir(&dir_buf);
+    var file_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const file_path = std.fmt.bufPrint(&file_path_buf, "{s}/recordings/{s}.json", .{ socket_dir, rec_name }) catch
+        return respondErr(allocator, "path error");
+
+    const file_content = std.fs.cwd().readFileAlloc(allocator, file_path, 10 * 1024 * 1024) catch
+        return respondErr(allocator, "recording not found");
+    defer allocator.free(file_content);
+
+    var rec = recorder.loadRecording(allocator, file_content) catch
+        return respondErr(allocator, "invalid recording format");
+    defer recorder.freeRecording(allocator, &rec);
+
+    var diff = recorder.diffRequests(allocator, rec.requests, collector) catch
+        return respondErr(allocator, "diff failed");
+    defer diff.deinit();
+
+    const data = recorder.serializeDiff(allocator, &diff) catch
+        return respondErr(allocator, "serialize failed");
+    defer allocator.free(data);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "response failed");
+}
+
 fn handleInterceptAdd(
     allocator: Allocator,
     ws: *websocket.Client,
@@ -1065,7 +1150,7 @@ fn handleStatus(allocator: Allocator, collector: *const network.Collector, conso
 // ============================================================================
 
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{ "record", "replay", "diff" };
+    const planned = [_][]const u8{ "replay" };
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
@@ -1122,14 +1207,14 @@ test "version string is set" {
 }
 
 test "isPlannedCommand: recognizes planned commands" {
-    try std.testing.expect(isPlannedCommand("record"));
     try std.testing.expect(isPlannedCommand("replay"));
-    try std.testing.expect(isPlannedCommand("diff"));
 }
 
 test "isPlannedCommand: implemented commands are not planned" {
     try std.testing.expect(!isPlannedCommand("analyze"));
     try std.testing.expect(!isPlannedCommand("intercept"));
+    try std.testing.expect(!isPlannedCommand("record"));
+    try std.testing.expect(!isPlannedCommand("diff"));
     try std.testing.expect(!isPlannedCommand("open"));
     try std.testing.expect(!isPlannedCommand("network"));
 }
