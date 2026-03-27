@@ -7,6 +7,7 @@ pub const analyzer = @import("analyzer.zig");
 pub const interceptor = @import("interceptor.zig");
 pub const recorder = @import("recorder.zig");
 pub const snapshot = @import("snapshot.zig");
+pub const response_map = @import("response_map.zig");
 
 test {
     _ = websocket;
@@ -18,4 +19,5 @@ test {
     _ = interceptor;
     _ = recorder;
     _ = snapshot;
+    _ = response_map;
 }

@@ -319,6 +319,7 @@ pub const SocketClient = struct {
 pub const DaemonOptions = struct {
     headed: bool = false,
     cdp_port: ?[]const u8 = null,
+    user_agent: ?[]const u8 = null,
 };
 
 /// Ensure a daemon is running for the given session.
@@ -349,6 +350,7 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     try env_map.put("AGENT_DEVTOOLS_SESSION", session);
     if (opts.headed) try env_map.put("AGENT_DEVTOOLS_HEADED", "1");
     if (opts.cdp_port) |p| try env_map.put("AGENT_DEVTOOLS_PORT", p);
+    if (opts.user_agent) |ua| try env_map.put("AGENT_DEVTOOLS_USER_AGENT", ua);
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning

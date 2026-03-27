@@ -14,6 +14,7 @@ pub const LaunchOptions = struct {
     user_data_dir: ?[]const u8 = null,
     window_size: struct { width: u16 = 1280, height: u16 = 720 } = .{},
     extra_args: []const []const u8 = &.{},
+    user_agent: ?[]const u8 = null,
 };
 
 /// Parse DevToolsActivePort file written by Chrome into user-data-dir.
@@ -204,6 +205,7 @@ pub fn buildChromeArgs(allocator: Allocator, options: LaunchOptions) ![]const []
         "--metrics-recording-only",
         "--password-store=basic",
         "--use-mock-keychain",
+        "--disable-blink-features=AutomationControlled",
     };
     for (core_flags) |flag| {
         try args.append(allocator, try allocator.dupe(u8, flag));

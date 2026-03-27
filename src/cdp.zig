@@ -135,16 +135,14 @@ pub fn parseMessage(allocator: Allocator, json_bytes: []const u8) ParseError!str
 
 /// Tracks command IDs for a CDP session.
 pub const CommandId = struct {
-    next_id: u64,
+    next_id: std.atomic.Value(u64),
 
     pub fn init() CommandId {
-        return .{ .next_id = 1 };
+        return .{ .next_id = std.atomic.Value(u64).init(1) };
     }
 
     pub fn next(self: *CommandId) u64 {
-        const id = self.next_id;
-        self.next_id += 1;
-        return id;
+        return self.next_id.fetchAdd(1, .monotonic);
     }
 };
 
@@ -926,7 +924,7 @@ test "CommandId: sequential IDs" {
 
 test "CommandId: starts at 1" {
     const cmd_id = CommandId.init();
-    try testing.expectEqual(@as(u64, 1), cmd_id.next_id);
+    try testing.expectEqual(@as(u64, 1), cmd_id.next_id.load(.monotonic));
 }
 
 // ============================================================================

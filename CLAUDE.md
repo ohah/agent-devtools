@@ -9,8 +9,8 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 339개 (`zig build test`)
-- **CLI 명령**: 60+개
+- **테스트**: 382개 (`zig build test`)
+- **CLI 명령**: 70+개
 
 ## Architecture
 
@@ -128,7 +128,7 @@ reference/            # 참조 코드 (gitignored)
 | cdp.zig | 67 | 메시지 파싱/직렬화, 에러 코드, 편의 명령, JSON 이스케이프 |
 | chrome.zig | 41 | DevToolsActivePort, /json/version, URL 재작성, discovery |
 | analyzer.zig | 35 | isApiRequest, pathToPattern, inferJsonSchema |
-| main.zig | 31 | RemoteObject 변환 (18개 JS 타입), isPlannedCommand |
+| main.zig | 57 | RemoteObject 변환 (18개 JS 타입), isPlannedCommand, jsonToF64, buildCallFunctionOnParams, HAR, state, credentials |
 | daemon.zig | 18 | 소켓 경로, 직렬화, 파싱, writeJsonValue |
 | interceptor.zig | 12 | matchPattern, InterceptorState |
 | network.zig | 11 | Collector lifecycle, filterByUrl |
@@ -149,7 +149,7 @@ reference/            # 참조 코드 (gitignored)
 
 ```bash
 zig build              # 빌드
-zig build test         # 테스트 (339개)
+zig build test         # 테스트 (382개)
 ./zig-out/bin/agent-devtools --help
 ```
 
@@ -178,8 +178,12 @@ agent-devtools scroll <dir> [px]       # 스크롤
 agent-devtools scrollintoview @ref     # 요소 스크롤
 agent-devtools drag @from @to          # 드래그 앤 드롭
 agent-devtools upload @ref <file>      # 파일 업로드
-agent-devtools check @ref              # 체크박스 (click 별칭)
+agent-devtools check @ref              # 체크박스 체크 (click)
+agent-devtools uncheck @ref            # 체크박스 해제 (checked일 때만 click)
+agent-devtools clear @ref              # 입력값 지우기 (Ctrl+A + Backspace)
+agent-devtools selectall @ref          # 전체 선택 (Ctrl+A)
 agent-devtools select @ref "value"     # 드롭다운 선택
+agent-devtools dispatch @ref <event>   # DOM 이벤트 디스패치 (input, change, blur 등)
 ```
 
 ### Get Information
@@ -193,6 +197,8 @@ agent-devtools get attr @ref <name>    # 요소 속성
 agent-devtools is visible @ref         # 가시성
 agent-devtools is enabled @ref         # 활성화
 agent-devtools is checked @ref         # 체크 상태
+agent-devtools boundingbox @ref        # 바운딩 박스 {x, y, width, height}
+agent-devtools styles @ref <prop>      # 계산된 CSS 스타일 값
 ```
 
 ### Screenshot & PDF
@@ -205,6 +211,15 @@ agent-devtools pdf [path]              # PDF 저장
 ```bash
 agent-devtools eval <expression>       # JS 실행
 agent-devtools wait <ms>               # 대기
+agent-devtools pause                   # JS 실행 일시정지 (Debugger.pause)
+agent-devtools resume                  # JS 실행 재개 (Debugger.resume)
+agent-devtools waitload [timeout_ms]   # 페이지 로드 완료 대기
+```
+
+### Clipboard
+```bash
+agent-devtools clipboard get           # 클립보드 읽기
+agent-devtools clipboard set <text>    # 클립보드 쓰기
 ```
 
 ### Network (차별화)
@@ -246,6 +261,8 @@ agent-devtools diff <name>             # 녹화 vs 현재 비교
 agent-devtools tab list                # 탭 목록
 agent-devtools tab new [url]           # 새 탭
 agent-devtools tab close               # 탭 닫기
+agent-devtools tab switch <index>      # 탭 전환 (0-based 인덱스)
+agent-devtools window new [url]        # 새 창 열기 (탭 아님)
 ```
 
 ### Browser Settings
@@ -271,6 +288,29 @@ agent-devtools mouse down
 agent-devtools mouse up
 ```
 
+### HTTP Auth & Downloads
+```bash
+agent-devtools credentials <user> <pw> # HTTP basic auth 설정
+agent-devtools download-path <dir>     # 다운로드 디렉토리 설정
+```
+
+### HAR Export
+```bash
+agent-devtools har [filename]          # 네트워크 데이터를 HAR 1.2로 내보내기
+```
+
+### State Management
+```bash
+agent-devtools state save <name>       # 쿠키 + localStorage + sessionStorage 저장
+agent-devtools state load <name>       # 저장된 상태 복원
+agent-devtools state list              # 저장된 상태 목록
+```
+
+### Page Injection
+```bash
+agent-devtools addstyle <css>          # <style> 태그 추가
+```
+
 ### Status & Session
 ```bash
 agent-devtools status                  # 데몬 상태
@@ -283,5 +323,5 @@ agent-devtools find-chrome             # Chrome 경로
 ### 구현 예정
 ```bash
 agent-devtools replay <name>           # record + open + diff 자동화
-agent-devtools find <strategy> <value> # 의미적 요소 탐색
+agent-devtools diff-screenshot <a> <b> # 스크린샷 픽셀 비교
 ```
