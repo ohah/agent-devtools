@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 310개 (`zig build test`)
+- **테스트**: 329개 (`zig build test`)
 
 ## Architecture
 
@@ -24,7 +24,6 @@ Browser DevTools CLI for AI agents, built with Zig.
 - 세션 기반 다중 데몬: `--session=NAME`으로 독립적인 Chrome 인스턴스 운영
 - Unix Domain Socket (`{session}.sock`)으로 CLI ↔ Daemon 통신 (newline-delimited JSON)
 - Chrome은 CDP(Chrome DevTools Protocol) WebSocket으로 제어
-- Chrome for Testing 또는 시스템 Chrome에 `--remote-debugging-port`로 연결
 - `--port=PORT`로 기존 Chrome에 연결 시 `/json/version` discovery (httpGet으로 GUID 포함 정확한 URL 획득)
 - Target.createTarget → attachToTarget(flatten=true)으로 페이지 세션 획득
 - Network.enable + Runtime.enable + Page.enable 상시 활성
@@ -33,12 +32,12 @@ Browser DevTools CLI for AI agents, built with Zig.
 
 ## Differentiation (기존 도구에 없는 것)
 
-1. **웹앱 역공학** — 네트워크 트래픽 관찰 → API 엔드포인트 자동 발견 + 의미 있는 파라미터명 ({userId}, {postId})
-2. **콘솔 로그 캡처** — Runtime.consoleAPICalled로 모든 JS 타입 정확 변환 (string, number, boolean, null, undefined, object, symbol, bigint, NaN, -0 등)
-3. **네트워크 인터셉트** (Phase 4) — 요청/응답 가로채기, 목업, 지연 시뮬레이션
-4. **플로우 녹화/재생** (Phase 5) — LLM 없이 기계적 비교, 토큰 비용 0
+1. **웹앱 역공학** — 네트워크 트래픽 관찰 → API 엔드포인트 자동 발견 + 의미 있는 파라미터명 + 응답 JSON 스키마 추론
+2. **콘솔 로그 캡처** — 모든 JS 타입 정확 변환 (string, number, boolean, null, undefined, object, symbol, bigint, NaN, -0 등)
+3. **네트워크 인터셉트** — CDP Fetch 도메인으로 요청 가로채기, 목업 응답, 차단, 지연
+4. **플로우 녹화/재생** — 네트워크 상태를 파일로 저장, 기계적 비교로 변화 감지 (LLM 토큰 비용 0)
 
-## Implementation Status
+## Implementation Status — 모든 Phase 완료 ✅
 
 ### ✅ Phase 1: CDP WebSocket 연결
 - WebSocket 프레임 코덱 (RFC 6455 준수, 106개 테스트)
@@ -62,9 +61,25 @@ Browser DevTools CLI for AI agents, built with Zig.
 - UUID, hex hash, 숫자 ID 자동 감지
 - 응답 JSON 스키마 자동 추론 (재귀적 object/array/nested 지원)
 - `analyze` 명령어
-- OpenAPI YAML 출력은 미구현 (JSON 출력 제공, YAML은 외부 도구 `yq` 등으로 변환 가능)
 
-### ✅ Phase 6: 데몬 아키텍처 (순서 앞당김)
+### ✅ Phase 4: 네트워크 인터셉트
+- CDP Fetch.enable + Fetch.requestPaused 이벤트 처리
+- 와일드카드 URL 패턴 매칭 (*api*, https://*/api/*)
+- `intercept mock <pattern> <json>` — 목업 응답 반환
+- `intercept fail <pattern>` — 요청 차단
+- `intercept delay <pattern> <ms>` — 요청 지연
+- `intercept remove <pattern>` — 규칙 제거
+- `intercept list` — 활성 규칙 목록
+- `intercept clear` — 모든 규칙 제거
+- Fetch.enable/disable 자동 관리
+
+### ✅ Phase 5: 플로우 녹화/재생
+- `record <name>` — 현재 네트워크 상태를 JSON 파일로 저장 (~/.agent-devtools/recordings/)
+- `diff <name>` — 녹화 파일 vs 현재 상태 기계적 비교
+- 변화 분류: added (새 요청), removed (사라진 요청), changed (상태 변경), unchanged
+- LLM 토큰 비용 0 — 전부 기계적 비교
+
+### ✅ Phase 6: 데몬 아키텍처 (순서 앞당겨 구현)
 - CLI/Daemon 같은 바이너리, 환경변수로 모드 분기
 - Unix Domain Socket IPC (JSON-line 프로토콜, cdp.writeJsonString으로 이스케이프)
 - ensureDaemon: 데몬 자동 스폰 + 준비 대기 (30초 타임아웃)
@@ -73,27 +88,17 @@ Browser DevTools CLI for AI agents, built with Zig.
 - Chrome 크래시 감지 (CDP 연속 실패 30회)
 
 ### ✅ 보강 완료
-- `console list/clear` — Runtime.consoleAPICalled 이벤트 수집
-  - 모든 JS 타입 정확 변환 (RemoteObject: string/number/boolean/null/undefined/object/symbol/bigint/NaN/-0/Infinity)
-  - 27개 테스트 (RemoteObject → text 변환)
+- `console list/clear` — Runtime.consoleAPICalled 이벤트 수집, 27개 RemoteObject 테스트
 - `status` — 데몬 상태 + 요청 수 + 콘솔 메시지 수
 - `--headed` — 브라우저 창 표시 옵션
 - `--port=PORT` — 기존 Chrome 연결 (/json/version discovery)
-
-### ⬜ Phase 4: 네트워크 인터셉트
-- CDP `Fetch.enable` + 요청/응답 조작
-- `intercept` 명령어 (목업, 지연, 차단)
-
-### ⬜ Phase 5: 플로우 녹화/재생
-- 네트워크 패턴 + AX 상태 저장
-- baseline 비교 + 변화 보고
-- `record`, `replay`, `diff` 명령어
 
 ### ⬜ 추가 계획
 - 기본 명령어: screenshot, eval, back/forward/reload, get url/title, wait
 - Collector 용량 제한 (LRU eviction)
 - console.zig 분리 (main.zig에서 독립 모듈로)
-- OpenAPI YAML 출력 (현재 JSON, YAML 변환은 외부 도구로 가능)
+- OpenAPI YAML 출력 (현재 JSON, YAML은 외부 도구로 변환 가능)
+- replay 명령 (record + 자동 open + diff를 한 번에)
 - Skills (SKILL.md) — Claude Code 연동
 - npm 배포 구조
 - CI 테스트 (GitHub Actions)
@@ -108,7 +113,9 @@ src/
 ├── cdp.zig           # CDP 메시지 파싱/직렬화 + writeJsonString (Network, Fetch, Target, Page, Runtime)
 ├── chrome.zig        # Chrome 프로세스 관리 (discovery, httpGet, path, args, launch)
 ├── network.zig       # 네트워크 이벤트 수집/필터링 (Collector)
-├── analyzer.zig      # API 엔드포인트 분석 (isApiRequest, pathToPattern, analyzeRequests)
+├── analyzer.zig      # API 엔드포인트 분석 + JSON 스키마 추론 (isApiRequest, pathToPattern, inferJsonSchema)
+├── interceptor.zig   # 네트워크 인터셉트 (InterceptorState, matchPattern, Rule)
+├── recorder.zig      # 플로우 녹화/재생/비교 (saveRecording, loadRecording, diffRequests)
 └── root.zig          # 모듈 루트
 
 docs/
@@ -122,8 +129,8 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 사용 (`test` 블록, 소스 파일 내 작성)
-- `zig build test`로 전체 실행 (현재 310개)
-- 유닛: WebSocket 프레임, CDP 메시지, 네트워크 필터링, 데몬 프로토콜, API 분석, RemoteObject 변환
+- `zig build test`로 전체 실행 (현재 329개)
+- 유닛: WebSocket 프레임, CDP 메시지, 네트워크 필터링, 데몬 프로토콜, API 분석, 인터셉트 매칭, 플로우 비교, RemoteObject 변환
 - 통합: 실제 Chrome 스폰 + CDP 연결 (E2E 동작 확인)
 
 ### 테스트 분포
@@ -133,10 +140,12 @@ reference/            # 참조 코드 (gitignored)
 | websocket.zig | 106 | RFC 6455 프레임, 마스킹, 핸드셰이크, Connection, URL 파싱 |
 | cdp.zig | 67 | 메시지 파싱/직렬화, 에러 코드, 편의 명령, JSON 이스케이프 |
 | chrome.zig | 41 | DevToolsActivePort, /json/version, URL 재작성, Chrome 인자, discovery |
-| main.zig | 31 | RemoteObject 변환 (18개 JS 타입), isPlannedCommand |
 | analyzer.zig | 35 | isApiRequest, extractPath, isLikelyId, pathToPattern, inferJsonSchema, serialize |
+| main.zig | 31 | RemoteObject 변환 (18개 JS 타입), isPlannedCommand |
 | daemon.zig | 18 | 소켓 경로, 직렬화, 파싱, 라운드트립, writeJsonValue |
+| interceptor.zig | 12 | matchPattern, InterceptorState add/remove/find, buildFetchPatterns |
 | network.zig | 11 | Collector lifecycle, filterByUrl, formatRequestLine |
+| recorder.zig | 7 | saveRecording, loadRecording, diffRequests, serializeDiff |
 | root.zig | 1 | 모듈 참조 |
 
 ### 테스트 작성 원칙
@@ -157,24 +166,45 @@ reference/            # 참조 코드 (gitignored)
 ```bash
 zig build              # 빌드
 zig build run          # 실행
-zig build test         # 테스트 (310개)
+zig build test         # 테스트 (329개)
 ./zig-out/bin/agent-devtools   # 직접 실행
 ```
 
-## Commands
-
-### 구현 완료
+## Commands — 전체 구현 완료
 
 ```bash
+# Navigation
 agent-devtools open <url>                          # 페이지 열기 (데몬 자동 시작)
+agent-devtools close                               # 브라우저 + 데몬 종료
+
+# Network
 agent-devtools network list [pattern]              # 네트워크 요청 목록 (URL 필터)
 agent-devtools network get <requestId>             # 요청 상세 (응답 본문 포함)
 agent-devtools network clear                       # 수집 초기화
+
+# Console
 agent-devtools console list                        # 콘솔 로그 목록
 agent-devtools console clear                       # 콘솔 초기화
-agent-devtools analyze                             # API 엔드포인트 분석
+
+# Analysis
+agent-devtools analyze                             # API 엔드포인트 분석 + 응답 스키마
+
+# Intercept
+agent-devtools intercept mock <pattern> <json>     # 목업 응답 반환
+agent-devtools intercept fail <pattern>            # 요청 차단
+agent-devtools intercept delay <pattern> <ms>      # 요청 지연
+agent-devtools intercept remove <pattern>          # 규칙 제거
+agent-devtools intercept list                      # 활성 규칙 목록
+agent-devtools intercept clear                     # 모든 규칙 제거
+
+# Recording
+agent-devtools record <name>                       # 네트워크 상태 녹화
+agent-devtools diff <name>                         # 녹화 vs 현재 비교
+
+# Status
 agent-devtools status                              # 데몬 상태 확인
-agent-devtools close                               # 브라우저 + 데몬 종료
+
+# Utility
 agent-devtools find-chrome                         # Chrome 경로 탐색
 agent-devtools --session=NAME <command>             # 세션별 독립 데몬
 agent-devtools --headed <command>                  # 브라우저 창 표시
@@ -185,15 +215,10 @@ agent-devtools --help / --version                  # 도움말 / 버전
 ### 구현 예정
 
 ```bash
-agent-devtools intercept <pattern> --mock <json>   # 응답 목업
-agent-devtools intercept <pattern> --delay <ms>    # 지연
-agent-devtools intercept <pattern> --fail          # 차단
-agent-devtools record <name>                       # 플로우 녹화
-agent-devtools replay <name>                       # 재생 + 비교
-agent-devtools diff <baseline>                     # 변화 감지
 agent-devtools screenshot [path]                   # 스크린샷
 agent-devtools eval <expression>                   # JS 실행
 agent-devtools back / forward / reload             # 네비게이션
 agent-devtools get url / get title                 # 페이지 정보
 agent-devtools wait <ms>                           # 대기
+agent-devtools replay <name>                       # record + open + diff 자동화
 ```
