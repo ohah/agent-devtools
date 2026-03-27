@@ -17,3 +17,6 @@ Thumbs.db
 # Node (npm distribution)
 node_modules/
 dist/
+
+# Reference repos (cloned for spec reference)
+reference/

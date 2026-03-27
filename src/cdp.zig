@@ -363,6 +363,32 @@ pub fn fetchContinueRequest(
 }
 
 // ============================================================================
+// Convenience: Target Domain (connection management)
+// Based on: https://chromedevtools.github.io/devtools-protocol/tot/Target/
+// ============================================================================
+
+pub fn targetGetTargets(allocator: Allocator, id: u64) ![]u8 {
+    return serializeCommand(allocator, id, "Target.getTargets", null, null);
+}
+
+pub fn targetAttachToTarget(allocator: Allocator, id: u64, target_id: []const u8, flatten: bool) ![]u8 {
+    const params = try std.fmt.allocPrint(allocator, "{{\"targetId\":\"{s}\",\"flatten\":{s}}}", .{
+        target_id,
+        if (flatten) "true" else "false",
+    });
+    defer allocator.free(params);
+    return serializeCommand(allocator, id, "Target.attachToTarget", params, null);
+}
+
+pub fn targetSetDiscoverTargets(allocator: Allocator, id: u64, discover: bool) ![]u8 {
+    const params = try std.fmt.allocPrint(allocator, "{{\"discover\":{s}}}", .{
+        if (discover) "true" else "false",
+    });
+    defer allocator.free(params);
+    return serializeCommand(allocator, id, "Target.setDiscoverTargets", params, null);
+}
+
+// ============================================================================
 // Helper: Extract values from CDP params
 // ============================================================================
 
@@ -962,4 +988,286 @@ test "helpers: work on non-object value" {
     try testing.expect(getBool(parsed.value, "any") == null);
     try testing.expect(getFloat(parsed.value, "any") == null);
     try testing.expect(getObject(parsed.value, "any") == null);
+}
+
+// ============================================================================
+// Tests: Parsing Edge Cases
+// ============================================================================
+
+test "parse: response with id=0 (valid)" {
+    const json =
+        \\{"id":0,"result":{}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expect(result.message.isResponse());
+    try testing.expectEqual(@as(u64, 0), result.message.id.?);
+}
+
+test "parse: response with large id" {
+    const json =
+        \\{"id":999999999,"result":{}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expectEqual(@as(u64, 999999999), result.message.id.?);
+}
+
+test "parse: event without params (some events have no params)" {
+    const json =
+        \\{"method":"Inspector.detached"}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expect(result.message.isEvent());
+    try testing.expectEqualStrings("Inspector.detached", result.message.method.?);
+    try testing.expect(result.message.params == null);
+}
+
+test "parse: result is null (distinct from empty object)" {
+    const json =
+        \\{"id":1,"result":null}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    // result field exists but is null — id is present so it's a response
+    try testing.expectEqual(@as(u64, 1), result.message.id.?);
+    try testing.expect(result.message.result != null); // json null is a valid Value
+}
+
+test "parse: negative id is ignored (treated as no id)" {
+    const json =
+        \\{"id":-1,"method":"some.event","params":{}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    // Negative id → id=null → treated as event
+    try testing.expect(result.message.id == null);
+    try testing.expect(result.message.isEvent());
+}
+
+test "parse: id as float (Chrome sometimes sends float ids)" {
+    const json =
+        \\{"id":5.0,"result":{}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expectEqual(@as(u64, 5), result.message.id.?);
+}
+
+test "parse: id as non-integer float is ignored" {
+    const json =
+        \\{"id":5.5,"result":{}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    // 5.5 is not a valid integer id
+    try testing.expect(result.message.id == null);
+}
+
+test "parse: error with data as object (not just string)" {
+    // Some CDP errors return data as an object
+    const json =
+        \\{"id":1,"error":{"code":-32000,"message":"Error","data":"extra info"}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expect(result.message.isErrorResponse());
+    try testing.expectEqualStrings("extra info", result.message.@"error".?.data.?);
+}
+
+test "parse: message with unknown extra fields (forward compatible)" {
+    // CDP may add new fields — parser should not reject them
+    const json =
+        \\{"id":1,"result":{},"unknown_field":"whatever","another":42}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expect(result.message.isResponse());
+    try testing.expectEqual(@as(u64, 1), result.message.id.?);
+}
+
+test "parse: empty object (no id, no method)" {
+    const json =
+        \\{}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    // Not a response, not an error, not an event
+    try testing.expect(!result.message.isResponse());
+    try testing.expect(!result.message.isErrorResponse());
+    try testing.expect(!result.message.isEvent());
+}
+
+// ============================================================================
+// Tests: Target Domain Commands
+// ============================================================================
+
+test "targetGetTargets: serializes correctly" {
+    const json = try targetGetTargets(testing.allocator, 1);
+    defer testing.allocator.free(json);
+
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expectEqualStrings("Target.getTargets", result.message.method.?);
+}
+
+test "targetAttachToTarget: with flatten=true" {
+    const json = try targetAttachToTarget(testing.allocator, 2, "ABCDEF123", true);
+    defer testing.allocator.free(json);
+
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expectEqualStrings("Target.attachToTarget", result.message.method.?);
+    try testing.expectEqualStrings("ABCDEF123", getString(result.message.params.?, "targetId").?);
+    try testing.expectEqual(true, getBool(result.message.params.?, "flatten").?);
+}
+
+test "targetAttachToTarget: with flatten=false" {
+    const json = try targetAttachToTarget(testing.allocator, 3, "TARGET1", false);
+    defer testing.allocator.free(json);
+
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expectEqual(false, getBool(result.message.params.?, "flatten").?);
+}
+
+test "targetSetDiscoverTargets: discover=true" {
+    const json = try targetSetDiscoverTargets(testing.allocator, 4, true);
+    defer testing.allocator.free(json);
+
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+
+    try testing.expectEqualStrings("Target.setDiscoverTargets", result.message.method.?);
+    try testing.expectEqual(true, getBool(result.message.params.?, "discover").?);
+}
+
+// ============================================================================
+// Tests: writeJsonString edge cases
+// ============================================================================
+
+test "writeJsonString: simple string" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try writeJsonString(buf.writer(testing.allocator), "hello");
+    try testing.expectEqualStrings("\"hello\"", buf.items);
+}
+
+test "writeJsonString: escapes quotes and backslash" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try writeJsonString(buf.writer(testing.allocator), "say \"hi\" and \\go");
+    try testing.expectEqualStrings("\"say \\\"hi\\\" and \\\\go\"", buf.items);
+}
+
+test "writeJsonString: escapes control characters" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try writeJsonString(buf.writer(testing.allocator), "line1\nline2\ttab\r");
+    try testing.expectEqualStrings("\"line1\\nline2\\ttab\\r\"", buf.items);
+}
+
+test "writeJsonString: escapes null and low control chars" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try writeJsonString(buf.writer(testing.allocator), &[_]u8{ 0x00, 0x01, 0x1F });
+
+    // Should produce \u0000, \u0001, \u001f
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\\u0000") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\\u0001") != null);
+    try testing.expect(std.mem.indexOf(u8, buf.items, "\\u001f") != null);
+}
+
+test "writeJsonString: empty string" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try writeJsonString(buf.writer(testing.allocator), "");
+    try testing.expectEqualStrings("\"\"", buf.items);
+}
+
+test "writeJsonString: backspace and form feed" {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(testing.allocator);
+    try writeJsonString(buf.writer(testing.allocator), &[_]u8{ 0x08, 0x0C });
+    try testing.expectEqualStrings("\"\\b\\f\"", buf.items);
+}
+
+// ============================================================================
+// Tests: Roundtrip with CDP spec field validation
+// (Fields verified against reference/cdp-protocol/json/browser_protocol.json)
+// ============================================================================
+
+test "parse: Network.requestWillBeSent - all required fields per spec" {
+    // CDP spec says these fields are required:
+    // requestId, loaderId, documentURL, request, timestamp, wallTime,
+    // initiator, redirectHasExtraInfo
+    const json =
+        \\{"method":"Network.requestWillBeSent","params":{"requestId":"R1","loaderId":"L1","documentURL":"https://test.com","request":{"url":"https://test.com/api","method":"POST","headers":{},"initialPriority":"High","referrerPolicy":"no-referrer"},"timestamp":100.0,"wallTime":1700000000.0,"initiator":{"type":"other"},"redirectHasExtraInfo":false}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+    const params = result.message.params.?;
+
+    // Verify all required fields exist
+    try testing.expect(getString(params, "requestId") != null);
+    try testing.expect(getString(params, "loaderId") != null);
+    try testing.expect(getString(params, "documentURL") != null);
+    try testing.expect(getObject(params, "request") != null);
+    try testing.expect(getFloat(params, "timestamp") != null);
+    try testing.expect(getFloat(params, "wallTime") != null);
+    try testing.expect(getObject(params, "initiator") != null);
+    try testing.expect(getBool(params, "redirectHasExtraInfo") != null);
+
+    // Verify nested Request required fields per spec
+    const request = getObject(params, "request").?;
+    try testing.expect(getString(request, "url") != null);
+    try testing.expect(getString(request, "method") != null);
+    try testing.expect(getObject(request, "headers") != null);
+}
+
+test "parse: Network.responseReceived - all required fields per spec" {
+    // CDP spec required: requestId, loaderId, timestamp, type, response, hasExtraInfo
+    const json =
+        \\{"method":"Network.responseReceived","params":{"requestId":"R1","loaderId":"L1","timestamp":101.0,"type":"Document","response":{"url":"https://test.com","status":200,"statusText":"OK","headers":{},"mimeType":"text/html","connectionReused":false,"connectionId":1,"fromDiskCache":false,"fromServiceWorker":false,"fromPrefetchCache":false,"fromEarlyHints":false,"encodedDataLength":500,"securityState":"secure"},"hasExtraInfo":true}}
+    ;
+    const result = try parseMessage(testing.allocator, json);
+    defer result.parsed.deinit();
+    const params = result.message.params.?;
+
+    try testing.expect(getString(params, "requestId") != null);
+    try testing.expect(getString(params, "loaderId") != null);
+    try testing.expect(getFloat(params, "timestamp") != null);
+    try testing.expect(getString(params, "type") != null);
+    try testing.expect(getObject(params, "response") != null);
+    try testing.expect(getBool(params, "hasExtraInfo") != null);
+
+    // Verify Response required fields per spec
+    const response = getObject(params, "response").?;
+    try testing.expect(getString(response, "url") != null);
+    try testing.expect(getInt(response, "status") != null);
+    try testing.expect(getString(response, "statusText") != null);
+    try testing.expect(getObject(response, "headers") != null);
+    try testing.expect(getString(response, "mimeType") != null);
+    try testing.expect(getBool(response, "connectionReused") != null);
+    try testing.expect(getInt(response, "connectionId") != null);
+    try testing.expect(getBool(response, "fromDiskCache") != null);
+    try testing.expect(getBool(response, "fromServiceWorker") != null);
+    try testing.expect(getBool(response, "fromPrefetchCache") != null);
+    try testing.expect(getBool(response, "fromEarlyHints") != null);
+    try testing.expect(getInt(response, "encodedDataLength") != null);
+    try testing.expect(getString(response, "securityState") != null);
 }
