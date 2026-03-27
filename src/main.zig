@@ -436,7 +436,11 @@ fn appendRemoteObjectText(allocator: Allocator, obj: std.json.Value, buf: *std.A
 
     // For numbers, booleans: value field contains the actual value
     if (std.mem.eql(u8, obj_type, "number") or std.mem.eql(u8, obj_type, "boolean") or std.mem.eql(u8, obj_type, "bigint")) {
-        // value can be number, bool, or string (for bigint/unserializable)
+        // Check unserializableValue first (-0, NaN, Infinity, bigint literals)
+        if (cdp.getString(obj, "unserializableValue")) |u| {
+            buf.appendSlice(allocator, u) catch {};
+            return;
+        }
         if (map.get("value")) |val| switch (val) {
             .integer => |n| {
                 var num_buf: [24]u8 = undefined;
@@ -460,11 +464,6 @@ fn appendRemoteObjectText(allocator: Allocator, obj: std.json.Value, buf: *std.A
             },
             else => {},
         };
-        // Fallback: unserializableValue (Infinity, NaN, -0, bigint literals)
-        if (cdp.getString(obj, "unserializableValue")) |u| {
-            buf.appendSlice(allocator, u) catch {};
-            return;
-        }
     }
 
     // For undefined
@@ -938,4 +937,58 @@ test "RemoteObject: object without description or className falls back to type" 
     const text = try remoteObjectToText("{\"type\":\"object\"}");
     defer std.testing.allocator.free(text);
     try std.testing.expectEqualStrings("object", text);
+}
+
+test "RemoteObject: negative zero (-0)" {
+    const text = try remoteObjectToText("{\"type\":\"number\",\"unserializableValue\":\"-0\",\"description\":\"-0\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("-0", text);
+}
+
+test "RemoteObject: native function (parseInt)" {
+    const text = try remoteObjectToText("{\"type\":\"function\",\"description\":\"function parseInt() { [native code] }\",\"className\":\"Function\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("function parseInt() { [native code] }", text);
+}
+
+test "RemoteObject: DOM node" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"node\",\"description\":\"body\",\"className\":\"HTMLBodyElement\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("body", text);
+}
+
+test "RemoteObject: promise" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"promise\",\"description\":\"Promise\",\"className\":\"Promise\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Promise", text);
+}
+
+test "RemoteObject: regexp" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"regexp\",\"description\":\"/test/gi\",\"className\":\"RegExp\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("/test/gi", text);
+}
+
+test "RemoteObject: date" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"date\",\"description\":\"Mon Jan 01 2024 00:00:00 GMT+0000\",\"className\":\"Date\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Mon Jan 01 2024 00:00:00 GMT+0000", text);
+}
+
+test "RemoteObject: map" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"map\",\"description\":\"Map(2)\",\"className\":\"Map\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Map(2)", text);
+}
+
+test "RemoteObject: proxy" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"proxy\",\"description\":\"Proxy\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("Proxy", text);
+}
+
+test "RemoteObject: arraybuffer" {
+    const text = try remoteObjectToText("{\"type\":\"object\",\"subtype\":\"arraybuffer\",\"description\":\"ArrayBuffer(16)\",\"className\":\"ArrayBuffer\"}");
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("ArrayBuffer(16)", text);
 }
