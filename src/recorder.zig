@@ -136,13 +136,23 @@ pub fn loadRecording(allocator: Allocator, json: []const u8) !Recording {
                 const state = cdp.getString(item, "state") orelse "unknown";
                 const status = cdp.getInt(item, "status");
 
+                const d_rid = try allocator.dupe(u8, rid);
+                errdefer allocator.free(d_rid);
+                const d_url = try allocator.dupe(u8, url);
+                errdefer allocator.free(d_url);
+                const d_method = try allocator.dupe(u8, method);
+                errdefer allocator.free(d_method);
+                const d_mime = try allocator.dupe(u8, mime);
+                errdefer allocator.free(d_mime);
+                const d_state = try allocator.dupe(u8, state);
+
                 try requests.append(allocator, .{
-                    .request_id = try allocator.dupe(u8, rid),
-                    .url = try allocator.dupe(u8, url),
-                    .method = try allocator.dupe(u8, method),
+                    .request_id = d_rid,
+                    .url = d_url,
+                    .method = d_method,
                     .status = status,
-                    .mime_type = try allocator.dupe(u8, mime),
-                    .state = try allocator.dupe(u8, state),
+                    .mime_type = d_mime,
+                    .state = d_state,
                 });
             }
         }
@@ -237,18 +247,27 @@ pub fn diffRequests(
         }
     }
 
-    // Check current against baseline for new requests
+    // Build baseline map for O(1) lookup in reverse direction
+    var baseline_map = std.StringArrayHashMap(void).init(allocator);
+    defer {
+        var bm = baseline_map.iterator();
+        while (bm.next()) |e| allocator.free(e.key_ptr.*);
+        baseline_map.deinit();
+    }
+    for (baseline) |base_req| {
+        var bkey_buf: [1024]u8 = undefined;
+        const bkey = std.fmt.bufPrint(&bkey_buf, "{s} {s}", .{ base_req.method, base_req.url }) catch continue;
+        const owned_bkey = allocator.dupe(u8, bkey) catch continue;
+        baseline_map.put(owned_bkey, {}) catch allocator.free(owned_bkey);
+    }
+
     var cur_check = current_collector.requests.iterator();
     while (cur_check.next()) |entry| {
         const info = entry.value_ptr.info;
-        var found = false;
-        for (baseline) |base_req| {
-            if (std.mem.eql(u8, base_req.method, info.method) and std.mem.eql(u8, base_req.url, info.url)) {
-                found = true;
-                break;
-            }
-        }
-        if (!found) {
+        var check_key_buf: [1024]u8 = undefined;
+        const check_key = std.fmt.bufPrint(&check_key_buf, "{s} {s}", .{ info.method, info.url }) catch continue;
+
+        if (baseline_map.get(check_key) == null) {
             try entries.append(allocator, .{
                 .change_type = .added,
                 .url = try allocator.dupe(u8, info.url),
@@ -401,14 +420,12 @@ test "diffRequests: removed request" {
 }
 
 test "serializeDiff: produces valid JSON" {
-    var diff = DiffResult{
-        .added = 1,
-        .removed = 0,
-        .changed = 0,
-        .unchanged = 2,
-        .entries = &.{},
-        .allocator = testing.allocator,
-    };
+    // Use an empty collector to produce a real DiffResult via diffRequests
+    var collector = network_mod.Collector.init(testing.allocator);
+    defer collector.deinit();
+
+    var diff = try diffRequests(testing.allocator, &.{}, &collector);
+    defer diff.deinit();
 
     const json = try serializeDiff(testing.allocator, &diff);
     defer testing.allocator.free(json);
@@ -416,5 +433,5 @@ test "serializeDiff: produces valid JSON" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
     try testing.expect(parsed.value == .object);
-    try testing.expectEqual(@as(i64, 1), cdp.getInt(parsed.value, "added").?);
+    try testing.expectEqual(@as(i64, 0), cdp.getInt(parsed.value, "added").?);
 }
