@@ -46,7 +46,7 @@ pub const RefMap = struct {
     pub fn deinit(self: *RefMap) void {
         var it = self.entries.iterator();
         while (it.next()) |entry| {
-            self.allocator.free(entry.value_ptr.ref_id);
+            // ref_id shares allocation with key — only free role, name, and key
             self.allocator.free(entry.value_ptr.role);
             self.allocator.free(entry.value_ptr.name);
             self.allocator.free(entry.key_ptr.*);
@@ -59,22 +59,20 @@ pub const RefMap = struct {
         const ref_id = std.fmt.bufPrint(&ref_buf, "e{d}", .{self.next_ref}) catch return error.Overflow;
         self.next_ref += 1;
 
-        const owned_ref = try self.allocator.dupe(u8, ref_id);
-        errdefer self.allocator.free(owned_ref);
+        const owned_key = try self.allocator.dupe(u8, ref_id);
+        errdefer self.allocator.free(owned_key);
         const owned_role = try self.allocator.dupe(u8, role);
         errdefer self.allocator.free(owned_role);
         const owned_name = try self.allocator.dupe(u8, name);
-        errdefer self.allocator.free(owned_name);
-        const owned_key = try self.allocator.dupe(u8, ref_id);
 
         try self.entries.put(owned_key, .{
-            .ref_id = owned_ref,
+            .ref_id = owned_key, // Share key allocation — no separate ref_id
             .backend_node_id = backend_node_id,
             .role = owned_role,
             .name = owned_name,
         });
 
-        return owned_ref;
+        return owned_key;
     }
 
     pub fn getByRef(self: *const RefMap, ref_id: []const u8) ?RefEntry {
@@ -105,7 +103,7 @@ pub fn isContentRole(role: []const u8) bool {
 }
 
 /// Parse the AX tree response and build a text snapshot with @refs.
-/// Returns the snapshot text and populates the ref_map.
+/// Preserves tree structure using parentId for depth-based indentation.
 pub fn buildSnapshot(
     allocator: Allocator,
     ax_tree_json: std.json.Value,
@@ -120,10 +118,32 @@ pub fn buildSnapshot(
     const nodes_val = ax_tree_json.object.get("nodes") orelse return error.InvalidCharacter;
     if (nodes_val != .array) return error.InvalidCharacter;
 
-    for (nodes_val.array.items) |node| {
+    const nodes = nodes_val.array.items;
+
+    // Build node-id → depth map using parentId
+    var depth_map = std.StringArrayHashMap(usize).init(allocator);
+    defer depth_map.deinit();
+
+    for (nodes) |node| {
+        if (node != .object) continue;
+        const node_id = cdp.getString(node, "nodeId") orelse continue;
+        const parent_id = cdp.getString(node, "parentId");
+
+        const depth: usize = if (parent_id) |pid| blk: {
+            break :blk (depth_map.get(pid) orelse 0) + 1;
+        } else 0;
+
+        const key = allocator.dupe(u8, node_id) catch continue;
+        depth_map.put(key, depth) catch allocator.free(key);
+    }
+    defer {
+        var it = depth_map.iterator();
+        while (it.next()) |entry| allocator.free(entry.key_ptr.*);
+    }
+
+    for (nodes) |node| {
         if (node != .object) continue;
 
-        // Skip ignored nodes
         if (cdp.getBool(node, "ignored")) |ignored| {
             if (ignored) continue;
         }
@@ -132,12 +152,18 @@ pub fn buildSnapshot(
         const name = extractAxValue(node, "name") orelse "";
         const backend_node_id = cdp.getInt(node, "backendDOMNodeId");
 
+        // Get depth for indentation
+        const node_id = cdp.getString(node, "nodeId") orelse "";
+        const depth = depth_map.get(node_id) orelse 0;
+
         const should_ref = isInteractiveRole(role) or
             (isContentRole(role) and name.len > 0);
 
         if (should_ref) {
             const ref_id = ref_map.addRef(backend_node_id, role, name) catch continue;
 
+            // Indent by depth
+            for (0..depth) |_| try writer.writeAll("  ");
             try writer.writeAll("@");
             try writer.writeAll(ref_id);
             try writer.writeAll(" [");
@@ -150,13 +176,11 @@ pub fn buildSnapshot(
             }
             try writer.writeByte('\n');
         } else if (!interactive_only and name.len > 0) {
-            try writer.writeAll("  ");
+            for (0..depth) |_| try writer.writeAll("  ");
             try writer.writeAll(role);
-            if (name.len > 0) {
-                try writer.writeAll(" \"");
-                try writer.writeAll(name);
-                try writer.writeByte('"');
-            }
+            try writer.writeAll(" \"");
+            try writer.writeAll(name);
+            try writer.writeByte('"');
             try writer.writeByte('\n');
         }
     }
@@ -172,20 +196,20 @@ fn extractAxValue(node: std.json.Value, field: []const u8) ?[]const u8 {
     return cdp.getString(ax_val, "value");
 }
 
-/// Build CDP command to get coordinates for clicking via backend_node_id.
-pub fn buildGetBoxModelCmd(allocator: Allocator, id: u64, backend_node_id: i64, session_id: ?[]const u8) ![]u8 {
+/// Build a CDP command that takes a single backendNodeId parameter.
+pub fn buildBackendNodeCmd(allocator: Allocator, id: u64, method: []const u8, backend_node_id: i64, session_id: ?[]const u8) ![]u8 {
     var buf: [64]u8 = undefined;
     const params = std.fmt.bufPrint(&buf, "{{\"backendNodeId\":{d}}}", .{backend_node_id}) catch
         return error.Overflow;
-    return cdp.serializeCommand(allocator, id, "DOM.getBoxModel", params, session_id);
+    return cdp.serializeCommand(allocator, id, method, params, session_id);
 }
 
-/// Build CDP command to focus an element.
+pub fn buildGetBoxModelCmd(allocator: Allocator, id: u64, backend_node_id: i64, session_id: ?[]const u8) ![]u8 {
+    return buildBackendNodeCmd(allocator, id, "DOM.getBoxModel", backend_node_id, session_id);
+}
+
 pub fn buildFocusCmd(allocator: Allocator, id: u64, backend_node_id: i64, session_id: ?[]const u8) ![]u8 {
-    var buf: [64]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"backendNodeId\":{d}}}", .{backend_node_id}) catch
-        return error.Overflow;
-    return cdp.serializeCommand(allocator, id, "DOM.focus", params, session_id);
+    return buildBackendNodeCmd(allocator, id, "DOM.focus", backend_node_id, session_id);
 }
 
 /// Build CDP command to dispatch a mouse click at coordinates.

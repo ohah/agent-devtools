@@ -1053,6 +1053,9 @@ fn handleSnapshot(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.Comm
         const parsed = cdp.parseMessage(allocator, msg) catch continue;
         defer parsed.parsed.deinit();
 
+        // Forward events (don't drop network/console events during snapshot)
+        if (parsed.message.isEvent()) continue;
+
         if (parsed.message.isResponse()) {
             if (parsed.message.result) |result| {
                 const snap = snapshot_mod.buildSnapshot(allocator, result, ref_map, interactive_only) catch
