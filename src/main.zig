@@ -534,7 +534,18 @@ fn runDaemon() void {
 
             if (req_len > 0) {
                 last_command_time = std.time.nanoTimestamp();
-                const resp = handleCommand(allocator, req_buf[0..req_len], &ws, &collector, &console_messages, &intercept_state, &ref_map, &cmd_id, session_id, &running);
+                var ctx = DaemonContext{
+                    .allocator = allocator,
+                    .ws = &ws,
+                    .collector = &collector,
+                    .console_msgs = &console_messages,
+                    .intercept_state = &intercept_state,
+                    .ref_map = &ref_map,
+                    .cmd_id = &cmd_id,
+                    .session_id = session_id,
+                    .running = &running,
+                };
+                const resp = handleCommand(&ctx, req_buf[0..req_len]);
                 defer allocator.free(resp);
                 _ = std.posix.write(client_fd, resp) catch {};
             }
@@ -745,9 +756,8 @@ fn respondErr(allocator: Allocator, msg: []const u8) []u8 {
         allocator.dupe(u8, "{\"success\":false,\"error\":\"internal error\"}\n") catch "";
 }
 
-fn handleCommand(
+const DaemonContext = struct {
     allocator: Allocator,
-    line: []const u8,
     ws: *websocket.Client,
     collector: *network.Collector,
     console_msgs: *std.ArrayList(ConsoleEntry),
@@ -756,11 +766,22 @@ fn handleCommand(
     cmd_id: *cdp.CommandId,
     session_id: ?[]const u8,
     running: *bool,
-) []u8 {
+};
+
+fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
+    const allocator = ctx.allocator;
     const req = daemon.parseRequest(allocator, line) catch {
         return respondErr(allocator, "Invalid request");
     };
     defer daemon.freeRequest(allocator, req);
+
+    const ws = ctx.ws;
+    const collector = ctx.collector;
+    const console_msgs = ctx.console_msgs;
+    const intercept_state = ctx.intercept_state;
+    const ref_map = ctx.ref_map;
+    const cmd_id = ctx.cmd_id;
+    const session_id = ctx.session_id;
 
     if (std.mem.eql(u8, req.action, "open")) {
         return handleOpen(allocator, ws, cmd_id, session_id, req.url);
@@ -785,14 +806,12 @@ fn handleCommand(
         return handleAnalyze(allocator, ws, cmd_id, session_id, collector);
     } else if (std.mem.eql(u8, req.action, "snapshot") or std.mem.eql(u8, req.action, "snapshot_interactive")) {
         return handleSnapshot(allocator, ws, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"));
-    } else if (std.mem.eql(u8, req.action, "click")) {
+    } else if (std.mem.eql(u8, req.action, "click") or std.mem.eql(u8, req.action, "hover")) {
         return handleClick(allocator, ws, cmd_id, session_id, ref_map, collector, req.url);
     } else if (std.mem.eql(u8, req.action, "fill") or std.mem.eql(u8, req.action, "type_text")) {
         return handleFill(allocator, ws, cmd_id, session_id, ref_map, collector, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "press")) {
         return handlePress(allocator, ws, cmd_id, session_id, req.url);
-    } else if (std.mem.eql(u8, req.action, "hover")) {
-        return handleClick(allocator, ws, cmd_id, session_id, ref_map, collector, req.url); // Same as click but mouseMoved only
     } else if (std.mem.eql(u8, req.action, "scroll")) {
         return handleScroll(allocator, ws, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "select_option")) {
@@ -835,7 +854,6 @@ fn handleCommand(
     } else if (std.mem.eql(u8, req.action, "intercept_clear")) {
         intercept_state.deinit();
         intercept_state.* = interceptor.InterceptorState.init(allocator);
-        // Disable Fetch
         const disable = cdp.fetchDisable(allocator, cmd_id.next(), session_id) catch return respondOk(allocator);
         defer allocator.free(disable);
         ws.sendText(disable) catch {};
@@ -843,7 +861,7 @@ fn handleCommand(
     } else if (std.mem.eql(u8, req.action, "status")) {
         return handleStatus(allocator, collector, console_msgs);
     } else if (std.mem.eql(u8, req.action, "close")) {
-        running.* = false;
+        ctx.running.* = false;
         return respondOk(allocator);
     } else if (std.mem.eql(u8, req.action, "ping")) {
         return respondOk(allocator);
