@@ -1238,10 +1238,12 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
 
     if (resp.success) {
         if (resp.data) |data| {
+            const result = unescapeJsonString(allocator, data);
+            defer if (result.allocated) allocator.free(result.output);
             if (daemon_opts.content_boundaries and isContentAction(action)) {
-                write("---AGENT_DEVTOOLS_CONTENT_START---\n{s}\n---AGENT_DEVTOOLS_CONTENT_END---\n", .{data});
+                write("---AGENT_DEVTOOLS_CONTENT_START---\n{s}\n---AGENT_DEVTOOLS_CONTENT_END---\n", .{result.output});
             } else {
-                write("{s}\n", .{data});
+                write("{s}\n", .{result.output});
             }
         } else {
             write("OK\n", .{});
@@ -8202,6 +8204,48 @@ fn isPlannedCommand(cmd: []const u8) bool {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
     return false;
+}
+
+/// Unescape a JSON-serialized string for CLI display.
+/// If data is a JSON string like `"hello\nworld"`, strips quotes and unescapes.
+/// If data is JSON object/array, returns as-is.
+/// Returns: .output = the string to print, .allocated = whether caller must free it.
+const UnescapeResult = struct { output: []const u8, allocated: bool };
+
+fn unescapeJsonString(allocator: Allocator, data: []const u8) UnescapeResult {
+    if (data.len >= 2 and data[0] == '"' and data[data.len - 1] == '"') {
+        const inner = data[1 .. data.len - 1];
+        if (std.mem.indexOf(u8, inner, "\\") == null) {
+            // No escapes — return sub-slice (not allocated)
+            return .{ .output = inner, .allocated = false };
+        }
+        // Has escapes — allocate and unescape
+        var buf: std.ArrayList(u8) = .empty;
+        var i: usize = 0;
+        while (i < inner.len) {
+            if (inner[i] == '\\' and i + 1 < inner.len) {
+                switch (inner[i + 1]) {
+                    'n' => buf.append(allocator, '\n') catch {},
+                    't' => buf.append(allocator, '\t') catch {},
+                    'r' => buf.append(allocator, '\r') catch {},
+                    '"' => buf.append(allocator, '"') catch {},
+                    '\\' => buf.append(allocator, '\\') catch {},
+                    '/' => buf.append(allocator, '/') catch {},
+                    else => {
+                        buf.append(allocator, inner[i]) catch {};
+                        buf.append(allocator, inner[i + 1]) catch {};
+                    },
+                }
+                i += 2;
+            } else {
+                buf.append(allocator, inner[i]) catch {};
+                i += 1;
+            }
+        }
+        const owned = buf.toOwnedSlice(allocator) catch return .{ .output = data, .allocated = false };
+        return .{ .output = owned, .allocated = true };
+    }
+    return .{ .output = data, .allocated = false };
 }
 
 fn write(comptime fmt: []const u8, args: anytype) void {
