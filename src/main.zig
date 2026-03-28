@@ -11,6 +11,7 @@ const interceptor = agent.interceptor;
 const recorder = agent.recorder;
 const snapshot_mod = agent.snapshot;
 const response_map_mod = agent.response_map;
+const png = agent.png;
 
 const Allocator = std.mem.Allocator;
 
@@ -1113,6 +1114,33 @@ pub fn main() void {
             writeErr("Unknown video subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
         }
+    } else if (std.mem.eql(u8, cmd, "diff-screenshot")) {
+        const baseline = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools diff-screenshot <baseline> [current] [--threshold N] [--output path]\n", .{});
+            std.process.exit(1);
+        };
+        var current: ?[]const u8 = null;
+        var threshold: ?[]const u8 = null;
+        var output: ?[]const u8 = null;
+
+        while (args_iter.next()) |arg| {
+            if (std.mem.eql(u8, arg, "--threshold")) {
+                threshold = args_iter.next();
+            } else if (std.mem.eql(u8, arg, "--output")) {
+                output = args_iter.next();
+            } else if (current == null) {
+                current = arg;
+            }
+        }
+
+        // Pack parameters: url=baseline, pattern=current|threshold|output (pipe-separated)
+        var param_buf: [2048]u8 = undefined;
+        const params = std.fmt.bufPrint(&param_buf, "{s}|{s}|{s}", .{
+            current orelse "",
+            threshold orelse "0.1",
+            output orelse "diff.png",
+        }) catch "||";
+        sendAction(session, "diff_screenshot", baseline, params, daemon_opts);
     } else if (isPlannedCommand(cmd)) {
         writeErr("{s}: not yet implemented\n", .{cmd});
         std.process.exit(1);
@@ -3159,6 +3187,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleVideoStart(allocator, sender, resp_map, cmd_id, session_id, ctx.video_recorder, req.url);
     } else if (std.mem.eql(u8, req.action, "video_stop")) {
         return handleVideoStop(allocator, ctx.video_recorder);
+    } else if (std.mem.eql(u8, req.action, "diff_screenshot")) {
+        return handleDiffScreenshot(allocator, sender, resp_map, cmd_id, session_id, req.url, req.pattern);
     } else {
         return respondErr(allocator, "Unknown action");
     }
@@ -4651,6 +4681,110 @@ fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response
         }
     }
     return respondErr(allocator, "screenshot timeout");
+}
+
+fn handleDiffScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, baseline_path_opt: ?[]const u8, params_opt: ?[]const u8) []u8 {
+    const baseline_path = baseline_path_opt orelse return respondErr(allocator, "baseline path required");
+
+    // Parse params: current_path|threshold|output_path
+    var current_path: ?[]const u8 = null;
+    var threshold: f64 = 0.1;
+    var output_path: []const u8 = "diff.png";
+
+    if (params_opt) |params| {
+        var it = std.mem.splitScalar(u8, params, '|');
+        const cp = it.next() orelse "";
+        if (cp.len > 0) current_path = cp;
+        const th = it.next() orelse "0.1";
+        if (th.len > 0) {
+            threshold = std.fmt.parseFloat(f64, th) catch 0.1;
+        }
+        const op = it.next() orelse "diff.png";
+        if (op.len > 0) output_path = op;
+    }
+
+    // Read baseline PNG
+    const baseline_data = std.fs.cwd().readFileAlloc(allocator, baseline_path, 50 * 1024 * 1024) catch
+        return respondErr(allocator, "cannot read baseline file");
+    defer allocator.free(baseline_data);
+
+    // Get current image: either from file or live screenshot
+    var current_data_owned: ?[]u8 = null;
+    defer if (current_data_owned) |d| allocator.free(d);
+
+    const current_data: []const u8 = if (current_path) |cp| blk: {
+        const data = std.fs.cwd().readFileAlloc(allocator, cp, 50 * 1024 * 1024) catch
+            return respondErr(allocator, "cannot read current file");
+        current_data_owned = data;
+        break :blk data;
+    } else blk: {
+        // Take live screenshot via CDP
+        const data = captureScreenshotRaw(allocator, sender, resp_map, cmd_id, session_id) orelse
+            return respondErr(allocator, "screenshot capture failed");
+        current_data_owned = data;
+        break :blk data;
+    };
+
+    // Perform diff
+    var result = png.diffScreenshots(allocator, baseline_data, current_data, threshold) catch
+        return respondErr(allocator, "diff failed: invalid PNG");
+    defer result.deinit();
+
+    // Save diff image
+    if (result.diff_image) |diff_png| {
+        const file = std.fs.cwd().createFile(output_path, .{}) catch
+            return respondErr(allocator, "cannot create diff file");
+        defer file.close();
+        _ = file.write(diff_png) catch return respondErr(allocator, "write error");
+    }
+
+    // Build response JSON
+    var resp_buf: std.ArrayList(u8) = .empty;
+    defer resp_buf.deinit(allocator);
+    const rw = resp_buf.writer(allocator);
+    rw.print("{{\"match\":{s},\"total_pixels\":{d},\"different_pixels\":{d},\"mismatch_percentage\":{d:.2},\"diff_image\":", .{
+        if (result.match) "true" else "false",
+        result.total_pixels,
+        result.different_pixels,
+        result.mismatch_percentage,
+    }) catch return respondErr(allocator, "format error");
+    cdp.writeJsonString(rw, output_path) catch return respondErr(allocator, "format error");
+    rw.writeAll("}") catch return respondErr(allocator, "format error");
+
+    const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+}
+
+/// Capture a raw PNG screenshot via CDP, returning the decoded binary data.
+/// Returns null on failure. Caller must free the returned slice.
+fn captureScreenshotRaw(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8) ?[]u8 {
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
+        \\{"format":"png"}
+    , session_id) catch return null;
+    defer allocator.free(cmd);
+
+    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse return null;
+    defer allocator.free(raw);
+
+    const parsed = cdp.parseMessage(allocator, raw) catch return null;
+    defer parsed.parsed.deinit();
+
+    if (parsed.message.isResponse()) {
+        if (parsed.message.result) |result| {
+            if (cdp.getString(result, "data")) |base64_data| {
+                const decoded_size = std.base64.standard.Decoder.calcSizeUpperBound(base64_data.len) catch return null;
+                const buf = allocator.alloc(u8, decoded_size) catch return null;
+                std.base64.standard.Decoder.decode(buf, base64_data) catch {
+                    allocator.free(buf);
+                    return null;
+                };
+                return buf;
+            }
+        }
+    }
+    return null;
 }
 
 fn handleEval(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, expr_opt: ?[]const u8) []u8 {
@@ -7785,7 +7919,7 @@ fn handleScreenshotAnnotate(
 }
 
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{"diff-screenshot"};
+    const planned = [_][]const u8{};
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
@@ -7932,6 +8066,7 @@ fn printUsage() void {
         \\  video start [path]        Start video recording (requires ffmpeg)
         \\  video stop                Stop video recording and save file
         \\  screenshot --annotate [p] Screenshot with ref labels overlaid (-a)
+        \\  diff-screenshot <a> [b]   Compare screenshots (pixel diff, PNG output)
         \\
         \\Dialog:
         \\  dialog accept [text]      Accept dialog (optional prompt text)
@@ -8024,7 +8159,7 @@ test "version string is set" {
 }
 
 test "isPlannedCommand: recognizes planned commands" {
-    try std.testing.expect(isPlannedCommand("diff-screenshot"));
+    try std.testing.expect(!isPlannedCommand("diff-screenshot"));
 }
 
 test "isPlannedCommand: implemented commands are not planned" {
@@ -8501,8 +8636,8 @@ test "buildCallFunctionOnParams: without argument" {
 // Tests: Batch 4 features
 // ============================================================================
 
-test "isPlannedCommand: diff-screenshot is planned" {
-    try std.testing.expect(isPlannedCommand("diff-screenshot"));
+test "isPlannedCommand: diff-screenshot is now implemented" {
+    try std.testing.expect(!isPlannedCommand("diff-screenshot"));
 }
 
 test "isPlannedCommand: batch4 commands are not planned" {
@@ -8903,7 +9038,7 @@ test "isPlannedCommand: new planned commands" {
     try std.testing.expect(!isPlannedCommand("video"));
     try std.testing.expect(!isPlannedCommand("trace"));
     try std.testing.expect(!isPlannedCommand("profiler"));
-    try std.testing.expect(isPlannedCommand("diff-screenshot"));
+    try std.testing.expect(!isPlannedCommand("diff-screenshot"));
 }
 
 // ============================================================================
