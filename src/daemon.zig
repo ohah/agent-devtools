@@ -456,6 +456,7 @@ pub const SocketClient = struct {
 pub const DaemonOptions = struct {
     headed: bool = false,
     cdp_port: ?[]const u8 = null,
+    auto_connect: bool = false,
     user_agent: ?[]const u8 = null,
     proxy: ?[]const u8 = null,
     proxy_bypass: ?[]const u8 = null,
@@ -501,6 +502,7 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     try env_map.put("AGENT_DEVTOOLS_SESSION", session);
     if (opts.headed) try env_map.put("AGENT_DEVTOOLS_HEADED", "1");
     if (opts.cdp_port) |p| try env_map.put("AGENT_DEVTOOLS_PORT", p);
+    if (opts.auto_connect) try env_map.put("AGENT_DEVTOOLS_AUTO_CONNECT", "1");
     if (opts.user_agent) |ua| try env_map.put("AGENT_DEVTOOLS_USER_AGENT", ua);
     if (opts.proxy) |p| try env_map.put("AGENT_DEVTOOLS_PROXY", p);
     if (opts.proxy_bypass) |b| try env_map.put("AGENT_DEVTOOLS_PROXY_BYPASS", b);

@@ -185,6 +185,7 @@ pub fn main() void {
     var session: []const u8 = "default";
     var headed = false;
     var cdp_port: ?[]const u8 = null;
+    var auto_connect = false;
     var user_agent: ?[]const u8 = null;
     var interactive = false;
     var debug_mode = false;
@@ -210,6 +211,8 @@ pub fn main() void {
             headed = true;
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
             cdp_port = arg["--port=".len..];
+        } else if (std.mem.eql(u8, arg, "--auto-connect")) {
+            auto_connect = true;
         } else if (std.mem.startsWith(u8, arg, "--user-agent=")) {
             user_agent = arg["--user-agent=".len..];
         } else if (std.mem.startsWith(u8, arg, "--proxy=")) {
@@ -242,6 +245,7 @@ pub fn main() void {
     const daemon_opts = daemon.DaemonOptions{
         .headed = headed,
         .cdp_port = cdp_port,
+        .auto_connect = auto_connect,
         .user_agent = user_agent,
         .proxy = proxy,
         .proxy_bypass = proxy_bypass,
@@ -1191,8 +1195,8 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
     };
     if (started) {
         writeErr("Started daemon (session: {s})\n", .{session});
-    } else if (daemon_opts.headed or daemon_opts.cdp_port != null) {
-        writeErr("Daemon already running — --headed/--port options ignored. Use 'close' first.\n", .{});
+    } else if (daemon_opts.headed or daemon_opts.cdp_port != null or daemon_opts.auto_connect) {
+        writeErr("Daemon already running — --headed/--port/--auto-connect options ignored. Use 'close' first.\n", .{});
     }
 
     // Connect and send command
@@ -1761,6 +1765,7 @@ fn runDaemon() void {
     const session = daemon.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
     const is_headed = daemon.getenv("AGENT_DEVTOOLS_HEADED") != null;
     const ext_port = daemon.getenv("AGENT_DEVTOOLS_PORT");
+    const env_auto_connect = daemon.getenv("AGENT_DEVTOOLS_AUTO_CONNECT") != null;
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
     const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
     const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
@@ -1787,6 +1792,12 @@ fn runDaemon() void {
         // Discover the correct WebSocket URL via /json/version
         discovered_url = chrome.discoverWsUrl(allocator, "127.0.0.1", port) catch |err| {
             std.debug.print("Daemon: Failed to discover CDP URL on port {d}: {s}\n", .{ port, @errorName(err) });
+            return;
+        };
+        break :blk discovered_url.?;
+    } else if (env_auto_connect) blk: {
+        discovered_url = chrome.autoConnect(allocator) catch |err| {
+            std.debug.print("Daemon: Auto-connect failed (no running Chrome found): {s}\n", .{@errorName(err)});
             return;
         };
         break :blk discovered_url.?;
@@ -8213,6 +8224,7 @@ fn printUsage() void {
         \\  --session <name>          Isolated session (default: "default")
         \\  --headed                  Show browser window (default: headless)
         \\  --port <port>             Connect to existing Chrome via CDP port
+        \\  --auto-connect            Auto-discover and connect to running Chrome
         \\  --user-agent <ua>         Set user agent on launch
         \\  --proxy <url>             Proxy server (e.g. http://localhost:8080)
         \\  --proxy-bypass <list>     Proxy bypass list (e.g. localhost,*.internal.com)

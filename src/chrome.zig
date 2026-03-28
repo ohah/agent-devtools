@@ -390,6 +390,140 @@ fn createTempDir(allocator: Allocator) ![]u8 {
 }
 
 // ============================================================================
+// Auto-Connect: discover existing Chrome instances
+// ============================================================================
+
+/// Check if a TCP port is reachable on 127.0.0.1.
+pub fn isPortReachable(port: u16) bool {
+    const addr = std.net.Address.parseIp4("127.0.0.1", port) catch return false;
+    const fd = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM, 0) catch return false;
+    defer std.posix.close(fd);
+    std.posix.connect(fd, &addr.any, addr.getOsSockLen()) catch return false;
+    return true;
+}
+
+/// Get Chrome user data directories for the current platform.
+/// Returns a slice of directory path strings. Some paths are absolute,
+/// others require prepending $HOME or %LOCALAPPDATA%.
+pub fn getUserDataDirs(allocator: Allocator) ![][]u8 {
+    var dirs: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (dirs.items) |d| allocator.free(d);
+        dirs.deinit(allocator);
+    }
+
+    switch (comptime builtin.os.tag) {
+        .macos => {
+            const home = std.posix.getenv("HOME") orelse return dirs.toOwnedSlice(allocator);
+            const suffixes = [_][]const u8{
+                "/Library/Application Support/Google/Chrome",
+                "/Library/Application Support/Google/Chrome Canary",
+                "/Library/Application Support/Chromium",
+                "/Library/Application Support/BraveSoftware/Brave-Browser",
+            };
+            for (suffixes) |suffix| {
+                const path = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, suffix }) catch continue;
+                try dirs.append(allocator, path);
+            }
+        },
+        .linux => {
+            const home = std.posix.getenv("HOME") orelse return dirs.toOwnedSlice(allocator);
+            const suffixes = [_][]const u8{
+                "/.config/google-chrome",
+                "/.config/google-chrome-unstable",
+                "/.config/chromium",
+                "/.config/BraveSoftware/Brave-Browser",
+            };
+            for (suffixes) |suffix| {
+                const path = std.fmt.allocPrint(allocator, "{s}{s}", .{ home, suffix }) catch continue;
+                try dirs.append(allocator, path);
+            }
+        },
+        .windows => {
+            const local_app_data = std.process.getenvW(std.unicode.utf8ToUtf16LeStringLiteral("LOCALAPPDATA")) orelse
+                return dirs.toOwnedSlice(allocator);
+            // Convert WTF-16 to UTF-8
+            var home_buf: [512]u8 = undefined;
+            var home_len: usize = 0;
+            for (local_app_data) |wc| {
+                if (home_len >= home_buf.len) break;
+                if (wc <= 127) {
+                    home_buf[home_len] = @intCast(wc);
+                    home_len += 1;
+                }
+            }
+            const base = home_buf[0..home_len];
+            if (base.len == 0) return dirs.toOwnedSlice(allocator);
+
+            const suffixes = [_][]const u8{
+                "\\Google\\Chrome\\User Data",
+                "\\Google\\Chrome SxS\\User Data",
+                "\\Chromium\\User Data",
+                "\\BraveSoftware\\Brave-Browser\\User Data",
+            };
+            for (suffixes) |suffix| {
+                const path = std.fmt.allocPrint(allocator, "{s}{s}", .{ base, suffix }) catch continue;
+                try dirs.append(allocator, path);
+            }
+        },
+        else => {},
+    }
+
+    return dirs.toOwnedSlice(allocator);
+}
+
+pub fn freeUserDataDirs(allocator: Allocator, dirs: [][]u8) void {
+    for (dirs) |d| allocator.free(d);
+    allocator.free(dirs);
+}
+
+/// Try to discover a running Chrome instance's WebSocket URL.
+/// 1. Search Chrome user data directories for DevToolsActivePort file
+/// 2. Try connecting via /json/version with the discovered port
+/// 3. Fallback: probe common ports (9222, 9229)
+/// Returns the WebSocket URL (caller must free).
+pub fn autoConnect(allocator: Allocator) ![]u8 {
+    // Step 1: Try user data directories
+    var has_dirs = true;
+    const dirs = getUserDataDirs(allocator) catch blk: {
+        has_dirs = false;
+        break :blk @as([][]u8, &.{});
+    };
+    defer if (has_dirs) freeUserDataDirs(allocator, dirs);
+
+    for (dirs) |dir| {
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/DevToolsActivePort", .{dir}) catch continue;
+
+        var file_buf: [256]u8 = undefined;
+        const content = std.fs.cwd().readFile(path, &file_buf) catch continue;
+
+        const info = parseDevToolsActivePort(content) orelse continue;
+        if (info.port == 0) continue;
+
+        // Try /json/version discovery first
+        if (discoverWsUrl(allocator, "127.0.0.1", info.port)) |ws_url| {
+            return ws_url;
+        } else |_| {}
+
+        // Fallback: build WebSocket URL directly from the file
+        if (isPortReachable(info.port)) {
+            return std.fmt.allocPrint(allocator, "ws://127.0.0.1:{d}{s}", .{ info.port, info.ws_path });
+        }
+    }
+
+    // Step 2: Probe common ports
+    const common_ports = [_]u16{ 9222, 9229 };
+    for (common_ports) |port| {
+        if (discoverWsUrl(allocator, "127.0.0.1", port)) |ws_url| {
+            return ws_url;
+        } else |_| {}
+    }
+
+    return error.NoChromeFound;
+}
+
+// ============================================================================
 // Tests
 // ============================================================================
 
@@ -735,4 +869,70 @@ test "httpGet: response body extraction with Content-Length" {
     const url = parseJsonVersion(testing.allocator, http_body).?;
     defer testing.allocator.free(url);
     try testing.expect(std.mem.indexOf(u8, url, "unique-id") != null);
+}
+
+// ============================================================================
+// Tests: Auto-Connect
+// ============================================================================
+
+test "isPortReachable: unreachable port returns false" {
+    // Port 1 is almost certainly not listening (requires root)
+    try testing.expect(!isPortReachable(1));
+}
+
+test "isPortReachable: random high port returns false" {
+    // A random ephemeral port unlikely to be in use
+    try testing.expect(!isPortReachable(64999));
+}
+
+test "getUserDataDirs: returns dirs for current platform" {
+    const dirs = try getUserDataDirs(testing.allocator);
+    defer freeUserDataDirs(testing.allocator, dirs);
+
+    // On macOS/Linux with HOME set, we should get some dirs
+    if (comptime builtin.os.tag == .macos) {
+        if (std.posix.getenv("HOME") != null) {
+            try testing.expect(dirs.len == 4);
+            // All should contain "Library/Application Support" on macOS
+            for (dirs) |d| {
+                try testing.expect(std.mem.indexOf(u8, d, "Library/Application Support") != null);
+            }
+        }
+    } else if (comptime builtin.os.tag == .linux) {
+        if (std.posix.getenv("HOME") != null) {
+            try testing.expect(dirs.len == 4);
+            for (dirs) |d| {
+                try testing.expect(std.mem.indexOf(u8, d, ".config/") != null or
+                    std.mem.indexOf(u8, d, "BraveSoftware") != null);
+            }
+        }
+    }
+}
+
+test "getUserDataDirs: paths are absolute" {
+    const dirs = try getUserDataDirs(testing.allocator);
+    defer freeUserDataDirs(testing.allocator, dirs);
+
+    for (dirs) |d| {
+        if (comptime builtin.os.tag == .windows) {
+            // Windows paths start with drive letter
+            try testing.expect(d.len >= 2 and d[1] == ':');
+        } else {
+            try testing.expect(d.len > 0 and d[0] == '/');
+        }
+    }
+}
+
+test "autoConnect: returns error when no Chrome is running" {
+    // In CI/test environment, no Chrome should be running on standard ports
+    // and no DevToolsActivePort files should exist in user data dirs.
+    // This test verifies the function handles the "not found" case gracefully.
+    const result = autoConnect(testing.allocator);
+    if (result) |url| {
+        // If Chrome happens to be running, that's OK — just free the result
+        testing.allocator.free(url);
+    } else |err| {
+        // Expected: no Chrome found
+        try testing.expect(err == error.NoChromeFound or err == error.ConnectionRefused);
+    }
 }

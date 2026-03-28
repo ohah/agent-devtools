@@ -356,6 +356,7 @@ agent-devtools status                  # 데몬 상태
 agent-devtools --session=NAME          # 세션별 독립 데몬
 agent-devtools --headed                # 브라우저 창 표시
 agent-devtools --port=PORT             # 기존 Chrome 연결
+agent-devtools --auto-connect          # 실행 중인 Chrome 자동 탐지 연결
 agent-devtools --proxy=URL             # 프록시 서버
 agent-devtools --proxy-bypass=LIST     # 프록시 바이패스 목록
 agent-devtools --extension=PATH        # Chrome 확장 로딩
