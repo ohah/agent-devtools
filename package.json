@@ -1,0 +1,35 @@
+{
+  "name": "@ohah/agent-devtools",
+  "version": "0.1.0",
+  "description": "Browser DevTools CLI for AI agents — web debugging, API reverse engineering, network interception",
+  "type": "module",
+  "files": [
+    "bin",
+    "scripts",
+    "skills",
+    "SKILL.md"
+  ],
+  "bin": {
+    "agent-devtools": "./bin/agent-devtools.js"
+  },
+  "scripts": {
+    "postinstall": "node scripts/postinstall.js"
+  },
+  "keywords": [
+    "browser",
+    "automation",
+    "ai",
+    "agent",
+    "devtools",
+    "cdp",
+    "chrome",
+    "testing",
+    "debugging"
+  ],
+  "author": "ohah",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ohah/agent-devtools"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "name": "agent-devtools",
+  "description": "Browser DevTools CLI for AI agents — web debugging, API reverse engineering, network interception",
+  "version": "0.1.0",
+  "author": {
+    "name": "ohah"
+  },
+  "repository": "https://github.com/ohah/agent-devtools"
+}

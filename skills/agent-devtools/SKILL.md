@@ -1,91 +1,173 @@
 ---
 name: agent-devtools
-description: Browser DevTools CLI for AI agents — network analysis, page interaction, API reverse-engineering, and flow recording
+description: Browser automation and web debugging CLI for AI agents. Use when the user needs to interact with websites, fill forms, click buttons, take screenshots, extract data, test web apps, inspect network traffic, reverse-engineer APIs, intercept requests, or record/diff network flows. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data", "test this web app", "login to a site", "inspect network requests", "find API endpoints", "mock an API", or any task requiring programmatic web interaction.
+allowed-tools: Bash(agent-devtools:*), Bash(./zig-out/bin/agent-devtools:*)
 ---
 
-# agent-devtools
+# Browser Automation with agent-devtools
 
-Browser DevTools CLI that combines agent-browser's page interaction with network analysis, API reverse-engineering, and flow recording.
-
-## Quick Start
-
-```bash
-# Open a page (starts daemon automatically)
-agent-devtools open https://example.com
-
-# Take a snapshot to see interactive elements
-agent-devtools snapshot -i
-# Output:
-# @e1 [heading] "Example Domain"
-# @e2 [link] "Learn more"
-
-# Interact using @refs
-agent-devtools click @e2
-agent-devtools fill @e3 "search query"
-agent-devtools press Enter
-```
+Controls Chrome/Chromium via CDP. Browser persists via background daemon across commands.
 
 ## Core Workflow
 
-### 1. Navigate + Snapshot + Interact
+1. `agent-devtools open <url>` — navigate
+2. `agent-devtools snapshot -i` — get interactive element refs
+3. Use refs (`@e1`, `@e2`) to interact
+4. Re-snapshot after navigation or DOM changes
+
 ```bash
-agent-devtools open <url>          # Navigate
-agent-devtools snapshot -i         # Get interactive elements with @refs
-agent-devtools click @e1           # Click using ref
-agent-devtools fill @e2 "text"     # Type into input
-agent-devtools press Enter         # Press key
-agent-devtools screenshot path.png # Verify visually
+agent-devtools open https://example.com/form
+agent-devtools snapshot -i
+# Output:
+# - textbox "Email" [ref=e1]
+# - textbox "Password" [ref=e2]
+# - button "Submit" [ref=e3]
+
+agent-devtools fill @e1 "user@example.com"
+agent-devtools fill @e2 "password123"
+agent-devtools click @e3
+agent-devtools snapshot -i  # Re-snapshot after submit
 ```
 
-### 2. Network Analysis
-```bash
-agent-devtools network list           # See all requests
-agent-devtools network list api       # Filter by URL pattern
-agent-devtools network get <reqId>    # Get response body
-agent-devtools analyze                # Auto-discover API endpoints + schema
+**Refs are invalidated on page changes.** Always re-snapshot after clicking links, submitting forms, or loading dynamic content.
+
+## Commands
+
+### Navigation
+```
+open <url>          Navigate (aliases: navigate, goto)
+back / forward      History navigation
+reload              Reload page
+close               Close browser + daemon
+url / title         Get current URL / page title
 ```
 
-### 3. API Reverse Engineering
-```bash
-agent-devtools open https://app.com
-# Browse around to generate traffic...
-agent-devtools analyze
-# Output: discovered endpoints with parameter names and response schemas
-# GET /api/users/{userId} [200] application/json
-#   Schema: {id: integer, name: string, email: string}
+### Snapshot + Interaction
+```
+snapshot -i         Interactive elements only (recommended)
+snapshot            Full accessibility tree
+click @e1           Click
+dblclick @e1        Double-click
+tap @e1             Touch tap
+fill @e1 "text"     Clear + type
+type @e1 "text"     Type (no clear)
+press Enter         Press key
+hover / focus @e1   Hover or focus
+select @e1 "val"    Select dropdown
+check / uncheck @e1 Checkbox
+scroll down 500     Scroll (up/down/left/right)
+drag @e1 @e2        Drag and drop
 ```
 
-### 4. Network Interception
-```bash
-agent-devtools intercept mock "*api/users*" '{"users":[]}'  # Mock response
-agent-devtools intercept fail "*analytics*"                   # Block requests
-agent-devtools intercept delay "*api*" 2000                   # Slow down
-agent-devtools intercept list                                 # View rules
-agent-devtools intercept clear                                # Remove all
+### Get Information
+```
+get text/html/value @e1    Element content
+get attr @e1 href          Attribute value
+get url / get title        Page info
+is visible/enabled/checked @e1
+boundingbox @e1            Bounding box {x,y,w,h}
+styles @e1 color           Computed CSS value
 ```
 
-### 5. Flow Recording & Comparison
-```bash
-agent-devtools record baseline        # Save current network state
-# ... make changes ...
-agent-devtools diff baseline          # Compare — added/removed/changed requests
+### Find Elements (without snapshot)
+```
+find role button           Find by ARIA role
+find text "Submit"         Find by text content
+find label "Email"         Find by label
 ```
 
-### 6. Console Debugging
-```bash
-agent-devtools console list           # View console.log/warn/error output
-agent-devtools console clear          # Clear
+### Capture
+```
+screenshot [path]   PNG screenshot
+pdf [path]          Save as PDF
+eval <js>           Run JavaScript
 ```
 
-## Important Notes
+### Network (unique feature)
+```
+network list [pattern]      List requests (filter by URL)
+network get <id>            Full request/response with body
+analyze                     API reverse engineering + schema
+intercept mock "/api" '{}'  Mock response
+intercept fail "/api"       Block request
+intercept delay "/api" 3000 Delay request
+har [file]                  Export HAR 1.2
+```
 
-- Always run `snapshot -i` before using `click @ref` or `fill @ref` — refs are generated by snapshot
-- The daemon persists between commands — no need to reopen Chrome each time
-- Use `--session=NAME` to run multiple independent browser sessions
-- Use `--headed` to see the browser window for debugging
-- Use `--port=PORT` to connect to an existing Chrome instance
-- The daemon auto-shuts down after 10 minutes of inactivity
+### Wait
+```
+wait <ms>                   Wait milliseconds
+waitforloadstate [ms]       Wait for page load
+waitfor network <pat> [ms]  Wait for network request
+waitfor console <pat> [ms]  Wait for console message
+waitfor error [ms]          Wait for JS error
+waitdownload [ms]           Wait for download
+```
 
-## Command Reference
+### Settings
+```
+set viewport 1920 1080     Viewport size
+set media dark             Color scheme
+set timezone Asia/Seoul    Timezone
+set locale ko-KR           Locale
+set device "iPhone 14"     Device emulation
+set useragent "..."        User agent
+set geolocation 37.5 127   Geolocation
+set headers '{"X":"Y"}'    HTTP headers
+set offline on             Offline mode
+set ignore-https-errors    Ignore cert errors
+set permissions grant geo  Grant permission
+```
 
-See [references/commands.md](references/commands.md) for the full command list.
+### Storage & State
+```
+cookies [list/set/get/clear]   Cookies
+storage local [key]            localStorage
+state save/load/list           Save/restore cookies + storage
+credentials <user> <pass>      HTTP basic auth
+```
+
+### Tabs & Console
+```
+tab list / new / close / switch <n>
+console list / clear
+errors [clear]
+dialog accept/dismiss/info
+```
+
+### Recording
+```
+record <name>    Save network state
+diff <name>      Compare current vs recorded
+replay <name>    Navigate + diff
+```
+
+## Interactive Mode
+
+`--interactive` for persistent sessions. Events stream automatically.
+
+```bash
+agent-devtools --interactive
+> open https://example.com
+< {"success":true}
+< {"event":"network","url":"https://example.com/","method":"GET","status":200}
+> snapshot -i
+< {"success":true,"data":"- button \"Submit\" [ref=e1]\n"}
+```
+
+## Debug Mode
+
+`--debug` with `--interactive` — action commands automatically include triggered API requests and URL changes. Static resources filtered.
+
+```bash
+agent-devtools --interactive --debug
+> click @e3
+< {"success":true,"debug":{"new_requests":[{"url":"/api/login","method":"POST","status":200}],"url_changed":true}}
+```
+
+## Deep-Dive Documentation
+
+For detailed reference, see `references/`:
+- [commands.md](references/commands.md) — Full command reference
+- [debug-mode.md](references/debug-mode.md) — Debug mode details
+- [patterns.md](references/patterns.md) — Common automation patterns

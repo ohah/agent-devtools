@@ -18,5 +18,8 @@ Thumbs.db
 node_modules/
 dist/
 
+# Downloaded native binaries (npm postinstall)
+bin/agent-devtools-*
+
 # Reference repos (cloned for spec reference)
 reference/
