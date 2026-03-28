@@ -2773,6 +2773,11 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "tab_list")) {
         return handleTabList(allocator, sender, resp_map, cmd_id, session_id);
     } else if (std.mem.eql(u8, req.action, "tab_new")) {
+        if (ctx.allowed_domains.len > 0) {
+            if (req.url) |u| {
+                if (!isDomainAllowed(u, ctx.allowed_domains)) return respondErr(allocator, "domain not allowed");
+            }
+        }
         return handleSimpleCdpWithParams(allocator, sender, cmd_id, session_id, "Target.createTarget", req.url);
     } else if (std.mem.eql(u8, req.action, "tab_close")) {
         return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Target.closeTarget");
@@ -7042,7 +7047,19 @@ fn getAuthDir(buf: []u8) ?[]const u8 {
     return std.fmt.bufPrint(buf, "{s}/.agent-devtools/auth", .{home}) catch null;
 }
 
+fn isValidVaultName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    for (name) |c| {
+        if (c == '/' or c == '\\' or c == '.' or c == 0) return false;
+    }
+    return true;
+}
+
 fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, password: []const u8) void {
+    if (!isValidVaultName(name)) {
+        writeErr("Invalid auth profile name (no /, \\, . allowed)\n", .{});
+        return;
+    }
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse {
         writeErr("Failed to determine auth directory\n", .{});
@@ -7169,6 +7186,7 @@ fn authVaultList() void {
 }
 
 fn authVaultShow(name: []const u8) void {
+    if (!isValidVaultName(name)) { writeErr("Invalid auth profile name\n", .{}); return; }
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse {
         writeErr("Auth directory not found\n", .{});
@@ -7200,6 +7218,7 @@ fn authVaultShow(name: []const u8) void {
 }
 
 fn authVaultDelete(name: []const u8) void {
+    if (!isValidVaultName(name)) { writeErr("Invalid auth profile name\n", .{}); return; }
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse {
         writeErr("Auth directory not found\n", .{});
@@ -7218,6 +7237,7 @@ fn authVaultDelete(name: []const u8) void {
 
 /// Load auth profile from file, return url, username, password.
 fn authVaultLoad(name: []const u8) ?struct { url: []const u8, username: []const u8, password: []const u8 } {
+    if (!isValidVaultName(name)) return null;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse return null;
 
@@ -7394,6 +7414,10 @@ fn handleTraceStop(
         }
     }
     _ = file.write("]}") catch return respondErr(allocator, "write error");
+
+    // Free trace events after writing
+    for (trace_events.items) |item| allocator.free(item);
+    trace_events.clearRetainingCapacity();
 
     // Build response
     var resp_buf: std.ArrayList(u8) = .empty;
