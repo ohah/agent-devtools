@@ -2942,12 +2942,15 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "tab_list")) {
         return handleTabList(allocator, sender, resp_map, cmd_id, session_id);
     } else if (std.mem.eql(u8, req.action, "tab_new")) {
-        if (ctx.allowed_domains.len > 0) {
-            if (req.url) |u| {
-                if (!isDomainAllowed(u, ctx.allowed_domains)) return respondErr(allocator, "domain not allowed");
+        if (ctx.allowed_domains) |domains| {
+            if (domains.len > 0) {
+                if (req.url) |u| {
+                    if (!isDomainAllowed(u, domains)) return respondErr(allocator, "domain not allowed");
+                }
             }
         }
         return handleSimpleCdpWithParams(allocator, sender, cmd_id, session_id, "Target.createTarget", req.url);
+        // NOTE: extra closing brace was needed for the if(ctx.allowed_domains) block — but the structure above closes correctly
     } else if (std.mem.eql(u8, req.action, "tab_close")) {
         return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Target.closeTarget");
     } else if (std.mem.eql(u8, req.action, "cookies_list")) {
@@ -7082,6 +7085,16 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
             if (std.mem.eql(u8, flag, "-i")) action = "snapshot_interactive";
         }
         url = null;
+    } else if (std.mem.eql(u8, cmd, "screenshot")) {
+        if (arg1) |flag| {
+            if (std.mem.eql(u8, flag, "--annotate") or std.mem.eql(u8, flag, "-a")) {
+                action = "screenshot_annotate";
+                url = arg2; // path
+            } else {
+                url = flag; // path
+            }
+        }
+        pattern = null;
     } else if (std.mem.eql(u8, cmd, "select")) {
         action = "select_option";
     } else if (std.mem.eql(u8, cmd, "check")) {
