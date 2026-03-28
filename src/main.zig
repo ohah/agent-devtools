@@ -7208,7 +7208,7 @@ fn loadConfigFile(
 ) void {
     // Try ./agent-devtools.json first, then ~/.agent-devtools/config.json
     const local_path = "agent-devtools.json";
-    var content_buf: [4096]u8 = undefined;
+    var content_buf: [65536]u8 = undefined;
 
     const content = blk: {
         break :blk std.fs.cwd().readFile(local_path, &content_buf) catch {

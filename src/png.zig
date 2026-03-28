@@ -92,7 +92,7 @@ pub fn decode(allocator: Allocator, png_data: []const u8) Error!Image {
     var decomp = std.compress.flate.Decompress.init(&reader, .zlib, &decomp_buf);
 
     // Read all decompressed data
-    const raw_size = (width * bpp + 1) * height; // +1 for filter byte per row
+    const raw_size = (@as(usize, width) * bpp + 1) * @as(usize, height);
     var aw: std.io.Writer.Allocating = .init(allocator);
     errdefer aw.deinit();
     _ = decomp.reader.streamRemaining(&aw.writer) catch return Error.DecompressError;
@@ -102,7 +102,7 @@ pub fn decode(allocator: Allocator, png_data: []const u8) Error!Image {
     if (raw_data.len < raw_size) return Error.DataTooShort;
 
     // 4. Apply row filters and convert to RGBA
-    const pixel_count = width * height;
+    const pixel_count = @as(usize, width) * @as(usize, height);
     const pixels = allocator.alloc(u8, pixel_count * 4) catch return Error.OutOfMemory;
     errdefer allocator.free(pixels);
 
@@ -337,8 +337,8 @@ fn writeChunk(allocator: Allocator, list: *std.ArrayListUnmanaged(u8), chunk_typ
 
 pub const DiffResult = struct {
     match: bool,
-    total_pixels: u32,
-    different_pixels: u32,
+    total_pixels: u64,
+    different_pixels: u64,
     mismatch_percentage: f64,
     diff_image: ?[]u8, // encoded PNG, caller must free
     allocator: Allocator,
@@ -364,8 +364,8 @@ pub fn diffScreenshots(allocator: Allocator, baseline_data: []const u8, current_
     const max_w = @max(img1.width, img2.width);
     const max_h = @max(img1.height, img2.height);
 
-    const total_pixels = max_w * max_h;
-    var different_pixels: u32 = 0;
+    const total_pixels: u64 = @as(u64, max_w) * @as(u64, max_h);
+    var different_pixels: u64 = 0;
 
     // Build diff image pixels
     const diff_pixels = try allocator.alloc(u8, @as(usize, max_w) * max_h * 4);
