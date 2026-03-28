@@ -1,6 +1,6 @@
 {
   "name": "@ohah/agent-devtools",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Browser DevTools CLI for AI agents — web debugging, API reverse engineering, network interception",
   "type": "module",
   "files": [
