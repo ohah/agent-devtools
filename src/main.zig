@@ -7333,8 +7333,8 @@ test "handleHar: generates valid HAR with empty collector" {
     var collector = network.Collector.init(allocator);
     defer collector.deinit();
 
-    // Use a temp file path
-    const tmp_path = "/tmp/agent-devtools-test-har.har";
+    // Use a cross-platform temp file path
+    const tmp_path = if (comptime builtin.os.tag == .windows) "agent-devtools-test-har.har" else "/tmp/agent-devtools-test-har.har";
     const result = handleHar(allocator, &collector, tmp_path);
     defer allocator.free(result);
 
