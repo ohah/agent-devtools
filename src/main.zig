@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const agent = @import("agent_devtools");
 const chrome = agent.chrome;
 const cdp = agent.cdp;
@@ -43,12 +44,16 @@ const DialogInfo = struct {
 };
 
 pub fn main() void {
-    if (std.posix.getenv("AGENT_DEVTOOLS_DAEMON")) |_| {
+    if (daemon.getenv("AGENT_DEVTOOLS_DAEMON")) |_| {
         runDaemon();
         return;
     }
 
-    var args_iter = std.process.args();
+    var args_iter = if (comptime builtin.os.tag == .windows)
+        std.process.argsWithAllocator(std.heap.page_allocator) catch return
+    else
+        std.process.args();
+    defer if (comptime builtin.os.tag == .windows) args_iter.deinit();
     _ = args_iter.next();
 
     // Parse --session flag (can appear before command)
@@ -1428,10 +1433,10 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_
 // ============================================================================
 
 fn runDaemon() void {
-    const session = std.posix.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
-    const is_headed = std.posix.getenv("AGENT_DEVTOOLS_HEADED") != null;
-    const ext_port = std.posix.getenv("AGENT_DEVTOOLS_PORT");
-    const env_user_agent = std.posix.getenv("AGENT_DEVTOOLS_USER_AGENT");
+    const session = daemon.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
+    const is_headed = daemon.getenv("AGENT_DEVTOOLS_HEADED") != null;
+    const ext_port = daemon.getenv("AGENT_DEVTOOLS_PORT");
+    const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
 
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();

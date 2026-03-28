@@ -7,19 +7,64 @@ const cdp = @import("cdp.zig");
 
 // Reference: agent-browser/cli/src/connection.rs, daemon.rs
 
+/// Cross-platform getenv: uses std.posix.getenv on Unix, std.process.getenvW on Windows.
+/// On Windows, converts the env var name to WTF-16 at comptime and uses a per-call-site
+/// static buffer to store the UTF-8 result.
+pub fn getenv(comptime name: []const u8) ?[]const u8 {
+    if (comptime builtin.os.tag == .windows) {
+        // Build null-terminated UTF-16 name at comptime
+        const name_w = comptime blk: {
+            var buf: [name.len:0]u16 = [_:0]u16{0} ** name.len;
+            for (name, 0..) |c, i| {
+                buf[i] = c;
+            }
+            const final = buf;
+            break :blk final;
+        };
+        const result = std.process.getenvW(@ptrCast(&name_w)) orelse return null;
+        // Each comptime call site gets its own static buffer via the comptime name param
+        const S = struct {
+            var env_buf: [512]u8 = undefined;
+        };
+        var len: usize = 0;
+        for (result) |wc| {
+            if (len >= S.env_buf.len) break;
+            if (wc <= 127) {
+                S.env_buf[len] = @intCast(wc);
+                len += 1;
+            }
+        }
+        if (len == 0) return null;
+        return S.env_buf[0..len];
+    } else {
+        return std.posix.getenv(name);
+    }
+}
+
 /// Get the base directory for socket/pid files.
 /// Priority: AGENT_DEVTOOLS_SOCKET_DIR > XDG_RUNTIME_DIR > $HOME/.agent-devtools > /tmp/agent-devtools
+/// On Windows: AGENT_DEVTOOLS_SOCKET_DIR > LOCALAPPDATA > USERPROFILE > C:\temp\agent-devtools
 pub fn getSocketDir(buf: []u8) []const u8 {
-    if (std.posix.getenv("AGENT_DEVTOOLS_SOCKET_DIR")) |dir| {
+    if (getenv("AGENT_DEVTOOLS_SOCKET_DIR")) |dir| {
         if (dir.len > 0) return dir;
     }
-    if (std.posix.getenv("XDG_RUNTIME_DIR")) |dir| {
-        if (dir.len > 0) return dir;
+    if (comptime builtin.os.tag == .windows) {
+        if (getenv("LOCALAPPDATA")) |dir| {
+            return std.fmt.bufPrint(buf, "{s}\\agent-devtools", .{dir}) catch "C:\\temp\\agent-devtools";
+        }
+        if (getenv("USERPROFILE")) |dir| {
+            return std.fmt.bufPrint(buf, "{s}\\.agent-devtools", .{dir}) catch "C:\\temp\\agent-devtools";
+        }
+        return "C:\\temp\\agent-devtools";
+    } else {
+        if (getenv("XDG_RUNTIME_DIR")) |dir| {
+            if (dir.len > 0) return dir;
+        }
+        if (getenv("HOME")) |home| {
+            return std.fmt.bufPrint(buf, "{s}/.agent-devtools", .{home}) catch "/tmp/agent-devtools";
+        }
+        return "/tmp/agent-devtools";
     }
-    if (std.posix.getenv("HOME")) |home| {
-        return std.fmt.bufPrint(buf, "{s}/.agent-devtools", .{home}) catch "/tmp/agent-devtools";
-    }
-    return "/tmp/agent-devtools";
 }
 
 pub fn getSocketPath(buf: []u8, session: []const u8) ![]const u8 {
@@ -32,6 +77,24 @@ pub fn getPidPath(buf: []u8, session: []const u8) ![]const u8 {
     var dir_buf: [512]u8 = undefined;
     const dir = getSocketDir(&dir_buf);
     return std.fmt.bufPrint(buf, "{s}/{s}.pid", .{ dir, session });
+}
+
+/// Get TCP port file path (used on Windows to store the port number).
+pub fn getPortPath(buf: []u8, session: []const u8) ![]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const dir = getSocketDir(&dir_buf);
+    return std.fmt.bufPrint(buf, "{s}/{s}.port", .{ dir, session });
+}
+
+/// Get TCP port for a session on Windows (hash-based, range 49152-65534).
+/// Matches agent-browser's approach for deterministic port assignment.
+pub fn getPortForSession(session: []const u8) u16 {
+    var hash: i32 = 0;
+    for (session) |c| {
+        hash = (hash << 5) -% hash +% @as(i32, @intCast(c));
+    }
+    const abs_hash = if (hash < 0) @as(u32, @intCast(-hash)) else @as(u32, @intCast(hash));
+    return 49152 + @as(u16, @intCast(abs_hash % 16383));
 }
 
 // ============================================================================
@@ -211,10 +274,19 @@ pub const SocketServer = struct {
     fd: posix.socket_t,
     socket_path: [std.fs.max_path_bytes]u8,
     socket_path_len: usize,
+    port: u16, // only used on Windows (TCP mode)
 
     pub const AcceptError = posix.AcceptError;
 
     pub fn listen(session: []const u8) !SocketServer {
+        if (comptime builtin.os.tag == .windows) {
+            return listenTcp(session);
+        } else {
+            return listenUnix(session);
+        }
+    }
+
+    fn listenUnix(session: []const u8) !SocketServer {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const socket_path = try getSocketPath(&path_buf, session);
 
@@ -239,10 +311,51 @@ pub const SocketServer = struct {
             .fd = fd,
             .socket_path = undefined,
             .socket_path_len = socket_path.len,
+            .port = 0,
         };
         @memcpy(server.socket_path[0..socket_path.len], socket_path);
 
         return server;
+    }
+
+    fn listenTcp(session: []const u8) !SocketServer {
+        const port = getPortForSession(session);
+        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch return error.InvalidArgument;
+        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
+        errdefer posix.close(fd);
+
+        // Allow address reuse
+        const optval = [_]u8{ 1, 0, 0, 0 };
+        posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &optval) catch {};
+
+        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+        try posix.listen(fd, 5);
+
+        // Ensure directory exists for port file
+        var dir_buf: [512]u8 = undefined;
+        const dir = getSocketDir(&dir_buf);
+        std.fs.makeDirAbsolute(dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+
+        // Write port file so client knows which port
+        var port_buf: [std.fs.max_path_bytes]u8 = undefined;
+        if (getPortPath(&port_buf, session)) |port_path| {
+            var pbuf: [8]u8 = undefined;
+            const port_str = std.fmt.bufPrint(&pbuf, "{d}", .{port}) catch "";
+            if (std.fs.createFileAbsolute(port_path, .{})) |f| {
+                _ = f.write(port_str) catch {};
+                f.close();
+            } else |_| {}
+        } else |_| {}
+
+        return SocketServer{
+            .fd = fd,
+            .socket_path = undefined,
+            .socket_path_len = 0,
+            .port = port,
+        };
     }
 
     pub fn accept(self: *SocketServer) AcceptError!posix.socket_t {
@@ -251,8 +364,13 @@ pub const SocketServer = struct {
 
     pub fn close(self: *SocketServer) void {
         posix.close(self.fd);
-        const path = self.socket_path[0..self.socket_path_len];
-        std.fs.deleteFileAbsolute(path) catch {};
+        if (comptime builtin.os.tag == .windows) {
+            // Clean up port file on Windows
+            // We don't have session here, but port file cleanup happens in ensureDaemon
+        } else {
+            const path = self.socket_path[0..self.socket_path_len];
+            std.fs.deleteFileAbsolute(path) catch {};
+        }
     }
 };
 
@@ -264,11 +382,30 @@ pub const SocketClient = struct {
     fd: posix.socket_t,
 
     pub fn connect(session: []const u8) !SocketClient {
+        if (comptime builtin.os.tag == .windows) {
+            return connectTcp(session);
+        } else {
+            return connectUnix(session);
+        }
+    }
+
+    fn connectUnix(session: []const u8) !SocketClient {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const socket_path = try getSocketPath(&path_buf, session);
 
         const addr = try std.net.Address.initUnix(socket_path);
         const fd = try posix.socket(posix.AF.UNIX, posix.SOCK.STREAM, 0);
+        errdefer posix.close(fd);
+
+        try posix.connect(fd, &addr.any, addr.getOsSockLen());
+
+        return .{ .fd = fd };
+    }
+
+    fn connectTcp(session: []const u8) !SocketClient {
+        const port = getPortForSession(session);
+        const addr = std.net.Address.parseIp4("127.0.0.1", port) catch return error.InvalidArgument;
+        const fd = try posix.socket(posix.AF.INET, posix.SOCK.STREAM, 0);
         errdefer posix.close(fd);
 
         try posix.connect(fd, &addr.any, addr.getOsSockLen());
@@ -328,12 +465,21 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (SocketClient.isReady(session)) return false;
 
     // Clean stale files
-    var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
     var pid_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sock_path = getSocketPath(&sock_buf, session) catch return error.InvalidArgument;
     const pid_path = getPidPath(&pid_buf, session) catch return error.InvalidArgument;
-    std.fs.deleteFileAbsolute(sock_path) catch {};
     std.fs.deleteFileAbsolute(pid_path) catch {};
+
+    if (comptime builtin.os.tag == .windows) {
+        // On Windows, clean stale port file
+        var port_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const port_path = getPortPath(&port_buf, session) catch return error.InvalidArgument;
+        std.fs.deleteFileAbsolute(port_path) catch {};
+    } else {
+        // On Unix, clean stale socket file
+        var sock_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const sock_path = getSocketPath(&sock_buf, session) catch return error.InvalidArgument;
+        std.fs.deleteFileAbsolute(sock_path) catch {};
+    }
 
     const exe_path = try std.fs.selfExePathAlloc(allocator);
     defer allocator.free(exe_path);
@@ -536,6 +682,37 @@ test "writeJsonValue: null" {
     defer buf.deinit(testing.allocator);
     try writeJsonValue(buf.writer(testing.allocator), .null);
     try testing.expectEqualStrings("null", buf.items);
+}
+
+test "getPortPath: builds correct path" {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try getPortPath(&buf, "test-session");
+    try testing.expect(std.mem.endsWith(u8, path, "test-session.port"));
+}
+
+test "getPortForSession: returns port in valid range" {
+    const port = getPortForSession("default");
+    try testing.expect(port >= 49152);
+    try testing.expect(port <= 65534);
+}
+
+test "getPortForSession: deterministic for same session" {
+    const port1 = getPortForSession("my-session");
+    const port2 = getPortForSession("my-session");
+    try testing.expectEqual(port1, port2);
+}
+
+test "getPortForSession: different sessions get different ports" {
+    const port1 = getPortForSession("session-a");
+    const port2 = getPortForSession("session-b");
+    // Not guaranteed but overwhelmingly likely for different inputs
+    try testing.expect(port1 != port2);
+}
+
+test "getPortForSession: empty session" {
+    const port = getPortForSession("");
+    try testing.expect(port >= 49152);
+    try testing.expect(port <= 65534);
 }
 
 test "writeJsonValue: nested object" {

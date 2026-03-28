@@ -170,6 +170,10 @@ pub fn findChrome() ?[]const u8 {
             "/usr/bin/chromium",
             "/usr/bin/brave-browser",
         },
+        .windows => &[_][]const u8{
+            "C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe",
+            "C:\\Program Files (x86)\\Google\\Chrome\\Application\\chrome.exe",
+        },
         else => return null,
     };
 
@@ -351,7 +355,10 @@ fn createTempDir(allocator: Allocator) ![]u8 {
         c.* = charset[c.* % charset.len];
     }
 
-    const tmp_base = std.posix.getenv("TMPDIR") orelse "/tmp";
+    const tmp_base = if (comptime builtin.os.tag == .windows)
+        "C:\\Windows\\Temp"
+    else
+        std.posix.getenv("TMPDIR") orelse "/tmp";
     const path = try std.fmt.allocPrint(allocator, "{s}/agent-devtools-{s}", .{ tmp_base, &suffix });
     errdefer allocator.free(path);
 
