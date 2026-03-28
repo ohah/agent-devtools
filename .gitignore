@@ -23,3 +23,5 @@ bin/agent-devtools-*
 
 # Reference repos (cloned for spec reference)
 reference/
+--annotate
+diff.png
