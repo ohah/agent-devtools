@@ -64,6 +64,19 @@ pub fn main() void {
     var interactive = false;
     var debug_mode = false;
     var command: ?[]const u8 = null;
+    var proxy: ?[]const u8 = null;
+    var proxy_bypass: ?[]const u8 = null;
+    var extensions: ?[]const u8 = null;
+    var allowed_domains: ?[]const u8 = null;
+    var content_boundaries = false;
+
+    // Load config file defaults (best-effort)
+    var config_headed = false;
+    var config_proxy: ?[]const u8 = null;
+    var config_proxy_bypass: ?[]const u8 = null;
+    var config_user_agent: ?[]const u8 = null;
+    var config_extensions: ?[]const u8 = null;
+    loadConfigFile(&config_headed, &config_proxy, &config_proxy_bypass, &config_user_agent, &config_extensions);
 
     while (args_iter.next()) |arg| {
         if (std.mem.startsWith(u8, arg, "--session=")) {
@@ -74,6 +87,16 @@ pub fn main() void {
             cdp_port = arg["--port=".len..];
         } else if (std.mem.startsWith(u8, arg, "--user-agent=")) {
             user_agent = arg["--user-agent=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--proxy=")) {
+            proxy = arg["--proxy=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--proxy-bypass=")) {
+            proxy_bypass = arg["--proxy-bypass=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--extension=")) {
+            extensions = arg["--extension=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--allowed-domains=")) {
+            allowed_domains = arg["--allowed-domains=".len..];
+        } else if (std.mem.eql(u8, arg, "--content-boundaries")) {
+            content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "--pipe")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -84,10 +107,22 @@ pub fn main() void {
         }
     }
 
+    // Apply config file defaults (CLI flags override)
+    if (!headed and config_headed) headed = true;
+    if (proxy == null) proxy = config_proxy;
+    if (proxy_bypass == null) proxy_bypass = config_proxy_bypass;
+    if (user_agent == null) user_agent = config_user_agent;
+    if (extensions == null) extensions = config_extensions;
+
     const daemon_opts = daemon.DaemonOptions{
         .headed = headed,
         .cdp_port = cdp_port,
         .user_agent = user_agent,
+        .proxy = proxy,
+        .proxy_bypass = proxy_bypass,
+        .extensions = extensions,
+        .allowed_domains = allowed_domains,
+        .content_boundaries = content_boundaries,
     };
 
     if (interactive) {
@@ -422,8 +457,17 @@ pub fn main() void {
         const coords = std.fmt.bufPrint(&coords_buf, "{s}:{s}", .{ x, y }) catch "0:0";
         sendAction(session, "mouse", action, coords, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "screenshot")) {
-        const path = args_iter.next();
-        sendAction(session, "screenshot", path, null, daemon_opts);
+        const first_arg = args_iter.next();
+        if (first_arg) |fa| {
+            if (std.mem.eql(u8, fa, "--annotate") or std.mem.eql(u8, fa, "-a")) {
+                const path = args_iter.next();
+                sendAction(session, "screenshot_annotate", path, null, daemon_opts);
+            } else {
+                sendAction(session, "screenshot", fa, null, daemon_opts);
+            }
+        } else {
+            sendAction(session, "screenshot", null, null, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         const flag = args_iter.next();
         const interactive_snap = if (flag) |f| std.mem.eql(u8, f, "-i") else false;
@@ -846,6 +890,91 @@ pub fn main() void {
         };
         const timeout = args_iter.next() orelse "30000";
         sendAction(session, "waitfunction", expr, timeout, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "auth")) {
+        const subcmd = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools auth <save|login|list|show|delete> [args]\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, subcmd, "save")) {
+            // auth save <name> --url <url> --username <user> --password <pass>
+            const name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools auth save <name> --url <url> --username <user> --password <pass>\n", .{});
+                std.process.exit(1);
+            };
+            var auth_url: ?[]const u8 = null;
+            var auth_user: ?[]const u8 = null;
+            var auth_pass: ?[]const u8 = null;
+            while (args_iter.next()) |aarg| {
+                if (std.mem.eql(u8, aarg, "--url")) { auth_url = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--username")) { auth_user = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--password")) { auth_pass = args_iter.next(); }
+            }
+            if (auth_url == null or auth_user == null or auth_pass == null) {
+                writeErr("Usage: agent-devtools auth save <name> --url <url> --username <user> --password <pass>\n", .{});
+                std.process.exit(1);
+            }
+            // Build JSON: url|username|password packed into url and pattern fields
+            // Pack as "url\x00username" in url, password in pattern
+            var pack_buf: [2048]u8 = undefined;
+            const pack_data = std.fmt.bufPrint(&pack_buf, "{s}\x00{s}", .{ auth_url.?, auth_user.? }) catch {
+                writeErr("auth data too long\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "auth_save", pack_data, auth_pass.?, daemon_opts);
+            // Also save to local file (name passed via a second field)
+            authVaultSave(name, auth_url.?, auth_user.?, auth_pass.?);
+        } else if (std.mem.eql(u8, subcmd, "login")) {
+            const name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools auth login <name>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "auth_login", name, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "list")) {
+            authVaultList();
+        } else if (std.mem.eql(u8, subcmd, "show")) {
+            const name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools auth show <name>\n", .{});
+                std.process.exit(1);
+            };
+            authVaultShow(name);
+        } else if (std.mem.eql(u8, subcmd, "delete")) {
+            const name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools auth delete <name>\n", .{});
+                std.process.exit(1);
+            };
+            authVaultDelete(name);
+        } else {
+            writeErr("Unknown auth subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
+    } else if (std.mem.eql(u8, cmd, "trace")) {
+        const subcmd = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools trace <start|stop> [path]\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, subcmd, "start")) {
+            sendAction(session, "trace_start", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "stop")) {
+            const path = args_iter.next();
+            sendAction(session, "trace_stop", path, null, daemon_opts);
+        } else {
+            writeErr("Unknown trace subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
+    } else if (std.mem.eql(u8, cmd, "profiler")) {
+        const subcmd = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools profiler <start|stop> [path]\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, subcmd, "start")) {
+            sendAction(session, "profiler_start", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "stop")) {
+            const path = args_iter.next();
+            sendAction(session, "profiler_stop", path, null, daemon_opts);
+        } else {
+            writeErr("Unknown profiler subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
     } else if (isPlannedCommand(cmd)) {
         writeErr("{s}: not yet implemented\n", .{cmd});
         std.process.exit(1);
@@ -913,7 +1042,11 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
 
     if (resp.success) {
         if (resp.data) |data| {
-            write("{s}\n", .{data});
+            if (daemon_opts.content_boundaries and isContentAction(action)) {
+                write("---AGENT_DEVTOOLS_CONTENT_START---\n{s}\n---AGENT_DEVTOOLS_CONTENT_END---\n", .{data});
+            } else {
+                write("{s}\n", .{data});
+            }
         } else {
             write("OK\n", .{});
         }
@@ -1437,6 +1570,11 @@ fn runDaemon() void {
     const is_headed = daemon.getenv("AGENT_DEVTOOLS_HEADED") != null;
     const ext_port = daemon.getenv("AGENT_DEVTOOLS_PORT");
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
+    const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
+    const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
+    const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
+    const env_allowed_domains = daemon.getenv("AGENT_DEVTOOLS_ALLOWED_DOMAINS");
+    const env_content_boundaries = daemon.getenv("AGENT_DEVTOOLS_CONTENT_BOUNDARIES") != null;
 
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
@@ -1461,7 +1599,12 @@ fn runDaemon() void {
         };
         break :blk discovered_url.?;
     } else blk: {
-        chrome_proc = chrome.ChromeProcess.launch(allocator, .{ .headless = !is_headed }) catch |err| {
+        chrome_proc = chrome.ChromeProcess.launch(allocator, .{
+            .headless = !is_headed,
+            .proxy = env_proxy,
+            .proxy_bypass = env_proxy_bypass,
+            .extensions = env_extensions,
+        }) catch |err| {
             std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
             return;
         };
@@ -1619,6 +1762,15 @@ fn runDaemon() void {
     var event_subscribers = EventSubscribers.init(allocator);
     defer event_subscribers.deinit();
 
+    var trace_events: std.ArrayList([]u8) = .empty;
+    defer {
+        for (trace_events.items) |item| allocator.free(item);
+        trace_events.deinit(allocator);
+    }
+    var trace_complete = std.atomic.Value(bool).init(false);
+    var trace_active = std.atomic.Value(bool).init(false);
+    var trace_mutex: std.Thread.Mutex = .{};
+
     // Set read timeout for receiver thread polling (200ms)
     ws.setReadTimeout(200);
 
@@ -1642,6 +1794,10 @@ fn runDaemon() void {
         .auth_mutex = &auth_mutex,
         .download_tracker = &download_tracker,
         .event_subscribers = &event_subscribers,
+        .trace_events = &trace_events,
+        .trace_complete = &trace_complete,
+        .trace_active = &trace_active,
+        .trace_mutex = &trace_mutex,
     };
     const receiver_handle = std.Thread.spawn(.{}, receiverThread, .{&receiver_ctx}) catch {
         std.debug.print("Daemon: Failed to spawn receiver thread\n", .{});
@@ -1681,6 +1837,12 @@ fn runDaemon() void {
         .auth_mutex = &auth_mutex,
         .download_tracker = &download_tracker,
         .event_subscribers = &event_subscribers,
+        .allowed_domains = env_allowed_domains,
+        .content_boundaries = env_content_boundaries,
+        .trace_events = &trace_events,
+        .trace_complete = &trace_complete,
+        .trace_active = &trace_active,
+        .trace_mutex = &trace_mutex,
     };
 
     const MAX_WORKERS = 8;
@@ -2151,6 +2313,12 @@ const DaemonContext = struct {
     auth_mutex: *std.Thread.Mutex,
     download_tracker: *DownloadTracker,
     event_subscribers: *EventSubscribers,
+    allowed_domains: ?[]const u8 = null,
+    content_boundaries: bool = false,
+    trace_events: *std.ArrayList([]u8),
+    trace_complete: *std.atomic.Value(bool),
+    trace_active: *std.atomic.Value(bool),
+    trace_mutex: *std.Thread.Mutex,
 };
 
 /// Send a CDP command and wait for the response. Returns raw message bytes (caller must free).
@@ -2179,6 +2347,10 @@ const ReceiverContext = struct {
     auth_mutex: *std.Thread.Mutex,
     download_tracker: *DownloadTracker,
     event_subscribers: *EventSubscribers,
+    trace_events: *std.ArrayList([]u8),
+    trace_complete: *std.atomic.Value(bool),
+    trace_active: *std.atomic.Value(bool),
+    trace_mutex: *std.Thread.Mutex,
 };
 
 /// Thread-safe list of fds that receive event broadcasts (interactive/pipe mode).
@@ -2462,6 +2634,15 @@ fn receiverThread(ctx: *ReceiverContext) void {
                                 broadcastDownloadEvent(ctx.allocator, ctx.event_subscribers, guid, state);
                             }
                         }
+                        // Tracing events for trace/profiler
+                        if (std.mem.eql(u8, method, "Tracing.dataCollected")) {
+                            if (ctx.trace_active.load(.acquire)) {
+                                collectTraceData(ctx.allocator, params, ctx.trace_events, ctx.trace_mutex);
+                            }
+                        }
+                        if (std.mem.eql(u8, method, "Tracing.tracingComplete")) {
+                            ctx.trace_complete.store(true, .release);
+                        }
                     }
                 }
                 // Wake any waitfor handlers waiting on new events
@@ -2503,7 +2684,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     const collector_mutex = ctx.collector_mutex;
 
     if (std.mem.eql(u8, req.action, "open")) {
-        return handleOpen(allocator, sender, cmd_id, session_id, req.url);
+        return handleOpen(allocator, sender, cmd_id, session_id, req.url, ctx.allowed_domains);
     } else if (std.mem.eql(u8, req.action, "network_list")) {
         collector_mutex.lock();
         defer collector_mutex.unlock();
@@ -2812,13 +2993,36 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleWaitForDialog(allocator, ctx.dialog_info, collector_mutex, ctx.event_cond, req.url);
     } else if (std.mem.eql(u8, req.action, "waitfor_download")) {
         return handleWaitForDownload(allocator, ctx.download_tracker, req.url);
+    } else if (std.mem.eql(u8, req.action, "auth_login")) {
+        ctx.ref_map_rwlock.lock();
+        defer ctx.ref_map_rwlock.unlock();
+        return handleAuthLogin(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
+    } else if (std.mem.eql(u8, req.action, "trace_start")) {
+        return handleTraceStart(allocator, sender, cmd_id, session_id, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, false);
+    } else if (std.mem.eql(u8, req.action, "trace_stop")) {
+        return handleTraceStop(allocator, sender, cmd_id, session_id, resp_map, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, req.url);
+    } else if (std.mem.eql(u8, req.action, "profiler_start")) {
+        return handleTraceStart(allocator, sender, cmd_id, session_id, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, true);
+    } else if (std.mem.eql(u8, req.action, "profiler_stop")) {
+        return handleTraceStop(allocator, sender, cmd_id, session_id, resp_map, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, req.url);
+    } else if (std.mem.eql(u8, req.action, "screenshot_annotate")) {
+        ctx.ref_map_rwlock.lock();
+        defer ctx.ref_map_rwlock.unlock();
+        return handleScreenshotAnnotate(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
     } else {
         return respondErr(allocator, "Unknown action");
     }
 }
 
-fn handleOpen(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, url: ?[]const u8) []u8 {
+fn handleOpen(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, url: ?[]const u8, allowed_domains: ?[]const u8) []u8 {
     const target_url = url orelse return respondErr(allocator, "url required");
+
+    // Domain restriction check
+    if (allowed_domains) |domains| {
+        if (!isDomainAllowed(target_url, domains)) {
+            return respondErr(allocator, "domain not allowed by --allowed-domains");
+        }
+    }
 
     const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), target_url, session_id) catch
         return respondErr(allocator, "Failed to build navigate command");
@@ -6612,6 +6816,14 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
         action = "waitfunction"; // alias
     } else if (std.mem.eql(u8, cmd, "tap")) {
         action = "tap";
+    } else if (std.mem.eql(u8, cmd, "auth")) {
+        if (arg1) |sub| {
+            if (std.mem.eql(u8, sub, "login")) { action = "auth_login"; url = arg2; pattern = null; }
+            else if (std.mem.eql(u8, sub, "list") or std.mem.eql(u8, sub, "show") or std.mem.eql(u8, sub, "delete") or std.mem.eql(u8, sub, "save")) {
+                // These are handled client-side, not via daemon
+                action = "auth_noop"; url = null; pattern = null;
+            }
+        }
     }
     // Simple 1:1 commands: open, click, dblclick, hover, focus, back, forward, reload, close,
     // eval, screenshot, pdf, press, highlight, bringtofront, pause, resume, tap, etc.
@@ -6625,8 +6837,708 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
     }) catch null;
 }
 
+// ============================================================================
+// Auth Login Handler (daemon-side)
+// ============================================================================
+
+fn handleAuthLogin(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, name_opt: ?[]const u8) []u8 {
+    _ = ref_map;
+    const name = name_opt orelse return respondErr(allocator, "auth profile name required");
+
+    // Load credentials from vault
+    const creds = authVaultLoad(name) orelse return respondErr(allocator, "auth profile not found");
+
+    // 1. Navigate to URL
+    const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), creds.url, session_id) catch
+        return respondErr(allocator, "Failed to build navigate command");
+    defer allocator.free(nav_cmd);
+    sender.sendText(nav_cmd) catch return respondErr(allocator, "Failed to navigate");
+
+    // Wait for page load
+    std.Thread.sleep(2000 * std.time.ns_per_ms);
+
+    // Find and fill username field (first visible text/email input)
+    var js_buf: std.ArrayList(u8) = .empty;
+    defer js_buf.deinit(allocator);
+    const w = js_buf.writer(allocator);
+    w.writeAll("(function(){var inputs=document.querySelectorAll('input[type=\"text\"],input[type=\"email\"],input:not([type])');for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(w, creds.username) catch return respondErr(allocator, "write error");
+    w.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return 'filled_username'}}return 'no_username_field'})()") catch return respondErr(allocator, "write error");
+
+    const username_js = js_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(username_js);
+
+    const uname_result = handleEval(allocator, sender, resp_map, cmd_id, session_id, username_js);
+    allocator.free(uname_result);
+
+    // Small delay between fields
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+
+    // Fill password field
+    var pw_buf: std.ArrayList(u8) = .empty;
+    defer pw_buf.deinit(allocator);
+    const pw = pw_buf.writer(allocator);
+    pw.writeAll("(function(){var inputs=document.querySelectorAll('input[type=\"password\"]');for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(pw, creds.password) catch return respondErr(allocator, "write error");
+    pw.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return 'filled_password'}}return 'no_password_field'})()") catch return respondErr(allocator, "write error");
+
+    const password_js = pw_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(password_js);
+
+    const pw_result = handleEval(allocator, sender, resp_map, cmd_id, session_id, password_js);
+    defer allocator.free(pw_result);
+
+    // Small delay before submit
+    std.Thread.sleep(200 * std.time.ns_per_ms);
+
+    // Click submit button
+    const submit_js =
+        \\(function(){var btns=document.querySelectorAll('button[type="submit"],input[type="submit"],button');for(var i=0;i<btns.length;i++){var t=(btns[i].textContent||btns[i].value||'').toLowerCase();if(t.match(/log\s*in|sign\s*in|submit|login|signin/)){btns[i].click();return 'clicked'}}var forms=document.querySelectorAll('form');if(forms.length>0){forms[0].submit();return 'submitted'}return 'no_submit_found'})()
+    ;
+    return handleEval(allocator, sender, resp_map, cmd_id, session_id, submit_js);
+}
+
+// ============================================================================
+// Config File Loading (agent-devtools.json)
+// ============================================================================
+
+fn loadConfigFile(
+    headed: *bool,
+    cfg_proxy: *?[]const u8,
+    cfg_proxy_bypass: *?[]const u8,
+    cfg_user_agent: *?[]const u8,
+    cfg_extensions: *?[]const u8,
+) void {
+    // Try ./agent-devtools.json first, then ~/.agent-devtools/config.json
+    const local_path = "agent-devtools.json";
+    var content_buf: [4096]u8 = undefined;
+
+    const content = blk: {
+        break :blk std.fs.cwd().readFile(local_path, &content_buf) catch {
+            // Try home dir
+            const home = daemon.getenv("HOME") orelse return;
+            var home_path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const home_path = std.fmt.bufPrint(&home_path_buf, "{s}/.agent-devtools/config.json", .{home}) catch return;
+            break :blk std.fs.cwd().readFile(home_path, &content_buf) catch return;
+        };
+    };
+
+    // Parse JSON and extract known fields
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch return;
+    defer parsed.deinit();
+
+    if (parsed.value != .object) return;
+
+    if (cdp.getBool(parsed.value, "headed")) |h| {
+        headed.* = h;
+    }
+    // Note: string values from config file point into parsed data which will be freed.
+    // For the config loading use case, these are static string literals checked in main()
+    // and the config values are only used as defaults before CLI args override.
+    // Since the parsed data is freed here, we use static storage for the values.
+    const S = struct {
+        var proxy_buf: [256]u8 = undefined;
+        var proxy_bypass_buf: [256]u8 = undefined;
+        var user_agent_buf: [256]u8 = undefined;
+        var extensions_buf: [512]u8 = undefined;
+    };
+    if (cdp.getString(parsed.value, "proxy")) |v| {
+        if (v.len <= S.proxy_buf.len) {
+            @memcpy(S.proxy_buf[0..v.len], v);
+            cfg_proxy.* = S.proxy_buf[0..v.len];
+        }
+    }
+    if (cdp.getString(parsed.value, "proxy_bypass")) |v| {
+        if (v.len <= S.proxy_bypass_buf.len) {
+            @memcpy(S.proxy_bypass_buf[0..v.len], v);
+            cfg_proxy_bypass.* = S.proxy_bypass_buf[0..v.len];
+        }
+    }
+    if (cdp.getString(parsed.value, "user_agent")) |v| {
+        if (v.len <= S.user_agent_buf.len) {
+            @memcpy(S.user_agent_buf[0..v.len], v);
+            cfg_user_agent.* = S.user_agent_buf[0..v.len];
+        }
+    }
+    if (cdp.getString(parsed.value, "extensions")) |v| {
+        if (v.len <= S.extensions_buf.len) {
+            @memcpy(S.extensions_buf[0..v.len], v);
+            cfg_extensions.* = S.extensions_buf[0..v.len];
+        }
+    }
+}
+
+// ============================================================================
+// Content Boundaries
+// ============================================================================
+
+fn isContentAction(action: []const u8) bool {
+    const content_actions = [_][]const u8{
+        "snapshot", "snapshot_interactive", "eval", "get_text", "get_html",
+        "get_value", "content", "get_url", "get_title",
+    };
+    for (content_actions) |a| {
+        if (std.mem.eql(u8, action, a)) return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Domain Restriction (--allowed-domains)
+// ============================================================================
+
+/// Extract the host from a URL. Returns the hostname portion.
+fn extractHost(url: []const u8) ?[]const u8 {
+    // Skip scheme (http://, https://, etc.)
+    var rest = url;
+    if (std.mem.indexOf(u8, rest, "://")) |idx| {
+        rest = rest[idx + 3 ..];
+    }
+    // Take until / or : or end
+    var end: usize = rest.len;
+    for (rest, 0..) |c, i| {
+        if (c == '/' or c == ':' or c == '?') {
+            end = i;
+            break;
+        }
+    }
+    if (end == 0) return null;
+    return rest[0..end];
+}
+
+/// Check if a domain matches a pattern. Supports simple glob: *.example.com
+fn domainMatchesPattern(host: []const u8, pattern: []const u8) bool {
+    if (std.mem.eql(u8, host, pattern)) return true;
+    if (std.mem.startsWith(u8, pattern, "*.")) {
+        const suffix = pattern[1..]; // ".example.com"
+        if (std.mem.endsWith(u8, host, suffix)) return true;
+        // Also match the base domain itself
+        if (std.mem.eql(u8, host, pattern[2..])) return true;
+    }
+    return false;
+}
+
+/// Check if a URL's domain is in the allowed list (comma-separated patterns).
+fn isDomainAllowed(url: []const u8, allowed_domains: []const u8) bool {
+    const host = extractHost(url) orelse return false;
+    var it = std.mem.splitScalar(u8, allowed_domains, ',');
+    while (it.next()) |pattern| {
+        const trimmed = std.mem.trim(u8, pattern, &std.ascii.whitespace);
+        if (trimmed.len == 0) continue;
+        if (domainMatchesPattern(host, trimmed)) return true;
+    }
+    return false;
+}
+
+// ============================================================================
+// Auth Vault (local file storage)
+// ============================================================================
+
+fn getAuthDir(buf: []u8) ?[]const u8 {
+    const home = daemon.getenv("HOME") orelse return null;
+    return std.fmt.bufPrint(buf, "{s}/.agent-devtools/auth", .{home}) catch null;
+}
+
+fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, password: []const u8) void {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const auth_dir = getAuthDir(&dir_buf) orelse {
+        writeErr("Failed to determine auth directory\n", .{});
+        return;
+    };
+
+    std.fs.makeDirAbsolute(auth_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => {},
+        else => {
+            // Try creating parent first
+            const home = daemon.getenv("HOME") orelse return;
+            var parent_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const parent = std.fmt.bufPrint(&parent_buf, "{s}/.agent-devtools", .{home}) catch return;
+            std.fs.makeDirAbsolute(parent) catch {};
+            std.fs.makeDirAbsolute(auth_dir) catch return;
+        },
+    };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return;
+
+    var content_buf: [2048]u8 = undefined;
+    var pos: usize = 0;
+
+    const prefix = "{\"url\":\"";
+    if (pos + prefix.len > content_buf.len) return;
+    @memcpy(content_buf[pos .. pos + prefix.len], prefix);
+    pos += prefix.len;
+
+    // Simple JSON - escape basic chars
+    for ([_]struct { key: []const u8, val: []const u8 }{ .{ .key = "", .val = url } }) |_| {
+        for (url) |c| {
+            if (c == '"' or c == '\\') {
+                if (pos + 2 > content_buf.len) return;
+                content_buf[pos] = '\\';
+                content_buf[pos + 1] = c;
+                pos += 2;
+            } else {
+                if (pos + 1 > content_buf.len) return;
+                content_buf[pos] = c;
+                pos += 1;
+            }
+        }
+    }
+
+    const mid1 = "\",\"username\":\"";
+    if (pos + mid1.len > content_buf.len) return;
+    @memcpy(content_buf[pos .. pos + mid1.len], mid1);
+    pos += mid1.len;
+
+    for (username) |c| {
+        if (c == '"' or c == '\\') {
+            if (pos + 2 > content_buf.len) return;
+            content_buf[pos] = '\\';
+            content_buf[pos + 1] = c;
+            pos += 2;
+        } else {
+            if (pos + 1 > content_buf.len) return;
+            content_buf[pos] = c;
+            pos += 1;
+        }
+    }
+
+    const mid2 = "\",\"password\":\"";
+    if (pos + mid2.len > content_buf.len) return;
+    @memcpy(content_buf[pos .. pos + mid2.len], mid2);
+    pos += mid2.len;
+
+    for (password) |c| {
+        if (c == '"' or c == '\\') {
+            if (pos + 2 > content_buf.len) return;
+            content_buf[pos] = '\\';
+            content_buf[pos + 1] = c;
+            pos += 2;
+        } else {
+            if (pos + 1 > content_buf.len) return;
+            content_buf[pos] = c;
+            pos += 1;
+        }
+    }
+
+    const suffix = "\"}";
+    if (pos + suffix.len > content_buf.len) return;
+    @memcpy(content_buf[pos .. pos + suffix.len], suffix);
+    pos += suffix.len;
+
+    if (std.fs.createFileAbsolute(path, .{})) |f| {
+        _ = f.write(content_buf[0..pos]) catch {};
+        f.close();
+        write("Saved auth profile: {s}\n", .{name});
+    } else |_| {
+        writeErr("Failed to save auth profile\n", .{});
+    }
+}
+
+fn authVaultList() void {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const auth_dir = getAuthDir(&dir_buf) orelse {
+        write("[]\n", .{});
+        return;
+    };
+
+    var dir = std.fs.openDirAbsolute(auth_dir, .{ .iterate = true }) catch {
+        write("[]\n", .{});
+        return;
+    };
+    defer dir.close();
+
+    var first = true;
+    const stdout = std.fs.File.stdout();
+    _ = stdout.write("[") catch {};
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const name_part = entry.name[0 .. entry.name.len - ".json".len];
+        if (!first) _ = stdout.write(",") catch {};
+        first = false;
+        _ = stdout.write("\"") catch {};
+        _ = stdout.write(name_part) catch {};
+        _ = stdout.write("\"") catch {};
+    }
+    _ = stdout.write("]\n") catch {};
+}
+
+fn authVaultShow(name: []const u8) void {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const auth_dir = getAuthDir(&dir_buf) orelse {
+        writeErr("Auth directory not found\n", .{});
+        return;
+    };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return;
+
+    var content_buf: [2048]u8 = undefined;
+    const content = std.fs.cwd().readFile(path, &content_buf) catch {
+        writeErr("Auth profile not found: {s}\n", .{name});
+        return;
+    };
+
+    // Mask password in output
+    if (std.mem.indexOf(u8, content, "\"password\":\"")) |pw_start| {
+        const val_start = pw_start + "\"password\":\"".len;
+        if (std.mem.indexOfScalarPos(u8, content, val_start, '"')) |val_end| {
+            const stdout = std.fs.File.stdout();
+            _ = stdout.write(content[0..val_start]) catch {};
+            _ = stdout.write("****") catch {};
+            _ = stdout.write(content[val_end..]) catch {};
+            _ = stdout.write("\n") catch {};
+            return;
+        }
+    }
+    write("{s}\n", .{content});
+}
+
+fn authVaultDelete(name: []const u8) void {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const auth_dir = getAuthDir(&dir_buf) orelse {
+        writeErr("Auth directory not found\n", .{});
+        return;
+    };
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return;
+
+    std.fs.deleteFileAbsolute(path) catch {
+        writeErr("Auth profile not found: {s}\n", .{name});
+        return;
+    };
+    write("Deleted auth profile: {s}\n", .{name});
+}
+
+/// Load auth profile from file, return url, username, password.
+fn authVaultLoad(name: []const u8) ?struct { url: []const u8, username: []const u8, password: []const u8 } {
+    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const auth_dir = getAuthDir(&dir_buf) orelse return null;
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return null;
+
+    const S = struct {
+        var content_buf: [2048]u8 = undefined;
+    };
+    const content = std.fs.cwd().readFile(path, &S.content_buf) catch return null;
+
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const alloc = gpa.allocator();
+    const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch return null;
+    defer parsed.deinit();
+
+    const url_val = cdp.getString(parsed.value, "url") orelse return null;
+    const user_val = cdp.getString(parsed.value, "username") orelse return null;
+    const pass_val = cdp.getString(parsed.value, "password") orelse return null;
+
+    // Copy into static buffers since parsed will be freed
+    const StaticBufs = struct {
+        var url: [512]u8 = undefined;
+        var user: [256]u8 = undefined;
+        var pass: [256]u8 = undefined;
+    };
+    if (url_val.len > StaticBufs.url.len or user_val.len > StaticBufs.user.len or pass_val.len > StaticBufs.pass.len) return null;
+    @memcpy(StaticBufs.url[0..url_val.len], url_val);
+    @memcpy(StaticBufs.user[0..user_val.len], user_val);
+    @memcpy(StaticBufs.pass[0..pass_val.len], pass_val);
+
+    return .{
+        .url = StaticBufs.url[0..url_val.len],
+        .username = StaticBufs.user[0..user_val.len],
+        .password = StaticBufs.pass[0..pass_val.len],
+    };
+}
+
+/// Collect Tracing.dataCollected events — called from receiver thread
+fn collectTraceData(allocator: Allocator, params: std.json.Value, trace_events: *std.ArrayList([]u8), trace_mutex: *std.Thread.Mutex) void {
+    trace_mutex.lock();
+    defer trace_mutex.unlock();
+    // params.value is an array of trace event objects — serialize each one
+    if (params != .object) return;
+    const val = params.object.get("value") orelse return;
+    if (val != .array) return;
+    for (val.array.items) |event| {
+        var out: std.io.Writer.Allocating = .init(allocator);
+        std.json.Stringify.value(event, .{}, &out.writer) catch {
+            out.deinit();
+            continue;
+        };
+        const owned = out.toOwnedSlice() catch {
+            out.deinit();
+            continue;
+        };
+        trace_events.append(allocator, owned) catch {
+            allocator.free(owned);
+        };
+    }
+}
+
+/// trace start / profiler start — send Tracing.start CDP command
+fn handleTraceStart(
+    allocator: Allocator,
+    sender: *WsSender,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    trace_active: *std.atomic.Value(bool),
+    trace_complete: *std.atomic.Value(bool),
+    trace_events: *std.ArrayList([]u8),
+    trace_mutex: *std.Thread.Mutex,
+    is_profiler: bool,
+) []u8 {
+    if (trace_active.load(.acquire)) {
+        return respondErr(allocator, "tracing already active — stop first");
+    }
+    // Clear previous trace data
+    {
+        trace_mutex.lock();
+        defer trace_mutex.unlock();
+        for (trace_events.items) |item| allocator.free(item);
+        trace_events.clearRetainingCapacity();
+    }
+    trace_complete.store(false, .release);
+
+    const params = if (is_profiler)
+        "{\"traceConfig\":{\"includedCategories\":[\"devtools.timeline\",\"disabled-by-default-v8.cpu_profiler\",\"disabled-by-default-v8.cpu_profiler.hires\",\"v8.execute\",\"v8\",\"blink\",\"blink.user_timing\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}"
+    else
+        "{\"traceConfig\":{\"recordMode\":\"recordContinuously\"},\"transferMode\":\"ReportEvents\"}";
+
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Tracing.start", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    sender.sendText(cmd) catch return respondErr(allocator, "send error");
+    trace_active.store(true, .release);
+
+    return respondOk(allocator);
+}
+
+/// trace stop / profiler stop — send Tracing.end, wait for data, write file
+fn handleTraceStop(
+    allocator: Allocator,
+    sender: *WsSender,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    resp_map: *response_map_mod.ResponseMap,
+    trace_active: *std.atomic.Value(bool),
+    trace_complete: *std.atomic.Value(bool),
+    trace_events: *std.ArrayList([]u8),
+    trace_mutex: *std.Thread.Mutex,
+    path_opt: ?[]const u8,
+) []u8 {
+    if (!trace_active.load(.acquire)) {
+        return respondErr(allocator, "no tracing active — start first");
+    }
+
+    // Send Tracing.end
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Tracing.end", null, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    // Use sendAndWait for the response to Tracing.end
+    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 10_000) orelse
+        return respondErr(allocator, "trace end timeout");
+    allocator.free(raw);
+
+    // Poll for trace_complete (receiver thread sets it on Tracing.tracingComplete)
+    var waited: u32 = 0;
+    while (!trace_complete.load(.acquire) and waited < 30_000) {
+        std.Thread.sleep(50 * std.time.ns_per_ms);
+        waited += 50;
+    }
+    trace_active.store(false, .release);
+
+    if (!trace_complete.load(.acquire)) {
+        return respondErr(allocator, "trace collection timed out");
+    }
+
+    // Build output path
+    var file_path_buf: [512]u8 = undefined;
+    const file_path = if (path_opt) |p| p else blk: {
+        const home = daemon.getenv("HOME") orelse "/tmp";
+        const ts = @as(u64, @intCast(@max(0, std.time.timestamp())));
+        const fp = std.fmt.bufPrint(&file_path_buf, "{s}/.agent-devtools/traces/trace-{d}.json", .{ home, ts }) catch
+            return respondErr(allocator, "path error");
+        break :blk fp;
+    };
+
+    // Ensure directory exists
+    if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |slash| {
+        std.fs.cwd().makePath(file_path[0..slash]) catch {};
+    }
+
+    // Write trace file: {"traceEvents": [...]}
+    trace_mutex.lock();
+    defer trace_mutex.unlock();
+
+    const event_count = trace_events.items.len;
+
+    const file = std.fs.cwd().createFile(file_path, .{}) catch
+        return respondErr(allocator, "file create error");
+    defer file.close();
+
+    _ = file.write("{\"traceEvents\":[") catch return respondErr(allocator, "write error");
+    for (trace_events.items, 0..) |item, i| {
+        _ = file.write(item) catch return respondErr(allocator, "write error");
+        if (i + 1 < trace_events.items.len) {
+            _ = file.write(",") catch return respondErr(allocator, "write error");
+        }
+    }
+    _ = file.write("]}") catch return respondErr(allocator, "write error");
+
+    // Build response
+    var resp_buf: std.ArrayList(u8) = .empty;
+    defer resp_buf.deinit(allocator);
+    const rw = resp_buf.writer(allocator);
+    rw.writeAll("{\"path\":") catch return respondOk(allocator);
+    cdp.writeJsonString(rw, file_path) catch return respondOk(allocator);
+    std.fmt.format(rw, ",\"eventCount\":{d}}}", .{event_count}) catch return respondOk(allocator);
+    const data = resp_buf.toOwnedSlice(allocator) catch return respondOk(allocator);
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
+}
+
+/// screenshot --annotate: take a snapshot, inject ref labels, screenshot, remove overlay
+fn handleScreenshotAnnotate(
+    allocator: Allocator,
+    sender: *WsSender,
+    resp_map: *response_map_mod.ResponseMap,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    ref_map: *snapshot_mod.RefMap,
+    path_opt: ?[]const u8,
+) []u8 {
+    // Step 1: Take a fresh snapshot to populate ref_map
+    ref_map.deinit();
+    ref_map.* = snapshot_mod.RefMap.init(allocator);
+
+    {
+        const snap_sent_id = cmd_id.next();
+        const snap_cmd = cdp.serializeCommand(allocator, snap_sent_id, "Accessibility.getFullAXTree", null, session_id) catch
+            return respondErr(allocator, "cmd error");
+        defer allocator.free(snap_cmd);
+
+        const snap_raw = sendAndWait(sender, resp_map, snap_cmd, snap_sent_id, 15_000) orelse
+            return respondErr(allocator, "snapshot timeout");
+        defer allocator.free(snap_raw);
+
+        const snap_parsed = cdp.parseMessage(allocator, snap_raw) catch
+            return respondErr(allocator, "parse error");
+        defer snap_parsed.parsed.deinit();
+
+        if (snap_parsed.message.isResponse()) {
+            if (snap_parsed.message.result) |result| {
+                const snap_text = snapshot_mod.buildSnapshot(allocator, result, ref_map, true, null) catch
+                    return respondErr(allocator, "snapshot build error");
+                allocator.free(snap_text);
+            }
+        }
+    }
+
+    // Step 2: For each ref, get bounding box and build overlay data
+    var positions: std.ArrayList(u8) = .empty;
+    defer positions.deinit(allocator);
+    const pw = positions.writer(allocator);
+    pw.writeByte('[') catch return respondErr(allocator, "write error");
+    var first = true;
+
+    var it = ref_map.entries.iterator();
+    while (it.next()) |entry| {
+        const ref_id = entry.key_ptr.*;
+        const ref_entry = entry.value_ptr.*;
+        const backend_id = ref_entry.backend_node_id orelse continue;
+
+        // DOM.getBoxModel for this ref
+        const box_sent_id = cmd_id.next();
+        const box_cmd = snapshot_mod.buildGetBoxModelCmd(allocator, box_sent_id, backend_id, session_id) catch continue;
+        defer allocator.free(box_cmd);
+
+        const box_raw = sendAndWait(sender, resp_map, box_cmd, box_sent_id, 3_000) orelse continue;
+        defer allocator.free(box_raw);
+
+        const box_parsed = cdp.parseMessage(allocator, box_raw) catch continue;
+        defer box_parsed.parsed.deinit();
+
+        if (box_parsed.message.isResponse()) {
+            if (box_parsed.message.result) |result| {
+                if (cdp.getObject(result, "model")) |model| {
+                    if (model.object.get("content")) |content| {
+                        if (content == .array) {
+                            const items = content.array.items;
+                            if (items.len >= 2) {
+                                const x_val = jsonToF64(items[0]) orelse continue;
+                                const y_val = jsonToF64(items[1]) orelse continue;
+                                if (!first) pw.writeByte(',') catch {};
+                                first = false;
+                                pw.writeAll("{\"ref\":\"@") catch {};
+                                pw.writeAll(ref_id) catch {};
+                                std.fmt.format(pw, "\",\"x\":{d},\"y\":{d}}}", .{ x_val, y_val }) catch {};
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    pw.writeByte(']') catch {};
+
+    const refs_json = positions.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(refs_json);
+
+    // Step 3: Inject annotation overlay via Runtime.evaluate
+    var inject_js: std.ArrayList(u8) = .empty;
+    defer inject_js.deinit(allocator);
+    const jw = inject_js.writer(allocator);
+    jw.writeAll(
+        \\(function(){var overlay=document.createElement('div');overlay.id='__agent_devtools_annotations__';overlay.style.cssText='position:fixed;top:0;left:0;width:100%;height:100%;pointer-events:none;z-index:2147483647';var refs=
+    ) catch return respondErr(allocator, "js build error");
+    jw.writeAll(refs_json) catch return respondErr(allocator, "js build error");
+    jw.writeAll(
+        \\;refs.forEach(function(r){var label=document.createElement('div');label.textContent=r.ref;label.style.cssText='position:absolute;left:'+r.x+'px;top:'+r.y+'px;background:#ff0;color:#000;font:bold 11px monospace;padding:1px 3px;border:1px solid #000;border-radius:2px;z-index:2147483647';overlay.appendChild(label)});document.body.appendChild(overlay)})()
+    ) catch return respondErr(allocator, "js build error");
+
+    const inject_slice = inject_js.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(inject_slice);
+
+    {
+        const eval_id = cmd_id.next();
+        const eval_cmd = cdp.runtimeEvaluate(allocator, eval_id, inject_slice, session_id) catch
+            return respondErr(allocator, "cmd error");
+        defer allocator.free(eval_cmd);
+        if (sendAndWait(sender, resp_map, eval_cmd, eval_id, 5_000)) |eval_raw| {
+            allocator.free(eval_raw);
+        }
+    }
+
+    // Step 4: Take the screenshot
+    const result = handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, path_opt);
+
+    // Step 5: Remove the overlay
+    {
+        const cleanup_js = "(function(){var el=document.getElementById('__agent_devtools_annotations__');if(el)el.remove()})()";
+        const cleanup_id = cmd_id.next();
+        const cleanup_cmd = cdp.runtimeEvaluate(allocator, cleanup_id, cleanup_js, session_id) catch
+            return result;
+        defer allocator.free(cleanup_cmd);
+        if (sendAndWait(sender, resp_map, cleanup_cmd, cleanup_id, 5_000)) |cleanup_raw| {
+            allocator.free(cleanup_raw);
+        }
+    }
+
+    return result;
+}
+
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{"diff-screenshot"};
+    const planned = [_][]const u8{ "diff-screenshot", "video" };
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
@@ -6765,6 +7677,13 @@ fn printUsage() void {
         \\  diff <name>               Compare current vs recorded state
         \\  replay <name>             Replay: navigate to recorded URL + diff
         \\
+        \\Performance:
+        \\  trace start               Start tracing (CDP Tracing.start)
+        \\  trace stop [path]         Stop tracing and save trace file (JSON)
+        \\  profiler start            Start CPU profiler via tracing
+        \\  profiler stop [path]      Stop profiler and save trace file (JSON)
+        \\  screenshot --annotate [p] Screenshot with ref labels overlaid (-a)
+        \\
         \\Dialog:
         \\  dialog accept [text]      Accept dialog (optional prompt text)
         \\  dialog dismiss            Dismiss dialog
@@ -6781,14 +7700,31 @@ fn printUsage() void {
         \\  status                    Show daemon status
         \\  find-chrome               Find Chrome executable path
         \\
+        \\Auth Vault:
+        \\  auth save <name> --url <url> --username <user> --password <pass>
+        \\  auth login <name>         Auto-login using saved credentials
+        \\  auth list                 List saved auth profiles
+        \\  auth show <name>          Show auth profile (masked password)
+        \\  auth delete <name>        Delete auth profile
+        \\
         \\Options:
         \\  --session <name>          Isolated session (default: "default")
         \\  --headed                  Show browser window (default: headless)
         \\  --port <port>             Connect to existing Chrome via CDP port
         \\  --user-agent <ua>         Set user agent on launch
+        \\  --proxy <url>             Proxy server (e.g. http://localhost:8080)
+        \\  --proxy-bypass <list>     Proxy bypass list (e.g. localhost,*.internal.com)
+        \\  --extension <path>        Load Chrome extension (comma-separated paths)
+        \\  --allowed-domains <list>  Restrict navigation to domains (e.g. example.com,*.internal.com)
+        \\  --content-boundaries      Wrap page content output with boundary markers
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
+        \\
+        \\Config File:
+        \\  Reads defaults from ./agent-devtools.json or ~/.agent-devtools/config.json
+        \\  Supported fields: headed, proxy, proxy_bypass, user_agent, extensions
+        \\  CLI flags always override config file values.
         \\
         \\Environment:
         \\  AGENT_DEVTOOLS_SESSION    Session name
@@ -7629,4 +8565,94 @@ test "buildDebugResponse: merges debug into response" {
         try std.testing.expect(std.mem.indexOf(u8, r, "\"success\":true") != null);
     }
     // It's OK if result is null (daemon not running), the function is robust
+}
+
+// ============================================================================
+// Tests: Domain Restriction (--allowed-domains)
+// ============================================================================
+
+test "extractHost: http URL" {
+    try std.testing.expectEqualStrings("example.com", extractHost("http://example.com/path").?);
+}
+
+test "extractHost: https URL with port" {
+    try std.testing.expectEqualStrings("example.com", extractHost("https://example.com:8080/path").?);
+}
+
+test "extractHost: URL with query" {
+    try std.testing.expectEqualStrings("example.com", extractHost("https://example.com?q=1").?);
+}
+
+test "extractHost: subdomain" {
+    try std.testing.expectEqualStrings("sub.example.com", extractHost("https://sub.example.com/").?);
+}
+
+test "extractHost: no scheme" {
+    try std.testing.expectEqualStrings("example.com", extractHost("example.com/path").?);
+}
+
+test "domainMatchesPattern: exact match" {
+    try std.testing.expect(domainMatchesPattern("example.com", "example.com"));
+}
+
+test "domainMatchesPattern: wildcard subdomain" {
+    try std.testing.expect(domainMatchesPattern("sub.example.com", "*.example.com"));
+}
+
+test "domainMatchesPattern: wildcard matches base domain" {
+    try std.testing.expect(domainMatchesPattern("example.com", "*.example.com"));
+}
+
+test "domainMatchesPattern: no match" {
+    try std.testing.expect(!domainMatchesPattern("other.com", "example.com"));
+}
+
+test "domainMatchesPattern: partial no match" {
+    try std.testing.expect(!domainMatchesPattern("notexample.com", "*.example.com"));
+}
+
+test "isDomainAllowed: single domain allowed" {
+    try std.testing.expect(isDomainAllowed("https://example.com/page", "example.com"));
+}
+
+test "isDomainAllowed: multiple domains" {
+    try std.testing.expect(isDomainAllowed("https://api.internal.com/v1", "example.com,*.internal.com"));
+}
+
+test "isDomainAllowed: domain blocked" {
+    try std.testing.expect(!isDomainAllowed("https://evil.com/hack", "example.com,*.internal.com"));
+}
+
+test "isDomainAllowed: with spaces in list" {
+    try std.testing.expect(isDomainAllowed("https://example.com/", " example.com , other.com "));
+}
+
+// ============================================================================
+// Tests: Content Boundaries
+// ============================================================================
+
+test "isContentAction: snapshot is content" {
+    try std.testing.expect(isContentAction("snapshot"));
+    try std.testing.expect(isContentAction("snapshot_interactive"));
+    try std.testing.expect(isContentAction("eval"));
+    try std.testing.expect(isContentAction("content"));
+}
+
+test "isContentAction: non-content actions" {
+    try std.testing.expect(!isContentAction("click"));
+    try std.testing.expect(!isContentAction("open"));
+    try std.testing.expect(!isContentAction("close"));
+    try std.testing.expect(!isContentAction("network_list"));
+}
+
+// ============================================================================
+// Tests: isPlannedCommand (updated)
+// ============================================================================
+
+test "isPlannedCommand: new planned commands" {
+    try std.testing.expect(!isPlannedCommand("annotate-screenshot"));
+    try std.testing.expect(isPlannedCommand("video"));
+    try std.testing.expect(!isPlannedCommand("trace"));
+    try std.testing.expect(!isPlannedCommand("profiler"));
+    try std.testing.expect(isPlannedCommand("diff-screenshot"));
 }

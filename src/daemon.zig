@@ -457,6 +457,11 @@ pub const DaemonOptions = struct {
     headed: bool = false,
     cdp_port: ?[]const u8 = null,
     user_agent: ?[]const u8 = null,
+    proxy: ?[]const u8 = null,
+    proxy_bypass: ?[]const u8 = null,
+    extensions: ?[]const u8 = null,
+    allowed_domains: ?[]const u8 = null,
+    content_boundaries: bool = false,
 };
 
 /// Ensure a daemon is running for the given session.
@@ -497,6 +502,11 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (opts.headed) try env_map.put("AGENT_DEVTOOLS_HEADED", "1");
     if (opts.cdp_port) |p| try env_map.put("AGENT_DEVTOOLS_PORT", p);
     if (opts.user_agent) |ua| try env_map.put("AGENT_DEVTOOLS_USER_AGENT", ua);
+    if (opts.proxy) |p| try env_map.put("AGENT_DEVTOOLS_PROXY", p);
+    if (opts.proxy_bypass) |b| try env_map.put("AGENT_DEVTOOLS_PROXY_BYPASS", b);
+    if (opts.extensions) |e| try env_map.put("AGENT_DEVTOOLS_EXTENSIONS", e);
+    if (opts.allowed_domains) |d| try env_map.put("AGENT_DEVTOOLS_ALLOWED_DOMAINS", d);
+    if (opts.content_boundaries) try env_map.put("AGENT_DEVTOOLS_CONTENT_BOUNDARIES", "1");
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning

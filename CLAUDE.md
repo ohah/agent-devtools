@@ -9,8 +9,8 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 382개 (`zig build test`)
-- **CLI 명령**: 70+개
+- **테스트**: 463개 (`zig build test`)
+- **CLI 명령**: 80+개
 
 ## Architecture
 
@@ -90,6 +90,14 @@ agent-browser의 모든 핵심 기능을 포함하면서, 추가로:
 - console list/clear
 - 모든 JS 타입 정확 변환 (27개 RemoteObject 테스트)
 
+### ✅ 프록시 / 확장 / 설정파일 / 도메인 제한 / 인증 보관
+- `--proxy`, `--proxy-bypass` — Chrome 프록시 설정
+- `--extension` — Chrome 확장 로딩 (headless 자동 비활성)
+- `agent-devtools.json` 또는 `~/.agent-devtools/config.json` 설정파일
+- `--allowed-domains` — 도메인 제한 (네비게이션 차단)
+- `--content-boundaries` — 콘텐츠 출력 경계 마커
+- `auth save/login/list/show/delete` — 인증 프로필 저장 + 자동 로그인
+
 ## Project Structure
 
 ```
@@ -117,7 +125,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 (`test` 블록, 소스 파일 내)
-- `zig build test` → 339개
+- `zig build test` → 463개
 - 유닛 + 통합 (실제 Chrome E2E 확인)
 
 ### 테스트 분포
@@ -125,15 +133,16 @@ reference/            # 참조 코드 (gitignored)
 | 모듈 | 수 | 내용 |
 |---|---|---|
 | websocket.zig | 106 | RFC 6455 프레임, 마스킹, 핸드셰이크, Connection, URL 파싱 |
+| main.zig | 100 | RemoteObject 변환, 도메인 제한, 콘텐츠 경계, isPlannedCommand, config, auth |
 | cdp.zig | 67 | 메시지 파싱/직렬화, 에러 코드, 편의 명령, JSON 이스케이프 |
-| chrome.zig | 41 | DevToolsActivePort, /json/version, URL 재작성, discovery |
+| chrome.zig | 47 | DevToolsActivePort, /json/version, URL 재작성, discovery, proxy, extensions |
+| snapshot.zig | 37 | RefMap, buildSnapshot, extractBoxCenter |
 | analyzer.zig | 35 | isApiRequest, pathToPattern, inferJsonSchema |
-| main.zig | 57 | RemoteObject 변환 (18개 JS 타입), isPlannedCommand, jsonToF64, buildCallFunctionOnParams, HAR, state, credentials |
-| daemon.zig | 18 | 소켓 경로, 직렬화, 파싱, writeJsonValue |
-| interceptor.zig | 12 | matchPattern, InterceptorState |
+| daemon.zig | 23 | 소켓 경로, 직렬화, 파싱, writeJsonValue |
+| interceptor.zig | 17 | matchPattern, InterceptorState |
 | network.zig | 11 | Collector lifecycle, filterByUrl |
-| snapshot.zig | 10 | RefMap, buildSnapshot, extractBoxCenter |
-| recorder.zig | 7 | saveRecording, loadRecording, diffRequests |
+| response_map.zig | 10 | ResponseMap |
+| recorder.zig | 9 | saveRecording, loadRecording, diffRequests |
 | root.zig | 1 | 모듈 참조 |
 
 ### 테스트 작성 원칙
@@ -311,17 +320,42 @@ agent-devtools state list              # 저장된 상태 목록
 agent-devtools addstyle <css>          # <style> 태그 추가
 ```
 
+### Auth Vault (차별화)
+```bash
+agent-devtools auth save <name> --url <url> --username <user> --password <pass>
+agent-devtools auth login <name>       # 자동 로그인 (URL 이동 + 필드 채우기 + 제출)
+agent-devtools auth list               # 저장된 인증 프로필 목록
+agent-devtools auth show <name>        # 인증 프로필 (비밀번호 마스킹)
+agent-devtools auth delete <name>      # 인증 프로필 삭제
+```
+
 ### Status & Session
 ```bash
 agent-devtools status                  # 데몬 상태
 agent-devtools --session=NAME          # 세션별 독립 데몬
 agent-devtools --headed                # 브라우저 창 표시
 agent-devtools --port=PORT             # 기존 Chrome 연결
+agent-devtools --proxy=URL             # 프록시 서버
+agent-devtools --proxy-bypass=LIST     # 프록시 바이패스 목록
+agent-devtools --extension=PATH        # Chrome 확장 로딩
+agent-devtools --allowed-domains=LIST  # 도메인 제한
+agent-devtools --content-boundaries    # 콘텐츠 경계 마커
 agent-devtools find-chrome             # Chrome 경로
+```
+
+### Config File
+```
+./agent-devtools.json 또는 ~/.agent-devtools/config.json
+지원 필드: headed, proxy, proxy_bypass, user_agent, extensions
+CLI 플래그가 설정파일 값을 덮어씀
 ```
 
 ### 구현 예정
 ```bash
 agent-devtools replay <name>           # record + open + diff 자동화
 agent-devtools diff-screenshot <a> <b> # 스크린샷 픽셀 비교
+agent-devtools annotate-screenshot     # @ref 오버레이 스크린샷
+agent-devtools video start/stop        # 비디오 녹화
+agent-devtools trace start/stop        # CDP Tracing
+agent-devtools profiler start/stop     # CDP Profiler
 ```

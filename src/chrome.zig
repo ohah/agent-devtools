@@ -15,6 +15,9 @@ pub const LaunchOptions = struct {
     window_size: struct { width: u16 = 1280, height: u16 = 720 } = .{},
     extra_args: []const []const u8 = &.{},
     user_agent: ?[]const u8 = null,
+    proxy: ?[]const u8 = null,
+    proxy_bypass: ?[]const u8 = null,
+    extensions: ?[]const u8 = null, // comma-separated paths
 };
 
 /// Parse DevToolsActivePort file written by Chrome into user-data-dir.
@@ -217,9 +220,24 @@ pub fn buildChromeArgs(allocator: Allocator, options: LaunchOptions) ![]const []
 
     try args.append(allocator, try std.fmt.allocPrint(allocator, "--remote-debugging-port={d}", .{options.port}));
 
-    if (options.headless) {
+    // Extensions don't work in headless mode — skip --headless if extensions are loaded
+    if (options.headless and options.extensions == null) {
         try args.append(allocator, try allocator.dupe(u8, "--headless=new"));
         try args.append(allocator, try allocator.dupe(u8, "--enable-unsafe-swiftshader"));
+    }
+
+    // Proxy support
+    if (options.proxy) |proxy| {
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "--proxy-server={s}", .{proxy}));
+    }
+    if (options.proxy_bypass) |bypass| {
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "--proxy-bypass-list={s}", .{bypass}));
+    }
+
+    // Extension loading
+    if (options.extensions) |ext_paths| {
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "--load-extension={s}", .{ext_paths}));
+        try args.append(allocator, try std.fmt.allocPrint(allocator, "--disable-extensions-except={s}", .{ext_paths}));
     }
 
     try args.append(allocator, try std.fmt.allocPrint(allocator, "--window-size={d},{d}", .{ options.window_size.width, options.window_size.height }));
@@ -614,6 +632,56 @@ test "buildChromeArgs: extra args with same prefix as core args are safe" {
     // Both the core and extra versions exist (duped independently)
     try testing.expect(containsArg(args, "--remote-debugging-port=0"));
     try testing.expect(containsArg(args, "--remote-debugging-port=9222"));
+}
+
+test "buildChromeArgs: proxy flag" {
+    const args = try buildChromeArgs(testing.allocator, .{ .proxy = "http://localhost:8080" });
+    defer freeChromeArgs(testing.allocator, args);
+
+    try testing.expect(containsArg(args, "--proxy-server=http://localhost:8080"));
+}
+
+test "buildChromeArgs: proxy bypass flag" {
+    const args = try buildChromeArgs(testing.allocator, .{ .proxy_bypass = "localhost,*.internal.com" });
+    defer freeChromeArgs(testing.allocator, args);
+
+    try testing.expect(containsArg(args, "--proxy-bypass-list=localhost,*.internal.com"));
+}
+
+test "buildChromeArgs: proxy with bypass" {
+    const args = try buildChromeArgs(testing.allocator, .{ .proxy = "http://proxy:3128", .proxy_bypass = "127.0.0.1" });
+    defer freeChromeArgs(testing.allocator, args);
+
+    try testing.expect(containsArg(args, "--proxy-server=http://proxy:3128"));
+    try testing.expect(containsArg(args, "--proxy-bypass-list=127.0.0.1"));
+}
+
+test "buildChromeArgs: extension loading" {
+    const args = try buildChromeArgs(testing.allocator, .{ .extensions = "/path/to/ext" });
+    defer freeChromeArgs(testing.allocator, args);
+
+    try testing.expect(containsArg(args, "--load-extension=/path/to/ext"));
+    try testing.expect(containsArg(args, "--disable-extensions-except=/path/to/ext"));
+}
+
+test "buildChromeArgs: extension disables headless" {
+    const args = try buildChromeArgs(testing.allocator, .{ .headless = true, .extensions = "/ext" });
+    defer freeChromeArgs(testing.allocator, args);
+
+    // Extensions don't work in headless — headless flag should be omitted
+    try testing.expect(!containsArg(args, "--headless=new"));
+    try testing.expect(containsArg(args, "--load-extension=/ext"));
+}
+
+test "buildChromeArgs: no proxy by default" {
+    const args = try buildChromeArgs(testing.allocator, .{});
+    defer freeChromeArgs(testing.allocator, args);
+
+    for (args) |arg| {
+        try testing.expect(!std.mem.startsWith(u8, arg, "--proxy-server="));
+        try testing.expect(!std.mem.startsWith(u8, arg, "--proxy-bypass-list="));
+        try testing.expect(!std.mem.startsWith(u8, arg, "--load-extension="));
+    }
 }
 
 fn containsArg(args: []const []const u8, target: []const u8) bool {
