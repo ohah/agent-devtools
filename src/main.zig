@@ -984,6 +984,23 @@ fn parseCountFromJson(line: []const u8, field: []const u8) ?usize {
     return std.fmt.parseInt(usize, line[num_start..end], 10) catch null;
 }
 
+/// Check if a URL is a static resource (JS/CSS/image/font) that should be filtered from debug output.
+fn isStaticResource(url: []const u8) bool {
+    const path = analyzer.extractPath(url);
+    const static_exts = [_][]const u8{
+        ".js", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ico",
+        ".woff", ".woff2", ".ttf", ".eot", ".map", ".webp", ".avif",
+        ".webm", ".mp4", ".mp3", ".ogg",
+    };
+    for (static_exts) |ext| {
+        if (std.mem.endsWith(u8, path, ext)) return true;
+    }
+    // Also filter gen_204 tracking pixels and similar
+    if (std.mem.indexOf(u8, url, "/gen_204") != null) return true;
+    if (std.mem.indexOf(u8, url, "/client_204") != null) return true;
+    return false;
+}
+
 /// Build debug JSON object and merge it with the original response.
 /// Returns the merged JSON line (caller must free), or null on failure.
 fn buildDebugResponse(
@@ -1006,34 +1023,47 @@ fn buildDebugResponse(
     w.writeAll("{\"debug\":{") catch return null;
     var has_field = false;
 
-    // New network requests
+    // New network requests (API only — filter out static resources like JS/CSS/images)
     if (post_requests > pre_requests) {
         if (sendDebugQuery(allocator, session, "network_list", "d2")) |net_resp| {
             defer allocator.free(net_resp);
-            // Extract the data array from the response
             if (std.mem.indexOf(u8, net_resp, "\"data\":")) |data_start| {
                 const val_start = data_start + "\"data\":".len;
-                // Find end — the data value goes until the closing }
-                // We need to extract just the array portion
-                if (net_resp[val_start] == '[') {
-                    // Find matching ] bracket
-                    var depth: usize = 0;
-                    var end: usize = val_start;
-                    while (end < net_resp.len) : (end += 1) {
-                        if (net_resp[end] == '[') depth += 1
-                        else if (net_resp[end] == ']') {
-                            depth -= 1;
-                            if (depth == 0) {
-                                end += 1;
-                                break;
+                if (val_start < net_resp.len and net_resp[val_start] == '[') {
+                    // Parse JSON array and filter to API requests only
+                    const parsed = std.json.parseFromSlice(std.json.Value, allocator, net_resp[val_start..], .{}) catch null;
+                    if (parsed) |p| {
+                        defer p.deinit();
+                        if (p.value == .array) {
+                            w.writeAll("\"new_requests\":[") catch return null;
+                            var first = true;
+                            for (p.value.array.items) |item| {
+                                if (item != .object) continue;
+                                const url_val = item.object.get("url") orelse continue;
+                                if (url_val != .string) continue;
+                                if (isStaticResource(url_val.string)) continue;
+                                if (!first) w.writeByte(',') catch return null;
+                                first = false;
+                                // Write compact JSON for this request
+                                w.writeAll("{\"url\":") catch return null;
+                                cdp.writeJsonString(w, url_val.string) catch return null;
+                                if (item.object.get("method")) |m| {
+                                    if (m == .string) {
+                                        w.writeAll(",\"method\":") catch return null;
+                                        cdp.writeJsonString(w, m.string) catch return null;
+                                    }
+                                }
+                                if (item.object.get("status")) |s| {
+                                    if (s == .integer) {
+                                        w.print(",\"status\":{d}", .{s.integer}) catch return null;
+                                    }
+                                }
+                                w.writeByte('}') catch return null;
                             }
+                            w.writeByte(']') catch return null;
+                            if (!first) has_field = true; // only if we wrote at least one request
                         }
                     }
-                    // We only want the NEW requests (skip pre_requests count)
-                    // But the array has all of them, so we write them as-is (new ones are at the end)
-                    w.writeAll("\"new_requests\":") catch return null;
-                    w.writeAll(net_resp[val_start..end]) catch return null;
-                    has_field = true;
                 }
             }
         }
