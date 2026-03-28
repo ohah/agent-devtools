@@ -425,13 +425,14 @@ agent-devtools includes all core browser automation features from [agent-browser
 | Tab management | Yes | Yes |
 | Device emulation | Yes | Yes |
 | Eval JavaScript | Yes | Yes |
-| **Network observation** | Partial | **Full (list, get with body, filter)** |
+| Network observation | Yes | Yes |
+| HAR export | Yes | Yes |
+| Console capture | Yes | Yes |
 | **API reverse engineering** | No | **Yes (analyze + JSON schema)** |
-| **Request interception** | Route-based | **CDP Fetch (mock/fail/delay)** |
-| **Console capture** | Basic | **Full (27 JS types)** |
+| **Request interception** | Route (mock/abort) | **intercept (mock/fail/delay)** |
 | **Flow recording/diffing** | No | **Yes (record + diff)** |
-| **HAR export** | Start/stop | **One-command export** |
-| **Debug mode** | No | **Yes (action + API correlation)** |
+| **Debug mode (--debug)** | No | **Yes (action → API correlation)** |
+| **Event wait (waitfor)** | No | **Yes (network/console/error/dialog)** |
 | Runtime | Rust | Zig |
 | Dependencies | npm + Rust binary | Zero (single Zig binary) |
 
