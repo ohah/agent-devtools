@@ -8224,7 +8224,8 @@ fn printUsage() void {
         \\  --session <name>          Isolated session (default: "default")
         \\  --headed                  Show browser window (default: headless)
         \\  --port <port>             Connect to existing Chrome via CDP port
-        \\  --auto-connect            Auto-discover and connect to running Chrome
+        \\  --auto-connect            Connect to running Chrome to reuse its auth state
+        \\                            Tip: agent-devtools --auto-connect state save ./auth.json
         \\  --user-agent <ua>         Set user agent on launch
         \\  --proxy <url>             Proxy server (e.g. http://localhost:8080)
         \\  --proxy-bypass <list>     Proxy bypass list (e.g. localhost,*.internal.com)
@@ -8272,6 +8273,7 @@ fn printUsage() void {
         \\  agent-devtools waitfor network /api/login 10000
         \\  agent-devtools analyze
         \\  agent-devtools --port 9222 snapshot -i
+        \\  agent-devtools --auto-connect snapshot -i
         \\  agent-devtools --interactive
         \\
         \\Command Chaining:
