@@ -9,8 +9,8 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 463개 (`zig build test`)
-- **CLI 명령**: 80+개
+- **테스트**: 490개 (`zig build test`)
+- **CLI 명령**: 90+개
 
 ## Architecture
 
@@ -98,11 +98,18 @@ agent-browser의 모든 핵심 기능을 포함하면서, 추가로:
 - `--content-boundaries` — 콘텐츠 출력 경계 마커
 - `auth save/login/list/show/delete` — 인증 프로필 저장 + 자동 로그인
 
+### ✅ 성능 분석 / 영상 녹화 / 스크린샷 비교
+- `video start/stop [path]` — 비디오 녹화 (FFmpeg, WebM/MP4)
+- `trace start/stop [path]` — Chrome DevTools 트레이스
+- `profiler start/stop [path]` — CPU 프로파일러
+- `screenshot --annotate` — @ref 오버레이 스크린샷
+- `diff-screenshot <baseline> [current]` — 스크린샷 픽셀 비교
+
 ## Project Structure
 
 ```
 src/
-├── main.zig          # CLI + 데몬 모드 + DaemonContext + 60+ 핸들러
+├── main.zig          # CLI + 데몬 모드 + DaemonContext + 90+ 핸들러
 ├── daemon.zig        # 데몬 프로토콜, Unix Socket, ensureDaemon
 ├── websocket.zig     # WebSocket 프레임 코덱 + Client + Connection (RFC 6455)
 ├── cdp.zig           # CDP 메시지 파싱/직렬화 + writeJsonString
@@ -112,6 +119,7 @@ src/
 ├── interceptor.zig   # 네트워크 인터셉트 (InterceptorState, matchPattern)
 ├── recorder.zig      # 플로우 녹화/재생/비교
 ├── snapshot.zig      # AX 트리 스냅샷 + @ref + 페이지 조작 CDP 명령
+├── png.zig           # PNG 디코딩 + 픽셀 비교 (diff-screenshot)
 └── root.zig          # 모듈 루트
 
 docs/
@@ -125,7 +133,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 (`test` 블록, 소스 파일 내)
-- `zig build test` → 463개
+- `zig build test` → 490개
 - 유닛 + 통합 (실제 Chrome E2E 확인)
 
 ### 테스트 분포
@@ -133,12 +141,13 @@ reference/            # 참조 코드 (gitignored)
 | 모듈 | 수 | 내용 |
 |---|---|---|
 | websocket.zig | 106 | RFC 6455 프레임, 마스킹, 핸드셰이크, Connection, URL 파싱 |
-| main.zig | 100 | RemoteObject 변환, 도메인 제한, 콘텐츠 경계, isPlannedCommand, config, auth |
+| main.zig | 105 | RemoteObject 변환, 도메인 제한, 콘텐츠 경계, isPlannedCommand, config, auth, video |
 | cdp.zig | 67 | 메시지 파싱/직렬화, 에러 코드, 편의 명령, JSON 이스케이프 |
 | chrome.zig | 47 | DevToolsActivePort, /json/version, URL 재작성, discovery, proxy, extensions |
 | snapshot.zig | 37 | RefMap, buildSnapshot, extractBoxCenter |
 | analyzer.zig | 35 | isApiRequest, pathToPattern, inferJsonSchema |
 | daemon.zig | 23 | 소켓 경로, 직렬화, 파싱, writeJsonValue |
+| png.zig | 22 | PNG 디코딩, 픽셀 비교, diff-screenshot |
 | interceptor.zig | 17 | matchPattern, InterceptorState |
 | network.zig | 11 | Collector lifecycle, filterByUrl |
 | response_map.zig | 10 | ResponseMap |
@@ -158,11 +167,11 @@ reference/            # 참조 코드 (gitignored)
 
 ```bash
 zig build              # 빌드
-zig build test         # 테스트 (382개)
+zig build test         # 테스트 (490개)
 ./zig-out/bin/agent-devtools --help
 ```
 
-## Commands — 전체 60+개
+## Commands — 전체 90+개
 
 ### Navigation
 ```bash
@@ -213,6 +222,8 @@ agent-devtools styles @ref <prop>      # 계산된 CSS 스타일 값
 ### Screenshot & PDF
 ```bash
 agent-devtools screenshot [path]       # PNG 스크린샷
+agent-devtools screenshot --annotate [path]  # @ref 오버레이 스크린샷
+agent-devtools diff-screenshot <baseline> [current] [--threshold N] [--output path]
 agent-devtools pdf [path]              # PDF 저장
 ```
 
@@ -320,6 +331,16 @@ agent-devtools state list              # 저장된 상태 목록
 agent-devtools addstyle <css>          # <style> 태그 추가
 ```
 
+### Performance (차별화)
+```bash
+agent-devtools video start [path]      # 비디오 녹화 시작 (FFmpeg 필요)
+agent-devtools video stop              # 비디오 녹화 중지
+agent-devtools trace start             # Chrome DevTools 트레이스 시작
+agent-devtools trace stop [path]       # 트레이스 중지 + 저장
+agent-devtools profiler start          # CPU 프로파일러 시작
+agent-devtools profiler stop [path]    # 프로파일러 중지 + 저장
+```
+
 ### Auth Vault (차별화)
 ```bash
 agent-devtools auth save <name> --url <url> --username <user> --password <pass>
@@ -352,10 +373,5 @@ CLI 플래그가 설정파일 값을 덮어씀
 
 ### 구현 예정
 ```bash
-agent-devtools replay <name>           # record + open + diff 자동화
-agent-devtools diff-screenshot <a> <b> # 스크린샷 픽셀 비교
-agent-devtools annotate-screenshot     # @ref 오버레이 스크린샷
-agent-devtools video start/stop        # 비디오 녹화
-agent-devtools trace start/stop        # CDP Tracing
-agent-devtools profiler start/stop     # CDP Profiler
+(현재 모든 계획된 기능이 구현 완료됨)
 ```

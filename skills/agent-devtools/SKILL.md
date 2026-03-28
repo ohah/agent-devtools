@@ -76,11 +76,16 @@ find text "Submit"         Find by text content
 find label "Email"         Find by label
 ```
 
-### Capture
+### Capture & Performance
 ```
-screenshot [path]   PNG screenshot
-pdf [path]          Save as PDF
-eval <js>           Run JavaScript
+screenshot [path]           PNG screenshot
+screenshot --annotate [path] Screenshot with @ref labels overlay
+diff-screenshot <baseline> [current] [--threshold N] [--output path]
+pdf [path]                  Save as PDF
+eval <js>                   Run JavaScript
+video start/stop [path]     Record video (requires FFmpeg)
+trace start/stop [path]     Chrome DevTools trace
+profiler start/stop [path]  CPU profiler
 ```
 
 ### Network (unique feature)
@@ -140,6 +145,23 @@ dialog accept/dismiss/info
 record <name>    Save network state
 diff <name>      Compare current vs recorded
 replay <name>    Navigate + diff
+```
+
+### Auth Vault
+```
+auth save <name> --url <url> --username <user> --password <pass>
+auth login <name>           Auto-login (navigate + fill + submit)
+auth list / show / delete <name>
+```
+
+### Security & Config
+```
+--proxy <url>               Proxy server
+--proxy-bypass <list>       Proxy bypass list
+--extension <path>          Load Chrome extension
+--allowed-domains <list>    Restrict navigation domains
+--content-boundaries        Wrap output with boundary markers
+agent-devtools.json         Config file (project or ~/.agent-devtools/config.json)
 ```
 
 ## Interactive Mode

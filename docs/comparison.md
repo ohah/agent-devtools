@@ -9,7 +9,7 @@
 | **스레딩** | 멀티스레드 (워커 풀) | tokio async |
 | **통신** | Unix Socket / TCP (Windows) | Unix Socket / TCP (Windows) |
 | **AX Tree** | 100% 동일 (diff 0줄 검증) | 기준 구현 |
-| **테스트** | 440개 유닛 | 44 E2E |
+| **테스트** | 490개 유닛 | 44 E2E |
 
 ## 동일한 기능
 
@@ -31,6 +31,16 @@
 - 봇 감지 우회
 - 멀티 세션
 - 기존 Chrome 연결
+- 영상 녹화 (video start/stop)
+- 트레이스/프로파일러 (trace/profiler start/stop)
+- annotate 스크린샷 (screenshot --annotate)
+- 스크린샷 비교 (diff-screenshot)
+- 프록시 (--proxy, --proxy-bypass)
+- 브라우저 확장 (--extension)
+- 설정 파일 (agent-devtools.json / config.json)
+- 인증 볼트 (auth save/login/list/show/delete)
+- 콘텐츠 바운더리 (--content-boundaries)
+- 도메인 제한 (--allowed-domains)
 
 ## agent-devtools만의 기능
 
@@ -50,18 +60,9 @@
 
 | 기능 | 설명 |
 |---|---|
-| 영상 녹화 | `record start/stop` (WebM) |
-| 트레이스/프로파일러 | `trace`/`profiler` (Chrome DevTools JSON) |
 | iOS 시뮬레이터 | `-p ios` (Appium) |
-| 스트리밍 | `stream enable` (WebSocket) |
-| annotate 스크린샷 | `--annotate` (ref 번호 오버레이) |
-| 프록시 | `--proxy` |
-| 브라우저 확장 | `--extension` |
-| 설정 파일 | `agent-browser.json` |
-| 인증 볼트 | `auth save/login/list` |
-| 배치 실행 | `batch` (JSON 배열) |
-| 콘텐츠 바운더리 | `--content-boundaries` |
-| 도메인 제한 | `--allowed-domains` |
+| 스트리밍 | `stream enable` (WebSocket 서버) |
+| 배치 실행 | `batch` (JSON 배열 일괄 실행) |
 
 ## 스냅샷 동일성 검증
 
@@ -79,4 +80,4 @@
 - **일반 자동화**: 동일 (같은 CDP, 같은 AX tree)
 - **웹앱 디버깅/역공학**: agent-devtools가 우위 (analyze, intercept, waitfor, --debug)
 - **설치/배포**: agent-devtools가 간편 (단일 바이너리, 의존성 없음)
-- **iOS/영상/프록시**: agent-browser가 우위
+- **iOS/배치/스트리밍**: agent-browser가 우위
