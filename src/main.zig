@@ -3902,20 +3902,104 @@ fn handleFill(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
     return respondOk(allocator);
 }
 
+/// Key info matching Playwright's USKeyboardLayout
+const KeyInfo = struct { key: []const u8, code: []const u8, key_code: i32, text: ?[]const u8 };
+
+fn getKeyInfo(key_name: []const u8) KeyInfo {
+    // Named keys (case-insensitive)
+    const named_keys = [_]struct { name: []const u8, key: []const u8, code: []const u8, kc: i32, text: ?[]const u8 }{
+        .{ .name = "enter", .key = "Enter", .code = "Enter", .kc = 13, .text = "\r" },
+        .{ .name = "return", .key = "Enter", .code = "Enter", .kc = 13, .text = "\r" },
+        .{ .name = "tab", .key = "Tab", .code = "Tab", .kc = 9, .text = "\t" },
+        .{ .name = "escape", .key = "Escape", .code = "Escape", .kc = 27, .text = null },
+        .{ .name = "esc", .key = "Escape", .code = "Escape", .kc = 27, .text = null },
+        .{ .name = "backspace", .key = "Backspace", .code = "Backspace", .kc = 8, .text = null },
+        .{ .name = "delete", .key = "Delete", .code = "Delete", .kc = 46, .text = null },
+        .{ .name = "arrowup", .key = "ArrowUp", .code = "ArrowUp", .kc = 38, .text = null },
+        .{ .name = "up", .key = "ArrowUp", .code = "ArrowUp", .kc = 38, .text = null },
+        .{ .name = "arrowdown", .key = "ArrowDown", .code = "ArrowDown", .kc = 40, .text = null },
+        .{ .name = "down", .key = "ArrowDown", .code = "ArrowDown", .kc = 40, .text = null },
+        .{ .name = "arrowleft", .key = "ArrowLeft", .code = "ArrowLeft", .kc = 37, .text = null },
+        .{ .name = "left", .key = "ArrowLeft", .code = "ArrowLeft", .kc = 37, .text = null },
+        .{ .name = "arrowright", .key = "ArrowRight", .code = "ArrowRight", .kc = 39, .text = null },
+        .{ .name = "right", .key = "ArrowRight", .code = "ArrowRight", .kc = 39, .text = null },
+        .{ .name = "home", .key = "Home", .code = "Home", .kc = 36, .text = null },
+        .{ .name = "end", .key = "End", .code = "End", .kc = 35, .text = null },
+        .{ .name = "pageup", .key = "PageUp", .code = "PageUp", .kc = 33, .text = null },
+        .{ .name = "pagedown", .key = "PageDown", .code = "PageDown", .kc = 34, .text = null },
+        .{ .name = "space", .key = " ", .code = "Space", .kc = 32, .text = " " },
+        .{ .name = "insert", .key = "Insert", .code = "Insert", .kc = 45, .text = null },
+        .{ .name = "f1", .key = "F1", .code = "F1", .kc = 112, .text = null },
+        .{ .name = "f2", .key = "F2", .code = "F2", .kc = 113, .text = null },
+        .{ .name = "f3", .key = "F3", .code = "F3", .kc = 114, .text = null },
+        .{ .name = "f4", .key = "F4", .code = "F4", .kc = 115, .text = null },
+        .{ .name = "f5", .key = "F5", .code = "F5", .kc = 116, .text = null },
+        .{ .name = "f6", .key = "F6", .code = "F6", .kc = 117, .text = null },
+        .{ .name = "f7", .key = "F7", .code = "F7", .kc = 118, .text = null },
+        .{ .name = "f8", .key = "F8", .code = "F8", .kc = 119, .text = null },
+        .{ .name = "f9", .key = "F9", .code = "F9", .kc = 120, .text = null },
+        .{ .name = "f10", .key = "F10", .code = "F10", .kc = 121, .text = null },
+        .{ .name = "f11", .key = "F11", .code = "F11", .kc = 122, .text = null },
+        .{ .name = "f12", .key = "F12", .code = "F12", .kc = 123, .text = null },
+    };
+
+    for (named_keys) |nk| {
+        if (std.ascii.eqlIgnoreCase(key_name, nk.name)) {
+            return .{ .key = nk.key, .code = nk.code, .key_code = nk.kc, .text = nk.text };
+        }
+    }
+
+    // Single character
+    if (key_name.len == 1) {
+        const ch = key_name[0];
+        // Letters: code=KeyA, VK=uppercase ASCII
+        if (ch >= 'a' and ch <= 'z') {
+            return .{ .key = key_name, .code = key_name, .key_code = @as(i32, ch - 32), .text = key_name };
+        }
+        if (ch >= 'A' and ch <= 'Z') {
+            return .{ .key = key_name, .code = key_name, .key_code = @as(i32, ch), .text = key_name };
+        }
+        // Digits: code=Digit0, VK=ASCII
+        if (ch >= '0' and ch <= '9') {
+            return .{ .key = key_name, .code = key_name, .key_code = @as(i32, ch), .text = key_name };
+        }
+        // Punctuation: VK codes differ from ASCII (Playwright-compatible)
+        const punct_info: struct { code: []const u8, kc: i32 } = switch (ch) {
+            ';', ':' => .{ .code = "Semicolon", .kc = 186 },
+            '=', '+' => .{ .code = "Equal", .kc = 187 },
+            ',', '<' => .{ .code = "Comma", .kc = 188 },
+            '-', '_' => .{ .code = "Minus", .kc = 189 },
+            '.', '>' => .{ .code = "Period", .kc = 190 },
+            '/', '?' => .{ .code = "Slash", .kc = 191 },
+            '`', '~' => .{ .code = "Backquote", .kc = 192 },
+            '[', '{' => .{ .code = "BracketLeft", .kc = 219 },
+            '\\', '|' => .{ .code = "Backslash", .kc = 220 },
+            ']', '}' => .{ .code = "BracketRight", .kc = 221 },
+            '\'', '"' => .{ .code = "Quote", .kc = 222 },
+            else => .{ .code = key_name, .kc = 0 },
+        };
+        return .{ .key = key_name, .code = punct_info.code, .key_code = punct_info.kc, .text = key_name };
+    }
+
+    return .{ .key = key_name, .code = key_name, .key_code = 0, .text = null };
+}
+
 fn handlePress(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8) []u8 {
     const key_name = key orelse return respondErr(allocator, "key required");
+    const info = getKeyInfo(key_name);
 
-    // For single printable characters, include text field for actual input
-    const is_printable = key_name.len == 1 and key_name[0] >= 0x20;
-
+    // keyDown
     var down_buf: std.ArrayList(u8) = .empty;
     defer down_buf.deinit(allocator);
     const dw = down_buf.writer(allocator);
     dw.writeAll("{\"type\":\"keyDown\",\"key\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(dw, key_name) catch return respondErr(allocator, "write error");
-    if (is_printable) {
+    cdp.writeJsonString(dw, info.key) catch return respondErr(allocator, "write error");
+    dw.writeAll(",\"code\":") catch {};
+    cdp.writeJsonString(dw, info.code) catch {};
+    std.fmt.format(dw, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code }) catch {};
+    if (info.text) |text| {
         dw.writeAll(",\"text\":") catch {};
-        cdp.writeJsonString(dw, key_name) catch {};
+        cdp.writeJsonString(dw, text) catch {};
     }
     dw.writeByte('}') catch {};
 
@@ -3927,11 +4011,15 @@ fn handlePress(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, 
     defer allocator.free(cmd1);
     sender.sendText(cmd1) catch {};
 
+    // keyUp
     var up_buf: std.ArrayList(u8) = .empty;
     defer up_buf.deinit(allocator);
     const uw = up_buf.writer(allocator);
     uw.writeAll("{\"type\":\"keyUp\",\"key\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(uw, key_name) catch {};
+    cdp.writeJsonString(uw, info.key) catch {};
+    uw.writeAll(",\"code\":") catch {};
+    cdp.writeJsonString(uw, info.code) catch {};
+    std.fmt.format(uw, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code }) catch {};
     uw.writeByte('}') catch {};
 
     const up_params = up_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
