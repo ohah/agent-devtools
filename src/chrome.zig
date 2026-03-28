@@ -53,8 +53,10 @@ pub fn parseJsonVersion(allocator: Allocator, body: []const u8) ?[]const u8 {
     return extractWsUrl(allocator, parsed.value);
 }
 
-/// Parse /json/list response to extract first target's webSocketDebuggerUrl.
-/// Prefers targets with type "browser".
+/// Parse /json/list response to extract a suitable target's webSocketDebuggerUrl.
+/// Priority: type "page" (excluding chrome-extension://, devtools://) > type "browser" > first available.
+/// This handles Electron apps where /json/version returns a browser-level URL
+/// but the actual app content is in a "page" type target.
 pub fn parseJsonList(allocator: Allocator, body: []const u8) ?[]const u8 {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch return null;
     defer parsed.deinit();
@@ -62,15 +64,29 @@ pub fn parseJsonList(allocator: Allocator, body: []const u8) ?[]const u8 {
     if (parsed.value != .array) return null;
     const items = parsed.value.array.items;
 
+    // 1st priority: type "page" with a real URL (not chrome-extension:// or devtools://)
     for (items) |item| {
         const type_str = cdp.getString(item, "type") orelse continue;
-        if (std.mem.eql(u8, type_str, "browser")) {
-            if (extractWsUrl(allocator, item)) |url| return url;
+        if (std.mem.eql(u8, type_str, "page")) {
+            const url = cdp.getString(item, "url") orelse "";
+            if (std.mem.startsWith(u8, url, "chrome-extension://")) continue;
+            if (std.mem.startsWith(u8, url, "devtools://")) continue;
+            if (std.mem.startsWith(u8, url, "chrome://")) continue;
+            if (extractWsUrl(allocator, item)) |ws| return ws;
         }
     }
 
+    // 2nd priority: type "browser"
     for (items) |item| {
-        if (extractWsUrl(allocator, item)) |url| return url;
+        const type_str = cdp.getString(item, "type") orelse continue;
+        if (std.mem.eql(u8, type_str, "browser")) {
+            if (extractWsUrl(allocator, item)) |ws| return ws;
+        }
+    }
+
+    // 3rd: any target with a WS URL
+    for (items) |item| {
+        if (extractWsUrl(allocator, item)) |ws| return ws;
     }
 
     return null;
@@ -144,8 +160,19 @@ pub fn httpGet(allocator: Allocator, host: []const u8, port: u16, path: []const 
     return allocator.dupe(u8, body);
 }
 
-/// Discover CDP WebSocket URL by querying /json/version on the given port.
+/// Discover CDP WebSocket URL by querying /json/version then /json/list.
+/// Falls back to /json/list to find page-level targets (needed for Electron apps).
 pub fn discoverWsUrl(allocator: Allocator, host: []const u8, port: u16) ![]u8 {
+    // Try /json/list first — finds actual page targets (works for Electron + Chrome)
+    if (httpGet(allocator, host, port, "/json/list")) |list_body| {
+        defer allocator.free(list_body);
+        if (parseJsonList(allocator, list_body)) |ws_url| {
+            defer allocator.free(ws_url);
+            return rewriteWsHost(allocator, ws_url, host, port);
+        }
+    } else |_| {}
+
+    // Fallback to /json/version (browser-level, works for Chrome)
     const body = try httpGet(allocator, host, port, "/json/version");
     defer allocator.free(body);
 
@@ -606,9 +633,27 @@ test "parseJsonVersion: field is not string" {
     ) == null);
 }
 
-test "parseJsonList: prefers browser type target" {
+test "parseJsonList: prefers page type over browser" {
     const body =
-        \\[{"type":"page","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/1"},{"type":"browser","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/abc"}]
+        \\[{"type":"browser","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/abc"},{"type":"page","url":"https://example.com","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/1"}]
+    ;
+    const url = parseJsonList(testing.allocator, body).?;
+    defer testing.allocator.free(url);
+    try testing.expectEqualStrings("ws://127.0.0.1:9222/devtools/page/1", url);
+}
+
+test "parseJsonList: skips chrome-extension pages" {
+    const body =
+        \\[{"type":"page","url":"chrome-extension://abc/popup.html","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/ext"},{"type":"page","url":"https://myapp.com","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/app"}]
+    ;
+    const url = parseJsonList(testing.allocator, body).?;
+    defer testing.allocator.free(url);
+    try testing.expectEqualStrings("ws://127.0.0.1:9222/devtools/page/app", url);
+}
+
+test "parseJsonList: falls back to browser if no real pages" {
+    const body =
+        \\[{"type":"page","url":"chrome://newtab","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/page/1"},{"type":"browser","webSocketDebuggerUrl":"ws://127.0.0.1:9222/devtools/browser/abc"}]
     ;
     const url = parseJsonList(testing.allocator, body).?;
     defer testing.allocator.free(url);

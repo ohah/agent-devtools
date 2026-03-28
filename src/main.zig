@@ -1820,34 +1820,94 @@ fn runDaemon() void {
     };
     defer ws.close();
 
-    // Create page target and attach
     var cmd_id = cdp.CommandId.init();
-    const create_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.createTarget",
-        \\{"url":"about:blank"}
-    , null) catch return;
-    ws.sendText(create_cmd) catch return;
-    allocator.free(create_cmd);
-
     ws.setReadTimeout(5000);
 
     var session_id: ?[]u8 = null;
     defer if (session_id) |s| allocator.free(s);
 
-    for (0..20) |_| {
-        const msg = ws.recvMessage() catch break;
-        defer allocator.free(msg);
-        const parsed = cdp.parseMessage(allocator, msg) catch continue;
-        defer parsed.parsed.deinit();
+    const is_external = ext_port != null or env_auto_connect;
 
-        if (parsed.message.isResponse()) {
-            if (parsed.message.result) |result| {
-                if (cdp.getString(result, "targetId")) |tid| {
-                    const attach = cdp.targetAttachToTarget(allocator, cmd_id.next(), tid, true) catch continue;
-                    ws.sendText(attach) catch {};
-                    allocator.free(attach);
-                } else if (cdp.getString(result, "sessionId")) |sid| {
-                    session_id = allocator.dupe(u8, sid) catch null;
-                    break;
+    if (is_external) {
+        // External Chrome/Electron: find existing page target and attach to it
+        const targets_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.getTargets", null, null) catch return;
+        ws.sendText(targets_cmd) catch return;
+        allocator.free(targets_cmd);
+
+        for (0..20) |_| {
+            const msg = ws.recvMessage() catch break;
+            defer allocator.free(msg);
+            const parsed = cdp.parseMessage(allocator, msg) catch continue;
+            defer parsed.parsed.deinit();
+
+            if (parsed.message.isResponse()) {
+                if (parsed.message.result) |result| {
+                    if (result.object.get("targetInfos")) |infos| {
+                        if (infos == .array) {
+                            // Find first "page" target that isn't a chrome internal page
+                            for (infos.array.items) |info| {
+                                const t = cdp.getString(info, "type") orelse continue;
+                                if (!std.mem.eql(u8, t, "page")) continue;
+                                const target_url = cdp.getString(info, "url") orelse "";
+                                if (std.mem.startsWith(u8, target_url, "chrome://")) continue;
+                                if (std.mem.startsWith(u8, target_url, "chrome-extension://")) continue;
+                                if (std.mem.startsWith(u8, target_url, "devtools://")) continue;
+
+                                if (cdp.getString(info, "targetId")) |tid| {
+                                    const attach = cdp.targetAttachToTarget(allocator, cmd_id.next(), tid, true) catch continue;
+                                    ws.sendText(attach) catch {};
+                                    allocator.free(attach);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                }
+                break;
+            }
+        }
+
+        // Read attach response to get sessionId
+        for (0..20) |_| {
+            const msg = ws.recvMessage() catch break;
+            defer allocator.free(msg);
+            const parsed = cdp.parseMessage(allocator, msg) catch continue;
+            defer parsed.parsed.deinit();
+
+            if (parsed.message.isResponse()) {
+                if (parsed.message.result) |result| {
+                    if (cdp.getString(result, "sessionId")) |sid| {
+                        session_id = allocator.dupe(u8, sid) catch null;
+                        break;
+                    }
+                }
+                break;
+            }
+        }
+    } else {
+        // Self-launched Chrome: create new page target
+        const create_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.createTarget",
+            \\{"url":"about:blank"}
+        , null) catch return;
+        ws.sendText(create_cmd) catch return;
+        allocator.free(create_cmd);
+
+        for (0..20) |_| {
+            const msg = ws.recvMessage() catch break;
+            defer allocator.free(msg);
+            const parsed = cdp.parseMessage(allocator, msg) catch continue;
+            defer parsed.parsed.deinit();
+
+            if (parsed.message.isResponse()) {
+                if (parsed.message.result) |result| {
+                    if (cdp.getString(result, "targetId")) |tid| {
+                        const attach = cdp.targetAttachToTarget(allocator, cmd_id.next(), tid, true) catch continue;
+                        ws.sendText(attach) catch {};
+                        allocator.free(attach);
+                    } else if (cdp.getString(result, "sessionId")) |sid| {
+                        session_id = allocator.dupe(u8, sid) catch null;
+                        break;
+                    }
                 }
             }
         }
