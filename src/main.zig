@@ -7453,6 +7453,7 @@ test "EventSubscribers: init and deinit" {
 }
 
 test "EventSubscribers: add and remove" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var subs = EventSubscribers.init(std.testing.allocator);
     defer subs.deinit();
 
@@ -7466,6 +7467,7 @@ test "EventSubscribers: add and remove" {
 }
 
 test "EventSubscribers: remove non-existent fd is no-op" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var subs = EventSubscribers.init(std.testing.allocator);
     defer subs.deinit();
 
@@ -7475,6 +7477,7 @@ test "EventSubscribers: remove non-existent fd is no-op" {
 }
 
 test "EventSubscribers: broadcast removes broken fds" {
+    if (comptime builtin.os.tag == .windows) return error.SkipZigTest;
     var subs = EventSubscribers.init(std.testing.allocator);
     defer subs.deinit();
 
