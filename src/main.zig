@@ -8281,7 +8281,8 @@ fn printUsage() void {
         \\
         \\Install:
         \\  npm install -g @ohah/agent-devtools
-        \\  agent-devtools open https://example.com
+        \\  curl -fsSL https://raw.githubusercontent.com/ohah/agent-devtools/main/install.sh | sh
+        \\  npx skills add ohah/agent-devtools     # AI agent skill
         \\
     ) catch {};
 }

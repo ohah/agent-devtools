@@ -27,6 +27,12 @@ npm install -g @ohah/agent-devtools
 npm install @ohah/agent-devtools
 ```
 
+### curl (no Node.js required)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ohah/agent-devtools/main/install.sh | sh
+```
+
 ### Skills (for AI agents)
 
 Add the skill to your AI coding assistant (Claude Code, Codex, Cursor, Gemini CLI, etc.):
@@ -34,6 +40,14 @@ Add the skill to your AI coding assistant (Claude Code, Codex, Cursor, Gemini CL
 ```bash
 npx skills add ohah/agent-devtools
 ```
+
+### Windows
+
+```powershell
+npm install -g @ohah/agent-devtools
+```
+
+Or download `agent-devtools-win32-x64.exe` from [Releases](https://github.com/ohah/agent-devtools/releases).
 
 ### Build from source
 
@@ -43,10 +57,24 @@ Requires [Zig 0.15.2](https://ziglang.org/download/):
 git clone https://github.com/ohah/agent-devtools
 cd agent-devtools
 zig build
-zig build test    # 382 tests
+zig build test    # 495 tests
 ```
 
 The binary is at `./zig-out/bin/agent-devtools`.
+
+### Updating
+
+```bash
+npm update -g @ohah/agent-devtools                    # npm
+curl -fsSL https://raw.githubusercontent.com/ohah/agent-devtools/main/install.sh | sh  # curl
+```
+
+### Uninstall
+
+```bash
+npm uninstall -g @ohah/agent-devtools                 # npm
+sudo rm /usr/local/bin/agent-devtools                  # curl
+```
 
 ## Quick Start
 
