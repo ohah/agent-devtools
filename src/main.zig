@@ -278,9 +278,25 @@ pub fn main() void {
         };
         sendAction(session, "open", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "network")) {
-        const subcmd = args_iter.next() orelse "list";
-        if (std.mem.eql(u8, subcmd, "list")) {
-            sendAction(session, "network_list", null, args_iter.next(), daemon_opts);
+        const subcmd = args_iter.next() orelse "requests";
+        if (std.mem.eql(u8, subcmd, "requests") or std.mem.eql(u8, subcmd, "list")) {
+            // network requests [--filter pattern] [--clear] [pattern]
+            var filter_pattern: ?[]const u8 = null;
+            var do_clear = false;
+            while (args_iter.next()) |narg| {
+                if (std.mem.eql(u8, narg, "--filter")) {
+                    filter_pattern = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--clear")) {
+                    do_clear = true;
+                } else if (filter_pattern == null) {
+                    filter_pattern = narg; // positional pattern (backward compat)
+                }
+            }
+            if (do_clear) {
+                sendAction(session, "network_clear", null, null, daemon_opts);
+            } else {
+                sendAction(session, "network_list", null, filter_pattern, daemon_opts);
+            }
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const req_id = args_iter.next() orelse {
                 writeErr("Usage: agent-devtools network get <requestId>\n", .{});
@@ -294,24 +310,31 @@ pub fn main() void {
                 \\Usage: agent-devtools network <subcommand>
                 \\
                 \\Subcommands:
-                \\  list [pattern]    List network requests (optional URL filter)
+                \\  requests [--filter pattern] [--clear]  List or clear network requests
                 \\  get <requestId>   Get request details (headers, body)
-                \\  clear             Clear collected requests
+                \\  clear             Clear collected requests (alias)
                 \\  help              Show this help
+                \\
+                \\Aliases: 'list' works as alias for 'requests'
                 \\
             , .{});
         } else {
-            writeErr("Unknown network subcommand: {s}\n", .{subcmd});
-            std.process.exit(1);
+            // Treat unknown subcmd as pattern for backward compat (network <pattern>)
+            sendAction(session, "network_list", null, subcmd, daemon_opts);
         }
     } else if (std.mem.eql(u8, cmd, "console")) {
-        const subcmd = args_iter.next() orelse "list";
-        if (std.mem.eql(u8, subcmd, "list")) {
+        const subcmd = args_iter.next();
+        if (subcmd == null) {
+            // `console` with no subcommand = list
             sendAction(session, "console_list", null, null, daemon_opts);
-        } else if (std.mem.eql(u8, subcmd, "clear")) {
+        } else if (std.mem.eql(u8, subcmd.?, "--clear")) {
+            sendAction(session, "console_clear", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd.?, "list")) {
+            sendAction(session, "console_list", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd.?, "clear")) {
             sendAction(session, "console_clear", null, null, daemon_opts);
         } else {
-            writeErr("Unknown console subcommand: {s}\n", .{subcmd});
+            writeErr("Unknown console subcommand: {s}\n", .{subcmd.?});
             std.process.exit(1);
         }
     } else if (std.mem.eql(u8, cmd, "intercept")) {
@@ -587,6 +610,9 @@ pub fn main() void {
             if (std.mem.eql(u8, fa, "--annotate") or std.mem.eql(u8, fa, "-a")) {
                 const path = args_iter.next();
                 sendAction(session, "screenshot_annotate", path, null, daemon_opts);
+            } else if (std.mem.eql(u8, fa, "--full")) {
+                const path = args_iter.next();
+                sendAction(session, "screenshot_full", path, null, daemon_opts);
             } else {
                 sendAction(session, "screenshot", fa, null, daemon_opts);
             }
@@ -889,7 +915,7 @@ pub fn main() void {
         sendAction(session, "waitfunction", expr, timeout, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "errors")) {
         const subcmd = args_iter.next();
-        if (subcmd != null and std.mem.eql(u8, subcmd.?, "clear")) {
+        if (subcmd != null and (std.mem.eql(u8, subcmd.?, "clear") or std.mem.eql(u8, subcmd.?, "--clear"))) {
             sendAction(session, "errors_clear", null, null, daemon_opts);
         } else {
             sendAction(session, "errors", null, null, daemon_opts);
@@ -2985,6 +3011,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleMouse(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "screenshot")) {
         return handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "screenshot_full")) {
+        return handleScreenshotFull(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "eval")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "back")) {
@@ -4684,6 +4712,67 @@ fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response
         }
     }
     return respondErr(allocator, "screenshot timeout");
+}
+
+fn handleScreenshotFull(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
+        \\{"format":"png","captureBeyondViewport":true,"fromSurface":true}
+    , session_id) catch return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
+        return respondErr(allocator, "screenshot timeout");
+    defer allocator.free(raw);
+
+    const parsed = cdp.parseMessage(allocator, raw) catch
+        return respondErr(allocator, "parse error");
+    defer parsed.parsed.deinit();
+
+    if (parsed.message.isResponse()) {
+        if (parsed.message.result) |result| {
+            if (cdp.getString(result, "data")) |base64_data| {
+                // If path provided, save to file
+                if (path_opt) |file_path| {
+                    const decoded_size = std.base64.standard.Decoder.calcSizeUpperBound(base64_data.len) catch
+                        return respondErr(allocator, "invalid base64");
+                    const buf = allocator.alloc(u8, decoded_size) catch return respondErr(allocator, "alloc error");
+                    defer allocator.free(buf);
+
+                    std.base64.standard.Decoder.decode(buf, base64_data) catch
+                        return respondErr(allocator, "decode error");
+
+                    const file = std.fs.cwd().createFile(file_path, .{}) catch
+                        return respondErr(allocator, "file create error");
+                    defer file.close();
+                    _ = file.write(buf[0..decoded_size]) catch return respondErr(allocator, "write error");
+
+                    var resp_buf2: std.ArrayList(u8) = .empty;
+                    defer resp_buf2.deinit(allocator);
+                    const rw2 = resp_buf2.writer(allocator);
+                    rw2.writeAll("{\"file\":") catch return respondOk(allocator);
+                    cdp.writeJsonString(rw2, file_path) catch return respondOk(allocator);
+                    rw2.print(",\"size\":{d}}}", .{decoded_size}) catch return respondOk(allocator);
+                    const data = resp_buf2.toOwnedSlice(allocator) catch return respondOk(allocator);
+                    defer allocator.free(data);
+                    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
+                } else {
+                    // Return base64 data directly
+                    var resp_buf: std.ArrayList(u8) = .empty;
+                    defer resp_buf.deinit(allocator);
+                    const writer = resp_buf.writer(allocator);
+                    writer.writeAll("{\"data\":\"") catch return respondErr(allocator, "write error");
+                    writer.writeAll(base64_data) catch return respondErr(allocator, "write error");
+                    writer.writeAll("\"}") catch {};
+
+                    const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+                    defer allocator.free(data);
+                    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+                }
+            }
+        }
+    }
+    return respondErr(allocator, "screenshot full-page timeout");
 }
 
 fn handleDiffScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, baseline_path_opt: ?[]const u8, params_opt: ?[]const u8) []u8 {
@@ -6944,7 +7033,21 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
         }
     } else if (std.mem.eql(u8, cmd, "network")) {
         if (arg1) |sub| {
-            if (std.mem.eql(u8, sub, "list")) { action = "network_list"; url = null; pattern = arg2; }
+            if (std.mem.eql(u8, sub, "requests") or std.mem.eql(u8, sub, "list")) {
+                // network requests [--filter pattern] [--clear] [pattern]
+                action = "network_list"; url = null; pattern = null;
+                var i: usize = 2;
+                while (i < token_count) : (i += 1) {
+                    if (std.mem.eql(u8, tokens[i], "--filter")) {
+                        i += 1;
+                        if (i < token_count) pattern = tokens[i];
+                    } else if (std.mem.eql(u8, tokens[i], "--clear")) {
+                        action = "network_clear";
+                    } else if (pattern == null) {
+                        pattern = tokens[i]; // positional pattern (backward compat)
+                    }
+                }
+            }
             else if (std.mem.eql(u8, sub, "get")) { action = "network_get"; url = arg2; pattern = null; }
             else if (std.mem.eql(u8, sub, "clear")) { action = "network_clear"; url = null; pattern = null; }
             else { action = "network_list"; url = null; pattern = arg1; }
@@ -6952,7 +7055,7 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
     } else if (std.mem.eql(u8, cmd, "console")) {
         if (arg1) |sub| {
             if (std.mem.eql(u8, sub, "list")) { action = "console_list"; url = null; }
-            else if (std.mem.eql(u8, sub, "clear")) { action = "console_clear"; url = null; }
+            else if (std.mem.eql(u8, sub, "clear") or std.mem.eql(u8, sub, "--clear")) { action = "console_clear"; url = null; }
             else { action = "console_list"; url = null; }
         } else { action = "console_list"; url = null; }
     } else if (std.mem.eql(u8, cmd, "tab")) {
@@ -7044,7 +7147,7 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
         }
     } else if (std.mem.eql(u8, cmd, "errors")) {
         if (arg1) |sub| {
-            if (std.mem.eql(u8, sub, "clear")) { action = "errors_clear"; url = null; }
+            if (std.mem.eql(u8, sub, "clear") or std.mem.eql(u8, sub, "--clear")) { action = "errors_clear"; url = null; }
             else { action = "errors"; url = null; }
         } else { action = "errors"; url = null; }
     } else if (std.mem.eql(u8, cmd, "clipboard")) {
@@ -7089,6 +7192,9 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
         if (arg1) |flag| {
             if (std.mem.eql(u8, flag, "--annotate") or std.mem.eql(u8, flag, "-a")) {
                 action = "screenshot_annotate";
+                url = arg2; // path
+            } else if (std.mem.eql(u8, flag, "--full")) {
+                action = "screenshot_full";
                 url = arg2; // path
             } else {
                 url = flag; // path
@@ -7978,7 +8084,7 @@ fn printUsage() void {
         \\  scrollintoview <@ref>     Scroll element into view
         \\  dispatch <@ref> <event>   Dispatch DOM event (input, change, blur)
         \\  wait <ms>                 Wait milliseconds
-        \\  screenshot [path]         Take screenshot
+        \\  screenshot [--full] [path] Take screenshot (--full for full page)
         \\  pdf [path]                Save as PDF
         \\  snapshot [-i]             Accessibility tree with refs (-i: interactive only)
         \\  eval <js>                 Run JavaScript
@@ -8024,9 +8130,9 @@ fn printUsage() void {
         \\  permissions grant <perm>  Grant browser permission
         \\
         \\Network:  agent-devtools network <action>
-        \\  list [pattern]            List requests (optional URL filter)
+        \\  requests [--filter pat] [--clear]  List or clear network requests
         \\  get <requestId>           Request details with response body
-        \\  clear                     Clear collected requests
+        \\  clear                     Clear collected requests (alias)
         \\
         \\Network Interception:  agent-devtools intercept <action>
         \\  mock <pattern> <json>     Mock response
@@ -8037,9 +8143,8 @@ fn printUsage() void {
         \\  clear                     Clear all rules
         \\
         \\Console & Errors:
-        \\  console list              View console messages
-        \\  console clear             Clear console messages
-        \\  errors [clear]            View or clear page errors
+        \\  console [--clear]         View console messages (--clear to clear)
+        \\  errors [--clear]          View or clear page errors
         \\
         \\Storage:
         \\  cookies [list|set|get|clear]  Manage cookies

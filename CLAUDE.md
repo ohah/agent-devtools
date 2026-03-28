@@ -221,7 +221,7 @@ agent-devtools styles @ref <prop>      # 계산된 CSS 스타일 값
 
 ### Screenshot & PDF
 ```bash
-agent-devtools screenshot [path]       # PNG 스크린샷
+agent-devtools screenshot [--full] [path]  # PNG 스크린샷 (--full: 전체 페이지)
 agent-devtools screenshot --annotate [path]  # @ref 오버레이 스크린샷
 agent-devtools diff-screenshot <baseline> [current] [--threshold N] [--output path]
 agent-devtools pdf [path]              # PDF 저장
@@ -244,15 +244,15 @@ agent-devtools clipboard set <text>    # 클립보드 쓰기
 
 ### Network (차별화)
 ```bash
-agent-devtools network list [pattern]  # 요청 목록 (URL 필터)
+agent-devtools network requests [--filter pattern] [--clear]  # 요청 목록/초기화
 agent-devtools network get <requestId> # 요청 상세 (응답 본문)
 agent-devtools network clear           # 수집 초기화
 ```
 
 ### Console (차별화)
 ```bash
-agent-devtools console list            # 콘솔 로그
-agent-devtools console clear           # 초기화
+agent-devtools console                 # 콘솔 로그 (no subcommand = list)
+agent-devtools console --clear         # 초기화
 ```
 
 ### Analysis (차별화)
