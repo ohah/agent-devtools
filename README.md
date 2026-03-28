@@ -6,7 +6,7 @@ AI 에이전트를 위한 브라우저 개발자 도구 CLI
 
 [![npm](https://img.shields.io/npm/v/@ohah/agent-devtools)](https://www.npmjs.com/package/@ohah/agent-devtools)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-490-brightgreen)]()
+[![Tests](https://img.shields.io/badge/tests-495-brightgreen)]()
 [![Zig](https://img.shields.io/badge/Zig-0.15.2-orange)]()
 
 A single native binary that controls Chrome via CDP (Chrome DevTools Protocol). Zero dependencies. No Playwright, no Puppeteer, no Node.js runtime required for the daemon.
@@ -340,14 +340,18 @@ agent-devtools --session=staging network list
 agent-devtools --session=prod status
 ```
 
-### Connect to existing Chrome
+### Connect to existing Chrome / Electron
 
 ```bash
-# Start Chrome with remote debugging
-google-chrome --remote-debugging-port=9222
+# Auto-discover running Chrome (checks user data dirs + common ports)
+agent-devtools --auto-connect snapshot -i
 
-# Connect agent-devtools to it
-agent-devtools --port=9222 snapshot
+# Or specify port manually
+agent-devtools --port=9222 snapshot -i
+
+# Electron apps (launched with --remote-debugging-port)
+/Applications/Slack.app/Contents/MacOS/Slack --remote-debugging-port=9222
+agent-devtools --port=9222 snapshot -i
 ```
 
 ## Configuration
@@ -358,7 +362,8 @@ Create `agent-devtools.json` in your project root or `~/.agent-devtools/config.j
 |------|-------------|
 | `--session=NAME` | Isolated session name |
 | `--headed` | Show browser window (not headless) |
-| `--port=PORT` | Connect to existing Chrome |
+| `--port=PORT` | Connect to existing Chrome by port |
+| `--auto-connect` | Auto-discover running Chrome/Electron |
 | `--interactive` | Persistent stdin/stdout session |
 | `--debug` | Include network/URL changes in responses |
 | `--proxy <url>` | Proxy server |

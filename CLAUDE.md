@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 490개 (`zig build test`)
+- **테스트**: 495개 (`zig build test`)
 - **CLI 명령**: 90+개
 
 ## Architecture
@@ -133,7 +133,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 (`test` 블록, 소스 파일 내)
-- `zig build test` → 490개
+- `zig build test` → 495개
 - 유닛 + 통합 (실제 Chrome E2E 확인)
 
 ### 테스트 분포
@@ -167,7 +167,7 @@ reference/            # 참조 코드 (gitignored)
 
 ```bash
 zig build              # 빌드
-zig build test         # 테스트 (490개)
+zig build test         # 테스트 (495개)
 ./zig-out/bin/agent-devtools --help
 ```
 

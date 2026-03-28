@@ -9,7 +9,7 @@
 | **스레딩** | 멀티스레드 (워커 풀) | tokio async |
 | **통신** | Unix Socket / TCP (Windows) | Unix Socket / TCP (Windows) |
 | **AX Tree** | 100% 동일 (diff 0줄 검증) | 기준 구현 |
-| **테스트** | 490개 유닛 | 44 E2E |
+| **테스트** | 495개 유닛 | 44 E2E |
 
 ## 동일한 기능
 
@@ -30,7 +30,7 @@
 - 상주 모드 (이벤트 스트리밍)
 - 봇 감지 우회
 - 멀티 세션
-- 기존 Chrome 연결
+- 기존 Chrome 연결 + 자동 발견 (--auto-connect)
 - 영상 녹화 (video start/stop)
 - 트레이스/프로파일러 (trace/profiler start/stop)
 - annotate 스크린샷 (screenshot --annotate)

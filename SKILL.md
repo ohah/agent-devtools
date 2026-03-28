@@ -161,6 +161,7 @@ auth list / show / delete <name>
 --extension <path>          Load Chrome extension
 --allowed-domains <list>    Restrict navigation domains
 --content-boundaries        Wrap output with boundary markers
+--auto-connect              Auto-discover running Chrome/Electron
 agent-devtools.json         Config file (project or ~/.agent-devtools/config.json)
 ```
 
