@@ -193,3 +193,10 @@ For detailed reference, see `references/`:
 - [commands.md](references/commands.md) — Full command reference
 - [debug-mode.md](references/debug-mode.md) — Debug mode details
 - [patterns.md](references/patterns.md) — Common automation patterns
+
+## Ready-to-Use Templates
+
+Copy and customize these shell scripts from `templates/`:
+- [form-automation.sh](templates/form-automation.sh) — Form fill + submit
+- [authenticated-session.sh](templates/authenticated-session.sh) — Login + state persistence
+- [api-discovery.sh](templates/api-discovery.sh) — API reverse engineering workflow
