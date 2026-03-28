@@ -37,6 +37,130 @@ const PageError = struct {
     timestamp: f64,
 };
 
+const VideoRecorder = struct {
+    active: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    thread: ?std.Thread = null,
+    frame_count: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+    path: [512]u8 = undefined,
+    path_len: usize = 0,
+
+    const CaptureContext = struct {
+        recorder: *VideoRecorder,
+        allocator: Allocator,
+        sender: *WsSender,
+        resp_map: *response_map_mod.ResponseMap,
+        cmd_id: *cdp.CommandId,
+        session_id: ?[]const u8,
+    };
+
+    fn start(self: *VideoRecorder, allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, output_path: []const u8) !void {
+        if (self.active.load(.acquire)) return error.AlreadyRecording;
+
+        @memcpy(self.path[0..output_path.len], output_path);
+        self.path_len = output_path.len;
+        self.frame_count.store(0, .release);
+        self.active.store(true, .release);
+
+        self.thread = try std.Thread.spawn(.{}, captureLoop, .{CaptureContext{
+            .recorder = self,
+            .allocator = allocator,
+            .sender = sender,
+            .resp_map = resp_map,
+            .cmd_id = cmd_id,
+            .session_id = session_id,
+        }});
+    }
+
+    fn stop(self: *VideoRecorder) !u64 {
+        if (!self.active.load(.acquire)) return error.NotRecording;
+        self.active.store(false, .release);
+        if (self.thread) |t| {
+            t.join();
+            self.thread = null;
+        }
+        return self.frame_count.load(.acquire);
+    }
+
+    fn captureLoop(cap: CaptureContext) void {
+        const self = cap.recorder;
+        const allocator = cap.allocator;
+        const path = self.path[0..self.path_len];
+
+        // Determine codec and extra flags based on extension
+        const is_mp4 = std.mem.endsWith(u8, path, ".mp4");
+        const codec: []const u8 = if (is_mp4) "libx264" else "libvpx";
+        const extra_flag: []const u8 = if (is_mp4) "-movflags" else "-b:v";
+        const extra_val: []const u8 = if (is_mp4) "+faststart" else "1M";
+
+        const argv = [_][]const u8{
+            "ffmpeg",    "-y",
+            "-f",        "image2pipe",
+            "-c:v",      "mjpeg",
+            "-framerate", "10",
+            "-i",        "pipe:0",
+            "-vf",       "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-c:v",      codec,
+            "-crf",      "30",
+            "-pix_fmt",  "yuv420p",
+            "-threads",  "1",
+            extra_flag,  extra_val,
+            path,
+        };
+
+        var child = std.process.Child.init(&argv, allocator);
+        child.stdin_behavior = .Pipe;
+        child.stdout_behavior = .Ignore;
+        child.stderr_behavior = .Ignore;
+        child.spawn() catch return;
+
+        const stdin_file = child.stdin orelse return;
+
+        while (self.active.load(.acquire)) {
+            // Take JPEG screenshot via CDP
+            const sent_id = cap.cmd_id.next();
+            const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
+                \\{"format":"jpeg","quality":80}
+            , cap.session_id) catch {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+            defer allocator.free(cmd);
+
+            const raw = sendAndWait(cap.sender, cap.resp_map, cmd, sent_id, 5000) orelse {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+            defer allocator.free(raw);
+
+            const parsed = cdp.parseMessage(allocator, raw) catch {
+                std.Thread.sleep(100 * std.time.ns_per_ms);
+                continue;
+            };
+            defer parsed.parsed.deinit();
+
+            if (parsed.message.result) |result| {
+                if (cdp.getString(result, "data")) |base64_data| {
+                    const decoded_size = std.base64.standard.Decoder.calcSizeUpperBound(base64_data.len) catch continue;
+                    const buf = allocator.alloc(u8, decoded_size) catch continue;
+                    defer allocator.free(buf);
+
+                    std.base64.standard.Decoder.decode(buf, base64_data) catch continue;
+
+                    stdin_file.writeAll(buf[0..decoded_size]) catch break;
+                    _ = self.frame_count.fetchAdd(1, .monotonic);
+                }
+            }
+
+            std.Thread.sleep(100 * std.time.ns_per_ms);
+        }
+
+        // Close stdin to signal EOF to ffmpeg, then wait for it to finish
+        child.stdin.?.close();
+        child.stdin = null;
+        _ = child.wait() catch {};
+    }
+};
+
 const DialogInfo = struct {
     dialog_type: []u8, // "alert", "confirm", "prompt", "beforeunload"
     message: []u8,
@@ -975,6 +1099,20 @@ pub fn main() void {
             writeErr("Unknown profiler subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
         }
+    } else if (std.mem.eql(u8, cmd, "video")) {
+        const subcmd = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools video <start|stop> [path]\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, subcmd, "start")) {
+            const path = args_iter.next();
+            sendAction(session, "video_start", path, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "stop")) {
+            sendAction(session, "video_stop", null, null, daemon_opts);
+        } else {
+            writeErr("Unknown video subcommand: {s}\n", .{subcmd});
+            std.process.exit(1);
+        }
     } else if (isPlannedCommand(cmd)) {
         writeErr("{s}: not yet implemented\n", .{cmd});
         std.process.exit(1);
@@ -1770,6 +1908,7 @@ fn runDaemon() void {
     var trace_complete = std.atomic.Value(bool).init(false);
     var trace_active = std.atomic.Value(bool).init(false);
     var trace_mutex: std.Thread.Mutex = .{};
+    var video_recorder: VideoRecorder = .{};
 
     // Set read timeout for receiver thread polling (200ms)
     ws.setReadTimeout(200);
@@ -1843,6 +1982,7 @@ fn runDaemon() void {
         .trace_complete = &trace_complete,
         .trace_active = &trace_active,
         .trace_mutex = &trace_mutex,
+        .video_recorder = &video_recorder,
     };
 
     const MAX_WORKERS = 8;
@@ -2319,6 +2459,7 @@ const DaemonContext = struct {
     trace_complete: *std.atomic.Value(bool),
     trace_active: *std.atomic.Value(bool),
     trace_mutex: *std.Thread.Mutex,
+    video_recorder: *VideoRecorder,
 };
 
 /// Send a CDP command and wait for the response. Returns raw message bytes (caller must free).
@@ -3014,6 +3155,10 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lock();
         defer ctx.ref_map_rwlock.unlock();
         return handleScreenshotAnnotate(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
+    } else if (std.mem.eql(u8, req.action, "video_start")) {
+        return handleVideoStart(allocator, sender, resp_map, cmd_id, session_id, ctx.video_recorder, req.url);
+    } else if (std.mem.eql(u8, req.action, "video_stop")) {
+        return handleVideoStop(allocator, ctx.video_recorder);
     } else {
         return respondErr(allocator, "Unknown action");
     }
@@ -7431,6 +7576,84 @@ fn handleTraceStop(
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
 }
 
+fn handleVideoStart(
+    allocator: Allocator,
+    sender: *WsSender,
+    resp_map: *response_map_mod.ResponseMap,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    video_recorder: *VideoRecorder,
+    path_opt: ?[]const u8,
+) []u8 {
+    // Check if ffmpeg is available
+    const ffmpeg_check_argv = [_][]const u8{ "ffmpeg", "-version" };
+    var ffmpeg_check = std.process.Child.init(&ffmpeg_check_argv, allocator);
+    ffmpeg_check.stdin_behavior = .Ignore;
+    ffmpeg_check.stdout_behavior = .Ignore;
+    ffmpeg_check.stderr_behavior = .Ignore;
+    ffmpeg_check.spawn() catch {
+        return respondErr(allocator, "ffmpeg not found — install ffmpeg and ensure it is in PATH");
+    };
+    _ = ffmpeg_check.wait() catch {
+        return respondErr(allocator, "ffmpeg not found — install ffmpeg and ensure it is in PATH");
+    };
+
+    // Build output path
+    var file_path_buf: [512]u8 = undefined;
+    const file_path = if (path_opt) |p| p else blk: {
+        const home = daemon.getenv("HOME") orelse "/tmp";
+        const ts = @as(u64, @intCast(@max(0, std.time.timestamp())));
+        const fp = std.fmt.bufPrint(&file_path_buf, "{s}/.agent-devtools/recordings/video-{d}.webm", .{ home, ts }) catch
+            return respondErr(allocator, "path error");
+        break :blk fp;
+    };
+
+    // Ensure directory exists
+    if (std.mem.lastIndexOfScalar(u8, file_path, '/')) |slash| {
+        std.fs.cwd().makePath(file_path[0..slash]) catch {};
+    }
+
+    video_recorder.start(allocator, sender, resp_map, cmd_id, session_id, file_path) catch |err| {
+        if (err == error.AlreadyRecording) {
+            return respondErr(allocator, "video recording already active — stop first");
+        }
+        return respondErr(allocator, "failed to start video recording");
+    };
+
+    // Build response
+    var resp_buf: std.ArrayList(u8) = .empty;
+    defer resp_buf.deinit(allocator);
+    const rw = resp_buf.writer(allocator);
+    rw.writeAll("{\"recording\":true,\"path\":") catch return respondOk(allocator);
+    cdp.writeJsonString(rw, file_path) catch return respondOk(allocator);
+    rw.writeAll("}") catch return respondOk(allocator);
+    const data = resp_buf.toOwnedSlice(allocator) catch return respondOk(allocator);
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
+}
+
+fn handleVideoStop(allocator: Allocator, video_recorder: *VideoRecorder) []u8 {
+    const frame_count = video_recorder.stop() catch |err| {
+        if (err == error.NotRecording) {
+            return respondErr(allocator, "no video recording active — start first");
+        }
+        return respondErr(allocator, "failed to stop video recording");
+    };
+
+    const path = video_recorder.path[0..video_recorder.path_len];
+
+    // Build response
+    var resp_buf: std.ArrayList(u8) = .empty;
+    defer resp_buf.deinit(allocator);
+    const rw = resp_buf.writer(allocator);
+    rw.writeAll("{\"recording\":false,\"path\":") catch return respondOk(allocator);
+    cdp.writeJsonString(rw, path) catch return respondOk(allocator);
+    std.fmt.format(rw, ",\"frames\":{d}}}", .{frame_count}) catch return respondOk(allocator);
+    const data = resp_buf.toOwnedSlice(allocator) catch return respondOk(allocator);
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
+}
+
 /// screenshot --annotate: take a snapshot, inject ref labels, screenshot, remove overlay
 fn handleScreenshotAnnotate(
     allocator: Allocator,
@@ -7562,7 +7785,7 @@ fn handleScreenshotAnnotate(
 }
 
 fn isPlannedCommand(cmd: []const u8) bool {
-    const planned = [_][]const u8{ "diff-screenshot", "video" };
+    const planned = [_][]const u8{"diff-screenshot"};
     for (planned) |p| {
         if (std.mem.eql(u8, cmd, p)) return true;
     }
@@ -7706,6 +7929,8 @@ fn printUsage() void {
         \\  trace stop [path]         Stop tracing and save trace file (JSON)
         \\  profiler start            Start CPU profiler via tracing
         \\  profiler stop [path]      Stop profiler and save trace file (JSON)
+        \\  video start [path]        Start video recording (requires ffmpeg)
+        \\  video stop                Stop video recording and save file
         \\  screenshot --annotate [p] Screenshot with ref labels overlaid (-a)
         \\
         \\Dialog:
@@ -8675,8 +8900,58 @@ test "isContentAction: non-content actions" {
 
 test "isPlannedCommand: new planned commands" {
     try std.testing.expect(!isPlannedCommand("annotate-screenshot"));
-    try std.testing.expect(isPlannedCommand("video"));
+    try std.testing.expect(!isPlannedCommand("video"));
     try std.testing.expect(!isPlannedCommand("trace"));
     try std.testing.expect(!isPlannedCommand("profiler"));
     try std.testing.expect(isPlannedCommand("diff-screenshot"));
+}
+
+// ============================================================================
+// Tests: VideoRecorder
+// ============================================================================
+
+test "VideoRecorder: initial state" {
+    var rec: VideoRecorder = .{};
+    try std.testing.expect(!rec.active.load(.acquire));
+    try std.testing.expectEqual(@as(u64, 0), rec.frame_count.load(.acquire));
+    try std.testing.expectEqual(@as(?std.Thread, null), rec.thread);
+    try std.testing.expectEqual(@as(usize, 0), rec.path_len);
+}
+
+test "VideoRecorder: stop without start returns error" {
+    var rec: VideoRecorder = .{};
+    const result = rec.stop();
+    try std.testing.expectError(error.NotRecording, result);
+}
+
+test "VideoRecorder: double start detection" {
+    var rec: VideoRecorder = .{};
+    // Simulate active state
+    rec.active.store(true, .release);
+    defer rec.active.store(false, .release);
+
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    // start should fail with AlreadyRecording when active
+    const result = rec.start(gpa.allocator(), undefined, undefined, undefined, null, "test.webm");
+    try std.testing.expectError(error.AlreadyRecording, result);
+}
+
+test "VideoRecorder: path storage" {
+    var rec: VideoRecorder = .{};
+    const test_path = "/tmp/test-video.webm";
+    @memcpy(rec.path[0..test_path.len], test_path);
+    rec.path_len = test_path.len;
+    try std.testing.expectEqualStrings(test_path, rec.path[0..rec.path_len]);
+}
+
+test "VideoRecorder: frame_count atomic operations" {
+    var rec: VideoRecorder = .{};
+    try std.testing.expectEqual(@as(u64, 0), rec.frame_count.load(.acquire));
+    _ = rec.frame_count.fetchAdd(1, .monotonic);
+    try std.testing.expectEqual(@as(u64, 1), rec.frame_count.load(.acquire));
+    _ = rec.frame_count.fetchAdd(5, .monotonic);
+    try std.testing.expectEqual(@as(u64, 6), rec.frame_count.load(.acquire));
+    rec.frame_count.store(0, .release);
+    try std.testing.expectEqual(@as(u64, 0), rec.frame_count.load(.acquire));
 }
