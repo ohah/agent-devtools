@@ -797,10 +797,34 @@ pub fn main() void {
         };
         sendAction(session, "hover", target, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "eval")) {
-        const expr = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools eval <expression>\n", .{});
+        const first = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools eval <expression> | eval --stdin | eval -b <base64>\n", .{});
             std.process.exit(1);
         };
+        const pa = std.heap.page_allocator;
+        const expr: []const u8 = if (std.mem.eql(u8, first, "--stdin")) blk: {
+            const data = std.fs.File.stdin().readToEndAlloc(pa, 16 * 1024 * 1024) catch {
+                writeErr("eval: failed to read stdin\n", .{});
+                std.process.exit(1);
+            };
+            break :blk std.mem.trimRight(u8, data, "\r\n");
+        } else if (std.mem.eql(u8, first, "-b") or std.mem.eql(u8, first, "--base64")) blk: {
+            const b64 = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools eval -b <base64-encoded-script>\n", .{});
+                std.process.exit(1);
+            };
+            const dec = std.base64.standard.Decoder;
+            const n = dec.calcSizeForSlice(b64) catch {
+                writeErr("eval: invalid base64\n", .{});
+                std.process.exit(1);
+            };
+            const out = pa.alloc(u8, n) catch std.process.exit(1);
+            dec.decode(out, b64) catch {
+                writeErr("eval: invalid base64\n", .{});
+                std.process.exit(1);
+            };
+            break :blk out;
+        } else first;
         sendAction(session, "eval", expr, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "back")) {
         sendAction(session, "back", null, null, daemon_opts);
@@ -985,7 +1009,7 @@ pub fn main() void {
         sendAction(session, "select_option", target, value, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "get")) {
         const what = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools get <url|title|text|html|value> [@ref]\n", .{});
+            writeErr("Usage: agent-devtools get <url|title|text|html|value|attr|count|cdp-url> [args]\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, what, "url")) {
@@ -1020,6 +1044,14 @@ pub fn main() void {
                 std.process.exit(1);
             };
             sendAction(session, "get_attr", target, attr_name, daemon_opts);
+        } else if (std.mem.eql(u8, what, "cdp-url")) {
+            sendAction(session, "cdp_url", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "count")) {
+            const sel = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get count <css-selector>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "count", sel, null, daemon_opts);
         } else {
             writeErr("Unknown: get {s}\n", .{what});
             std.process.exit(1);
@@ -1465,6 +1497,18 @@ fn parseHttpHostPort(url: []const u8) ?HostPort {
         return .{ .host = host, .port = port };
     }
     return .{ .host = authority, .port = default_port };
+}
+
+/// `get count <selector>` → querySelectorAll 길이를 문자열로 반환하는 JS 표현식.
+/// selector는 JSON 문자열로 인코딩해 인젝션/특수문자 안전.
+fn buildCountExpr(allocator: Allocator, selector: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("String(document.querySelectorAll(");
+    try cdp.writeJsonString(w, selector);
+    try w.writeAll(").length)");
+    return buf.toOwnedSlice(allocator);
 }
 
 fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8, daemon_opts: daemon.DaemonOptions) void {
@@ -2584,6 +2628,7 @@ fn runDaemon() void {
         .trace_active = &trace_active,
         .trace_mutex = &trace_mutex,
         .video_recorder = &video_recorder,
+        .cdp_url = ws_url,
     };
 
     const MAX_WORKERS = 8;
@@ -3079,6 +3124,7 @@ const DaemonContext = struct {
     trace_active: *std.atomic.Value(bool),
     trace_mutex: *std.Thread.Mutex,
     video_recorder: *VideoRecorder,
+    cdp_url: []const u8 = "", // 연결된 CDP WebSocket URL (get cdp-url)
 };
 
 /// Send a CDP command and wait for the response. Returns raw message bytes (caller must free).
@@ -3625,6 +3671,16 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "document.title");
+    } else if (std.mem.eql(u8, req.action, "cdp_url")) {
+        var resp: std.ArrayList(u8) = .empty;
+        defer resp.deinit(allocator);
+        cdp.writeJsonString(resp.writer(allocator), ctx.cdp_url) catch return respondErr(allocator, "write error");
+        return daemon.serializeResponse(allocator, .{ .success = true, .data = resp.items }) catch respondErr(allocator, "resp error");
+    } else if (std.mem.eql(u8, req.action, "count")) {
+        const sel = req.url orelse return respondErr(allocator, "selector required");
+        const expr = buildCountExpr(allocator, sel) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(expr);
+        return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
     } else if (std.mem.eql(u8, req.action, "wait")) {
         const ms_str = req.url orelse "1000";
         const ms = std.fmt.parseInt(u32, ms_str, 10) catch 1000;
@@ -10998,6 +11054,17 @@ test "parseHttpHostPort: rejects non-http and malformed" {
     try std.testing.expect(parseHttpHostPort("ws://x:1") == null);
     try std.testing.expect(parseHttpHostPort("http://") == null);
     try std.testing.expect(parseHttpHostPort("http://h:notaport") == null);
+}
+
+test "buildCountExpr: JSON-encodes selector into querySelectorAll" {
+    const a = std.testing.allocator;
+    const e1 = try buildCountExpr(a, "div.item");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("String(document.querySelectorAll(\"div.item\").length)", e1);
+    // injection-safe: quotes/backslashes escaped
+    const e2 = try buildCountExpr(a, "a[href=\"x\"]");
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("String(document.querySelectorAll(\"a[href=\\\"x\\\"]\").length)", e2);
 }
 
 test "buildDebugResponse: merges debug into response" {
