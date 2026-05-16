@@ -1023,14 +1023,52 @@ pub fn main() void {
         sendAction(session, "diff", name, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "find")) {
         const strategy = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools find <role|text|label|placeholder|testid> <value>\n", .{});
+            writeErr("Usage: agent-devtools find <role|text|label|placeholder|alt|title|testid|first|last|nth> <value> [action] [text] [--name N] [--exact]\n", .{});
             std.process.exit(1);
         };
-        const value = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools find {s} <value>\n", .{strategy});
+        var value = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools find {s} <value> [action] [text]\n", .{strategy});
             std.process.exit(1);
         };
-        sendAction(session, "find", strategy, value, daemon_opts);
+        // nth는 `find nth <index> <selector>` 순서 — value(=index) 다음이 selector
+        var nth_idx: i64 = 0;
+        if (std.mem.eql(u8, strategy, "nth")) {
+            nth_idx = std.fmt.parseInt(i64, value, 10) catch {
+                writeErr("find nth <index> <selector>: index must be numeric\n", .{});
+                std.process.exit(1);
+            };
+            value = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools find nth <index> <selector> [action]\n", .{});
+                std.process.exit(1);
+            };
+        }
+        // 남은 토큰: [action] [text...] [--name <n>] [--exact] → extra(JSON)로 전달
+        var act: ?[]const u8 = null;
+        var name: ?[]const u8 = null;
+        var exact = false;
+        var txt_buf: std.ArrayList(u8) = .empty;
+        while (args_iter.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--exact")) {
+                exact = true;
+            } else if (std.mem.eql(u8, tok, "--name")) {
+                name = args_iter.next();
+            } else if (act == null) {
+                act = tok;
+            } else {
+                if (txt_buf.items.len > 0) txt_buf.append(std.heap.page_allocator, ' ') catch {};
+                txt_buf.appendSlice(std.heap.page_allocator, tok) catch {};
+            }
+        }
+        var ebuf: std.ArrayList(u8) = .empty;
+        const ew = ebuf.writer(std.heap.page_allocator);
+        ew.writeAll("{\"act\":") catch {};
+        cdp.writeJsonString(ew, act orelse "") catch {};
+        ew.writeAll(",\"txt\":") catch {};
+        cdp.writeJsonString(ew, txt_buf.items) catch {};
+        ew.writeAll(",\"name\":") catch {};
+        cdp.writeJsonString(ew, name orelse "") catch {};
+        ew.print(",\"exact\":{s},\"idx\":{d}}}", .{ if (exact) "true" else "false", nth_idx }) catch {};
+        sendActionEx(session, "find", strategy, value, ebuf.items, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "dialog")) {
         const subcmd = args_iter.next() orelse {
             writeErr("Usage: agent-devtools dialog <accept|dismiss|info> [text]\n", .{});
@@ -3563,7 +3601,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "find")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
-        return handleFind(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url, req.pattern);
+        return handleFind(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "dialog_accept")) {
         return handleDialogAccept(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "dialog_dismiss")) {
@@ -6156,9 +6194,189 @@ fn handleStatusFull(allocator: Allocator, collector: *const network.Collector, c
 // Find (Semantic Element Queries)
 // ============================================================================
 
-fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, strategy_opt: ?[]const u8, value_opt: ?[]const u8) []u8 {
+/// strategy → DOM 속성명. placeholder/testid/alt/title 지원.
+fn findAttrName(strategy: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, strategy, "placeholder")) return "placeholder";
+    if (std.mem.eql(u8, strategy, "testid")) return "data-testid";
+    if (std.mem.eql(u8, strategy, "alt")) return "alt";
+    if (std.mem.eql(u8, strategy, "title")) return "title";
+    return null;
+}
+
+/// 한 backend 노드의 DOM 속성값을 해석 (호출자 free). 실패/없음 시 null.
+/// firstAttrRefId 와 find 목록(attr) 경로가 공유 — CDP 파이프라인 1곳화.
+fn resolveEntryAttr(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, backend_id: i64, attr: []const u8) ?[]u8 {
+    const oid = resolveNodeObjectId(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse return null;
+    defer allocator.free(oid);
+    const cp = buildCallFunctionOnParams(allocator, oid, "function(a){return this.getAttribute(a)}", attr) orelse return null;
+    defer allocator.free(cp);
+    const cid = cmd_id.next();
+    const cc = cdp.serializeCommand(allocator, cid, "Runtime.callFunctionOn", cp, session_id) catch return null;
+    defer allocator.free(cc);
+    const raw = sendAndWait(sender, resp_map, cc, cid, 3_000) orelse return null;
+    defer allocator.free(raw);
+    const parsed = cdp.parseMessage(allocator, raw) catch return null;
+    defer parsed.parsed.deinit();
+    if (parsed.message.isResponse()) if (parsed.message.result) |r| {
+        if (cdp.getObject(r, "result")) |ro| if (cdp.getString(ro, "value")) |av| {
+            return allocator.dupe(u8, av) catch null;
+        };
+    };
+    return null;
+}
+
+/// role/text/label 매칭 술어 (목록·액션 경로 공유 — --exact/--name 일관 적용).
+/// role: role 정확 일치 + (name_filter 비어있지 않으면 name이 name_filter
+/// 포함/정확). text/label: name이 value 포함(exact면 정확).
+fn axMatches(role: []const u8, name: []const u8, strategy: []const u8, value: []const u8, exact: bool, name_filter: []const u8) bool {
+    if (std.mem.eql(u8, strategy, "role")) {
+        if (!std.mem.eql(u8, role, value)) return false;
+        if (name_filter.len == 0) return true;
+        return if (exact) std.mem.eql(u8, name, name_filter) else std.mem.indexOf(u8, name, name_filter) != null;
+    }
+    return if (exact) std.mem.eql(u8, name, value) else std.mem.indexOf(u8, name, value) != null;
+}
+
+/// DOM 속성 기반(placeholder/testid/alt/title) 첫 일치 ref_id (포함 매칭).
+fn firstAttrRefId(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, strategy: []const u8, value: []const u8) ?[]const u8 {
+    const attr = findAttrName(strategy) orelse return null;
+    var it = ref_map.entries.iterator();
+    var checked: usize = 0;
+    while (it.next()) |entry| {
+        if (checked >= 200) break;
+        checked += 1;
+        const e = entry.value_ptr.*;
+        const backend_id = e.backend_node_id orelse continue;
+        const av = resolveEntryAttr(allocator, sender, resp_map, cmd_id, session_id, backend_id, attr) orelse continue;
+        defer allocator.free(av);
+        if (std.mem.indexOf(u8, av, value) != null) return e.ref_id;
+    }
+    return null;
+}
+
+/// 해석된 ref에 액션 위임 (click/hover/fill/type/check/text).
+fn dispatchFindAction(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, act: []const u8, ref_id: []const u8, txt: []const u8) []u8 {
+    if (std.mem.eql(u8, act, "click") or std.mem.eql(u8, act, "hover"))
+        return handleClick(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id);
+    if (std.mem.eql(u8, act, "fill") or std.mem.eql(u8, act, "type"))
+        return handleFill(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id, txt);
+    if (std.mem.eql(u8, act, "check"))
+        return handleCheck(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id);
+    if (std.mem.eql(u8, act, "text"))
+        return handleGetElementProp(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id, "get_text");
+    return respondErr(allocator, "find: unknown action (click/hover/fill/type/check/text)");
+}
+
+/// find first|last|nth <selector> [action] — querySelectorAll 기반 JS 직접 수행.
+fn handleFindNth(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, strategy: []const u8, selector: []const u8, opts: FindOpts) []u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    w.writeAll("(function(){var els=document.querySelectorAll(") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(w, selector) catch return respondErr(allocator, "write error");
+    w.writeAll(");if(!els.length)return 'NOMATCH';var i=") catch return respondErr(allocator, "write error");
+    if (std.mem.eql(u8, strategy, "first")) {
+        w.writeAll("0") catch {};
+    } else if (std.mem.eql(u8, strategy, "last")) {
+        w.writeAll("els.length-1") catch {};
+    } else {
+        // nth: 음수 인덱스는 뒤에서부터 (Playwright와 동일)
+        if (opts.idx < 0) {
+            std.fmt.format(w, "els.length{d}", .{opts.idx}) catch {};
+        } else {
+            std.fmt.format(w, "{d}", .{opts.idx}) catch {};
+        }
+    }
+    w.writeAll(";var el=els[i];if(!el)return 'NOMATCH';") catch {};
+    const act = opts.act;
+    if (act.len == 0 or std.mem.eql(u8, act, "click") or std.mem.eql(u8, act, "hover")) {
+        w.writeAll("el.click();return 'OK'})()") catch {};
+    } else if (std.mem.eql(u8, act, "text")) {
+        w.writeAll("return (el.innerText||el.textContent||'')})()") catch {};
+    } else if (std.mem.eql(u8, act, "fill") or std.mem.eql(u8, act, "type")) {
+        w.writeAll("el.focus();el.value=") catch {};
+        cdp.writeJsonString(w, opts.txt) catch {};
+        w.writeAll(";el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'OK'})()") catch {};
+    } else if (std.mem.eql(u8, act, "check")) {
+        w.writeAll("if(el.type==='checkbox'||el.type==='radio'){el.checked=true;el.dispatchEvent(new Event('change',{bubbles:true}))}else{el.click()}return 'OK'})()") catch {};
+    } else {
+        // dispatchFindAction과 동일하게 미지원 액션은 에러 (조용한 click 금지)
+        return respondErr(allocator, "find: unknown action (click/hover/fill/type/check/text)");
+    }
+    const expr = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(expr);
+    return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
+}
+
+/// find의 extra(JSON) 파싱 — act/txt/name/exact. (순수, 테스트 가능)
+/// act/txt/name: 빈 문자열은 "" 리터럴(비할당) 센티넬, len>0이면 heap 소유.
+const FindOpts = struct {
+    act: []const u8 = "",
+    txt: []const u8 = "",
+    name: []const u8 = "",
+    exact: bool = false,
+    idx: i64 = 0,
+    fn deinit(self: FindOpts, allocator: Allocator) void {
+        if (self.act.len > 0) allocator.free(@constCast(self.act));
+        if (self.txt.len > 0) allocator.free(@constCast(self.txt));
+        if (self.name.len > 0) allocator.free(@constCast(self.name));
+    }
+};
+fn parseFindOpts(allocator: Allocator, json_opt: ?[]const u8) FindOpts {
+    const j = json_opt orelse return .{};
+    const p = std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch return .{};
+    defer p.deinit();
+    const dup = struct {
+        fn d(a: Allocator, v: std.json.Value, k: []const u8) []const u8 {
+            const s = cdp.getString(v, k) orelse return "";
+            if (s.len == 0) return "";
+            return a.dupe(u8, s) catch "";
+        }
+    }.d;
+    return .{
+        .act = dup(allocator, p.value, "act"),
+        .txt = dup(allocator, p.value, "txt"),
+        .name = dup(allocator, p.value, "name"),
+        .exact = cdp.getBool(p.value, "exact") orelse false,
+        .idx = cdp.getInt(p.value, "idx") orelse 0,
+    };
+}
+
+/// role/text/label 로케이터로 ref_map에서 첫 일치 ref_id 반환. (순수, 테스트 가능)
+/// role: 정확 일치. text/label: name에 value 포함(exact면 정확 일치).
+fn firstAxRefId(ref_map: *const snapshot_mod.RefMap, strategy: []const u8, value: []const u8, exact: bool, name_filter: []const u8) ?[]const u8 {
+    var it = ref_map.entries.iterator();
+    while (it.next()) |entry| {
+        const e = entry.value_ptr.*;
+        if (axMatches(e.role, e.name, strategy, value, exact, name_filter)) return e.ref_id;
+    }
+    return null;
+}
+
+fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, strategy_opt: ?[]const u8, value_opt: ?[]const u8, extra_opt: ?[]const u8) []u8 {
     const strategy = strategy_opt orelse return respondErr(allocator, "strategy required");
     const value = value_opt orelse return respondErr(allocator, "value required");
+
+    const opts = parseFindOpts(allocator, extra_opt);
+    defer opts.deinit(allocator);
+
+    // first/last/nth — CSS 셀렉터 기반: JS로 직접 요소 선택 + 액션 수행
+    if (std.mem.eql(u8, strategy, "first") or std.mem.eql(u8, strategy, "last") or std.mem.eql(u8, strategy, "nth")) {
+        return handleFindNth(allocator, sender, resp_map, cmd_id, session_id, strategy, value, opts);
+    }
+
+    // 액션이 주어지면 첫 일치 요소에 위임 (role/text/label은 ref_map에서 즉시 해석)
+    if (opts.act.len > 0) {
+        const ref_id = blk: {
+            if (std.mem.eql(u8, strategy, "role") or std.mem.eql(u8, strategy, "text") or std.mem.eql(u8, strategy, "label")) {
+                break :blk firstAxRefId(ref_map, strategy, value, opts.exact, opts.name);
+            }
+            // placeholder/testid/alt/title: DOM 속성으로 첫 일치 ref 탐색
+            break :blk firstAttrRefId(allocator, sender, resp_map, cmd_id, session_id, ref_map, strategy, value);
+        } orelse return respondErr(allocator, "find: no element matched (run `snapshot -i` first)");
+
+        return dispatchFindAction(allocator, sender, resp_map, cmd_id, session_id, ref_map, opts.act, ref_id, opts.txt);
+    }
 
     if (std.mem.eql(u8, strategy, "role") or std.mem.eql(u8, strategy, "text") or std.mem.eql(u8, strategy, "label")) {
         // Search through ref_map entries
@@ -6171,11 +6389,8 @@ fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
         var it = ref_map.entries.iterator();
         while (it.next()) |entry| {
             const ref_entry = entry.value_ptr.*;
-            const matches = if (std.mem.eql(u8, strategy, "role"))
-                std.mem.eql(u8, ref_entry.role, value)
-            else
-                // text and label both match on the accessible name
-                std.mem.indexOf(u8, ref_entry.name, value) != null;
+            // 액션 경로와 동일 술어 — 목록 경로도 --exact/--name 일관 적용
+            const matches = axMatches(ref_entry.role, ref_entry.name, strategy, value, opts.exact, opts.name);
 
             if (matches) {
                 if (!first) writer.writeByte(',') catch {};
@@ -6194,9 +6409,8 @@ fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
         const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
         defer allocator.free(data);
         return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
-    } else if (std.mem.eql(u8, strategy, "placeholder") or std.mem.eql(u8, strategy, "testid")) {
-        // For placeholder/testid, we need DOM access: resolve each ref and check attribute
-        const attr_name = if (std.mem.eql(u8, strategy, "testid")) "data-testid" else "placeholder";
+    } else if (findAttrName(strategy)) |attr_name| {
+        // placeholder/testid/alt/title: DOM 속성으로 매칭
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
@@ -6254,7 +6468,7 @@ fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
         defer allocator.free(data);
         return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
     } else {
-        return respondErr(allocator, "unknown find strategy (use: role, text, label, placeholder, testid)");
+        return respondErr(allocator, "unknown find strategy (role|text|label|placeholder|alt|title|testid|first|last|nth)");
     }
 }
 
@@ -9408,8 +9622,9 @@ fn printUsage() void {
         \\  styles <@ref> <prop>      Get computed CSS style value
         \\  highlight <@ref>          Highlight element with overlay
         \\
-        \\Find Elements:  agent-devtools find <locator> <value>
-        \\  role, text, label, placeholder, testid
+        \\Find Elements:  agent-devtools find <locator> <value> [action] [text] [--name N] [--exact]
+        \\  locators: role text label placeholder alt title testid | first/last <sel> | nth <i> <sel>
+        \\  action(생략 시 매칭 목록): click hover fill type check text
         \\
         \\Mouse:  agent-devtools mouse <action> [args]
         \\  move <x> <y>, down, up
@@ -10282,6 +10497,59 @@ test "buildDynamicBoundaries: keeps only dynamic boundaries" {
     try std.testing.expectEqual(@as(usize, 3), out.value.array.items.len); // 2,3,4 — not 1, not the string
     try std.testing.expectEqual(@as(i64, 2), out.value.array.items[0].object.get("id").?.integer);
     try std.testing.expectEqual(@as(i64, 4), out.value.array.items[2].object.get("id").?.integer);
+}
+
+test "findAttrName: maps strategies, rejects unknown" {
+    try std.testing.expectEqualStrings("placeholder", findAttrName("placeholder").?);
+    try std.testing.expectEqualStrings("data-testid", findAttrName("testid").?);
+    try std.testing.expectEqualStrings("alt", findAttrName("alt").?);
+    try std.testing.expectEqualStrings("title", findAttrName("title").?);
+    try std.testing.expect(findAttrName("role") == null);
+}
+
+test "parseFindOpts: parses act/txt/name/exact/idx; null → defaults" {
+    const a = std.testing.allocator;
+    const o = parseFindOpts(a, "{\"act\":\"fill\",\"txt\":\"hi there\",\"name\":\"\",\"exact\":true,\"idx\":-1}");
+    defer o.deinit(a);
+    try std.testing.expectEqualStrings("fill", o.act);
+    try std.testing.expectEqualStrings("hi there", o.txt);
+    try std.testing.expectEqualStrings("", o.name);
+    try std.testing.expect(o.exact);
+    try std.testing.expectEqual(@as(i64, -1), o.idx);
+
+    const d = parseFindOpts(a, null);
+    try std.testing.expectEqualStrings("", d.act);
+    try std.testing.expect(!d.exact);
+    try std.testing.expectEqual(@as(i64, 0), d.idx);
+}
+
+test "firstAxRefId: role exact, text/label contains vs exact" {
+    const a = std.testing.allocator;
+    var rm = snapshot_mod.RefMap.init(a);
+    defer rm.deinit();
+    _ = try rm.addRef(1, "button", "Submit form");
+    _ = try rm.addRef(2, "link", "Home");
+    // role: 정확 일치
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", false, "") != null);
+    try std.testing.expect(firstAxRefId(&rm, "role", "butto", false, "") == null);
+    // text: 포함 매칭
+    try std.testing.expect(firstAxRefId(&rm, "text", "Submit", false, "") != null);
+    // exact: 정확 일치만
+    try std.testing.expect(firstAxRefId(&rm, "text", "Submit", true, "") == null);
+    try std.testing.expect(firstAxRefId(&rm, "label", "Home", true, "") != null);
+    // --name: role + accessible name 필터
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", false, "Submit") != null);
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", false, "Cancel") == null);
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", true, "Submit") == null); // exact name != "Submit form"
+}
+
+test "axMatches: shared predicate honors exact + name filter" {
+    try std.testing.expect(axMatches("button", "Submit form", "role", "button", false, ""));
+    try std.testing.expect(axMatches("button", "Submit form", "role", "button", false, "Submit"));
+    try std.testing.expect(!axMatches("button", "Submit form", "role", "button", true, "Submit"));
+    try std.testing.expect(!axMatches("link", "Submit", "role", "button", false, ""));
+    try std.testing.expect(axMatches("link", "Click here", "text", "here", false, ""));
+    try std.testing.expect(!axMatches("link", "Click here", "text", "here", true, ""));
 }
 
 test "buildDynamicBoundaries: empty input yields empty array" {
