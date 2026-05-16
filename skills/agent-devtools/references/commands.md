@@ -5,6 +5,7 @@
 |---|---|
 | `open <url>` | Navigate (aliases: navigate, goto) |
 | `back` / `forward` / `reload` | History navigation |
+| `pushstate <url>` | SPA client-side navigation (history.pushState) |
 | `close` | Close browser + daemon |
 | `url` / `title` | Get current URL / title |
 | `content` / `setcontent <html>` | Get/set page HTML |
@@ -14,6 +15,7 @@
 | Command | Description |
 |---|---|
 | `snapshot -i` | Interactive elements only (recommended) |
+| `snapshot -u` | Include link href URLs (combine: `-i -u`) |
 | `snapshot` | Full accessibility tree |
 | `click` / `dblclick` / `tap @ref` | Click / double-click / touch tap |
 | `fill @ref "text"` | Clear + type |
@@ -51,6 +53,16 @@
 | `screenshot [path]` | PNG screenshot |
 | `pdf [path]` | PDF export |
 | `eval <js>` | Run JavaScript |
+| `vitals [url]` | Core Web Vitals (LCP/CLS/FCP/INP) + TTFB |
+| `video/trace/profiler start/stop [path]` | Recording/profiling |
+
+## React Introspection (requires `--enable=react-devtools` at launch)
+| Command | Description |
+|---|---|
+| `react tree` | Component tree (JSON) |
+| `react inspect <fiberId>` | Fiber props / hooks / state |
+| `react renders start` / `stop` | Render profiling (fps, mounts, re-renders) |
+| `react suspense [--only-dynamic]` | Suspense boundary analysis |
 
 ## Network
 | Command | Description |
@@ -60,6 +72,7 @@
 | `network clear` | Clear |
 | `analyze` | API reverse engineering + schema |
 | `intercept mock/fail/delay <pattern>` | Mock/block/delay |
+| `intercept ... --resource-type <csv>` | Limit to CDP resourceType (Document/XHR/Script/…) |
 | `intercept remove/list/clear` | Manage rules |
 | `har [file]` | Export HAR 1.2 |
 
@@ -86,6 +99,7 @@
 | Command | Description |
 |---|---|
 | `cookies list/set/get/clear` | Cookies |
+| `cookies set --curl <file>` | Bulk import (JSON / cURL dump / Cookie header) |
 | `storage local/session [key]` | Web storage |
 | `state save/load/list` | Full state persistence |
 | `credentials <user> <pass>` | HTTP auth |
@@ -96,9 +110,20 @@
 | `tab list/new/close/switch/count` | Tab management |
 | `console list/clear` | Console messages |
 | `errors [clear]` | Page errors |
-| `dialog accept/dismiss/info` | Dialog handling |
+| `dialog accept/dismiss/info` | Dialog handling (alert/beforeunload auto-dismissed by default) |
 | `record/diff/replay <name>` | Network recording |
 | `addscript <js>` / `addstyle <css>` | Page injection |
+| `removeinitscript <id>` | Remove script added by addscript/--init-script |
 | `pause` / `resume` | JS debugging |
 | `clipboard get/set` | Clipboard |
 | `status` | Daemon status |
+
+## Launch Flags (set on the command that starts the daemon)
+| Flag | Description |
+|---|---|
+| `--enable=react-devtools` | Install React DevTools hook → enables `react …` |
+| `--init-script=<path>` | Run a script before page JS (repeatable) |
+| `--no-auto-dialog` | Disable alert/beforeunload auto-dismiss |
+| `--proxy/--proxy-bypass/--extension` | Chrome launch options |
+| `--allowed-domains <list>` | Restrict navigation domains |
+| `--auto-connect` | Attach to running Chrome/Electron |
