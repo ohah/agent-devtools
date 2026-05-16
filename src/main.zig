@@ -337,11 +337,19 @@ pub fn main() void {
     };
 
     if (std.mem.eql(u8, cmd, "batch")) {
-        const bail = blk: {
-            while (args_iter.next()) |a| if (std.mem.eql(u8, a, "--bail")) break :blk true;
-            break :blk false;
-        };
-        const exit_code = runBatch(session, daemon_opts, bail);
+        // batch [--bail] [cmd1 cmd2 ...]  — 인라인 명령 있으면 stdin 대신 그것 실행
+        var bail = false;
+        var inline_cmds: std.ArrayList([]const u8) = .empty;
+        defer inline_cmds.deinit(std.heap.page_allocator);
+        while (args_iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--bail")) {
+                bail = true;
+            } else {
+                inline_cmds.append(std.heap.page_allocator, a) catch {};
+            }
+        }
+        const inline_slice: ?[]const []const u8 = if (inline_cmds.items.len > 0) inline_cmds.items else null;
+        const exit_code = runBatch(session, daemon_opts, bail, inline_slice);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -1003,7 +1011,13 @@ pub fn main() void {
         };
         sendAction(session, "pushstate", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "vitals")) {
-        sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
+        // vitals [url] [--json] — url은 첫 비플래그 인자. vitals 출력은 이미
+        // JSON이므로 --json은 호환을 위해 수용(동작 동일).
+        var vitals_url: ?[]const u8 = null;
+        while (args_iter.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "--") and vitals_url == null) vitals_url = a;
+        }
+        sendAction(session, "vitals", vitals_url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "react")) {
         const sub = args_iter.next() orelse {
             writeErr("Usage: agent-devtools react <tree|inspect|renders|suspense>\n", .{});
@@ -2361,7 +2375,23 @@ fn runDoctor(json_out: bool) void {
     write("  status  : {s}\n", .{if (ok) "ok" else "Chrome missing"});
 }
 
-fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) u8 {
+/// 한 batch 명령 줄 처리: parse→send→출력. 실패면 true.
+fn runBatchLine(allocator: Allocator, session: []const u8, line: []const u8, counter: usize) u8 {
+    var id_buf: [20]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{counter}) catch unreachable;
+    const resp: []u8 = blk: {
+        const data = parseTextCommand(allocator, line, id_str) orelse
+            break :blk allocator.dupe(u8, "{\"success\":false,\"error\":\"parse error\"}") catch return 2;
+        defer allocator.free(data);
+        break :blk sendOneCommand(allocator, session, data) catch
+            allocator.dupe(u8, "{\"success\":false,\"error\":\"daemon send/recv failed\"}") catch return 2;
+    };
+    defer allocator.free(resp);
+    writeLine(resp);
+    return if (responseFailed(allocator, resp)) 1 else 0;
+}
+
+fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool, inline_cmds: ?[]const []const u8) u8 {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
@@ -2372,6 +2402,24 @@ fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) 
     };
     if (started) writeErr("Started daemon (session: {s})\n", .{session});
 
+    var had_failure = false;
+    var counter: usize = 1;
+
+    if (inline_cmds) |cmds| {
+        for (cmds) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const r = runBatchLine(allocator, session, line, counter);
+            counter += 1;
+            if (r == 2) return 1;
+            if (r == 1) {
+                had_failure = true;
+                if (bail) return 1;
+            }
+        }
+        return if (had_failure) 1 else 0;
+    }
+
     const stdin = std.fs.File.stdin();
     const input = stdin.readToEndAlloc(allocator, 16 * 1024 * 1024) catch {
         writeErr("batch: failed to read stdin\n", .{});
@@ -2379,28 +2427,14 @@ fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) 
     };
     defer allocator.free(input);
 
-    var had_failure = false;
-    var counter: usize = 1;
     var it = std.mem.splitScalar(u8, input, '\n');
     while (it.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-
-        var id_buf: [20]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{counter}) catch unreachable; // [20]u8는 usize 10진수 충분
+        const r = runBatchLine(allocator, session, line, counter);
         counter += 1;
-
-        const resp: []u8 = blk: {
-            const data = parseTextCommand(allocator, line, id_str) orelse
-                break :blk allocator.dupe(u8, "{\"success\":false,\"error\":\"parse error\"}") catch return 1;
-            defer allocator.free(data);
-            break :blk sendOneCommand(allocator, session, data) catch
-                allocator.dupe(u8, "{\"success\":false,\"error\":\"daemon send/recv failed\"}") catch return 1;
-        };
-        defer allocator.free(resp);
-        writeLine(resp);
-
-        if (responseFailed(allocator, resp)) {
+        if (r == 2) return 1;
+        if (r == 1) {
             had_failure = true;
             if (bail) return 1;
         }
