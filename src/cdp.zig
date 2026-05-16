@@ -234,6 +234,16 @@ pub fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]
     return buf.toOwnedSlice(allocator);
 }
 
+/// CDP exceptionDetails 객체 → 사람이 읽을 메시지.
+/// exception.description 우선(가장 구체적), 없으면 exceptionDetails.text.
+pub fn exceptionMessage(details: std.json.Value) []const u8 {
+    if (getObject(details, "exception")) |exc| {
+        if (getString(exc, "description")) |d| return d;
+    }
+    if (getString(details, "text")) |t| return t;
+    return "script threw an exception";
+}
+
 /// Write a JSON-escaped string (with quotes) to a writer.
 pub fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
@@ -1173,6 +1183,27 @@ test "targetSetDiscoverTargets: discover=true" {
 // ============================================================================
 // Tests: writeJsonString edge cases
 // ============================================================================
+
+test "exceptionMessage: prefers exception.description, falls back to text" {
+    const a = testing.allocator;
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"exception":{"description":"TypeError: x is not a function"},"text":"Uncaught"}
+        , .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("TypeError: x is not a function", exceptionMessage(p.value));
+    }
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{\"text\":\"Uncaught (in promise)\"}", .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("Uncaught (in promise)", exceptionMessage(p.value));
+    }
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("script threw an exception", exceptionMessage(p.value));
+    }
+}
 
 test "writeJsonString: simple string" {
     var buf: std.ArrayList(u8) = .empty;

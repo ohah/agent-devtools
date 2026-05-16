@@ -734,6 +734,17 @@ pub fn main() void {
         sendAction(session, "pushstate", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "vitals")) {
         sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "react")) {
+        const sub = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools react <tree|inspect|renders|suspense>\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, sub, "tree")) {
+            sendAction(session, "react_tree", null, null, daemon_opts);
+        } else {
+            writeErr("Unknown react subcommand: {s}\n", .{sub});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, cmd, "dblclick")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools dblclick <@ref>\n", .{});
@@ -1306,16 +1317,16 @@ fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, patte
         std.process.exit(1);
     };
 
-    // Read response
-    var recv_buf: [65536]u8 = undefined;
-    const response_line = client.recvLine(&recv_buf) catch |err| {
+    // Read response (동적 — 64KB 초과 응답 대응)
+    const response_line = client.recvLineAlloc(allocator) catch |err| {
         writeErr("Failed to read response: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    defer allocator.free(response_line);
 
     const resp = daemon.parseResponse(allocator, response_line) catch {
         // Raw output if not valid JSON
-        write("{s}\n", .{response_line});
+        writeLine(response_line);
         return;
     };
     defer daemon.freeResponse(allocator, resp);
@@ -1327,7 +1338,7 @@ fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, patte
             if (daemon_opts.content_boundaries and isContentAction(action)) {
                 write("---AGENT_DEVTOOLS_CONTENT_START---\n{s}\n---AGENT_DEVTOOLS_CONTENT_END---\n", .{result.output});
             } else {
-                write("{s}\n", .{result.output});
+                writeLine(result.output);
             }
         } else {
             write("OK\n", .{});
@@ -3227,6 +3238,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handlePushState(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "vitals")) {
         return handleVitals(allocator, sender, resp_map, cmd_id, session_id, req.url, ctx.allowed_domains);
+    } else if (std.mem.eql(u8, req.action, "react_tree")) {
+        return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, REACT_TREE_SNAPSHOT);
     } else if (std.mem.eql(u8, req.action, "get_url")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
@@ -6971,6 +6984,55 @@ fn handleEvalRaw(allocator: Allocator, sender: *WsSender, resp_map: *response_ma
     return null;
 }
 
+// ============================================================================
+// React Introspection (window.__REACT_DEVTOOLS_GLOBAL_HOOK__ 기반)
+// 스크립트는 async IIFE → awaitPromise+returnByValue 필요. throw 시
+// exceptionDetails를 사용자 친화 에러로 변환.
+// ============================================================================
+
+const REACT_TREE_SNAPSHOT = @embedFile("react/tree_snapshot.js");
+
+/// async React 스크립트를 평가해 JSON 문자열(또는 에러)을 daemon 응답으로 반환.
+fn handleReactScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, expression: []const u8) []u8 {
+    var pbuf: std.ArrayList(u8) = .empty;
+    defer pbuf.deinit(allocator);
+    const pw = pbuf.writer(allocator);
+    pw.writeAll("{\"expression\":") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(pw, expression) catch return respondErr(allocator, "write error");
+    pw.writeAll(",\"awaitPromise\":true,\"returnByValue\":true}") catch return respondErr(allocator, "write error");
+    const params = pbuf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Runtime.evaluate", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
+        return respondErr(allocator, "react eval timeout");
+    defer allocator.free(raw);
+
+    const parsed = cdp.parseMessage(allocator, raw) catch
+        return respondErr(allocator, "parse error");
+    defer parsed.parsed.deinit();
+
+    if (!parsed.message.isResponse()) return respondErr(allocator, "react eval failed");
+    const result = parsed.message.result orelse return respondErr(allocator, "react eval failed");
+
+    // 스크립트 내 throw (hook 미설치 등) → 사용자 친화 에러
+    if (cdp.getObject(result, "exceptionDetails")) |exc| {
+        return respondErr(allocator, cdp.exceptionMessage(exc));
+    }
+
+    if (cdp.getObject(result, "result")) |remote_obj| {
+        if (cdp.getString(remote_obj, "value")) |v| {
+            return daemon.serializeResponse(allocator, .{ .success = true, .data = v }) catch
+                respondErr(allocator, "serialize error");
+        }
+    }
+    return respondErr(allocator, "react script returned no value");
+}
+
 fn handleStateLoad(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, name_opt: ?[]const u8) []u8 {
     const state_name = name_opt orelse return respondErr(allocator, "state name required");
 
@@ -8735,8 +8797,22 @@ fn unescapeJsonString(allocator: Allocator, data: []const u8) UnescapeResult {
 fn write(comptime fmt: []const u8, args: anytype) void {
     const stdout = std.fs.File.stdout();
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = stdout.write(msg) catch {};
+    if (std.fmt.bufPrint(&buf, fmt, args)) |msg| {
+        stdout.writeAll(msg) catch {};
+        return;
+    } else |_| {}
+    // 4KB 초과 출력 (스냅샷, 네트워크, react 트리 등): 동적 할당으로 폴백.
+    // CLI는 단발 프로세스라 page_allocator로 충분 (defer free로 정리).
+    const msg = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+    defer std.heap.page_allocator.free(msg);
+    stdout.writeAll(msg) catch {};
+}
+
+/// 대형 페이로드(스냅샷/네트워크/react 트리)를 포맷·재할당 없이 그대로 출력 + 개행.
+fn writeLine(slice: []const u8) void {
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(slice) catch {};
+    stdout.writeAll("\n") catch {};
 }
 
 fn writeErr(comptime fmt: []const u8, args: anytype) void {
@@ -8783,6 +8859,7 @@ fn printUsage() void {
         \\  reload                    Reload page
         \\  pushstate <url>           SPA client-side navigation (history.pushState)
         \\  vitals [url]              Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
+        \\  react tree                React 컴포넌트 트리 (--enable=react-devtools 필요)
         \\  url                       Get current URL
         \\  title                     Get page title
         \\  content                   Get page HTML
@@ -9608,6 +9685,11 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "REACT_TREE_SNAPSHOT: embedded async script references hook and returns JSON" {
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_SNAPSHOT, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_SNAPSHOT, "JSON.stringify") != null);
 }
 
 test "REACT_INSTALL_HOOK: embedded hook is present and installs the global" {
