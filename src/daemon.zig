@@ -242,7 +242,7 @@ pub fn parseResponse(allocator: Allocator, line: []const u8) !Response {
 }
 
 /// Write a std.json.Value to a writer as JSON text.
-fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
+pub fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
     switch (value) {
         .null => try writer.writeAll("null"),
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),
