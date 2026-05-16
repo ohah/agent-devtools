@@ -1,7 +1,7 @@
 {
   "name": "agent-devtools",
   "description": "Browser DevTools CLI for AI agents — web debugging, API reverse engineering, network interception",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "author": {
     "name": "ohah"
   },
