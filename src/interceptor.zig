@@ -24,7 +24,21 @@ pub const Rule = struct {
     mock_content_type: []u8, // For mock action (default "application/json")
     delay_ms: u32, // For delay action
     error_reason: []u8, // For fail action (default "BlockedByClient")
+    resource_types: ?[]u8 = null, // CSV of CDP resourceType; null = match all
 };
+
+/// 요청의 resourceType이 룰의 resource_types 필터에 부합하는지.
+/// 필터가 없으면(null) 모든 타입 허용. 비교는 대소문자 무시.
+pub fn matchesResourceType(rule: *const Rule, resource_type: []const u8) bool {
+    const csv = rule.resource_types orelse return true;
+    var it = std.mem.splitScalar(u8, csv, ',');
+    while (it.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t");
+        if (part.len == 0) continue;
+        if (std.ascii.eqlIgnoreCase(part, resource_type)) return true;
+    }
+    return false;
+}
 
 pub const InterceptorState = struct {
     rules: std.ArrayList(Rule),
@@ -39,13 +53,16 @@ pub const InterceptorState = struct {
         };
     }
 
+    fn freeRule(allocator: Allocator, rule: Rule) void {
+        allocator.free(rule.url_pattern);
+        if (rule.mock_body) |b| allocator.free(b);
+        allocator.free(rule.mock_content_type);
+        allocator.free(rule.error_reason);
+        if (rule.resource_types) |rt| allocator.free(rt);
+    }
+
     pub fn deinit(self: *InterceptorState) void {
-        for (self.rules.items) |rule| {
-            self.allocator.free(rule.url_pattern);
-            if (rule.mock_body) |b| self.allocator.free(b);
-            self.allocator.free(rule.mock_content_type);
-            self.allocator.free(rule.error_reason);
-        }
+        for (self.rules.items) |rule| freeRule(self.allocator, rule);
         self.rules.deinit(self.allocator);
     }
 
@@ -62,10 +79,7 @@ pub const InterceptorState = struct {
         while (i < self.rules.items.len) {
             if (std.mem.eql(u8, self.rules.items[i].url_pattern, url_pattern)) {
                 const rule = self.rules.orderedRemove(i);
-                self.allocator.free(rule.url_pattern);
-                if (rule.mock_body) |b| self.allocator.free(b);
-                self.allocator.free(rule.mock_content_type);
-                self.allocator.free(rule.error_reason);
+                freeRule(self.allocator, rule);
                 removed += 1;
             } else {
                 i += 1;
@@ -75,10 +89,10 @@ pub const InterceptorState = struct {
         return removed;
     }
 
-    /// Find the first matching rule for a URL.
-    pub fn findMatch(self: *const InterceptorState, url: []const u8) ?*const Rule {
+    /// Find the first rule matching both the URL pattern and resource-type filter.
+    pub fn findMatch(self: *const InterceptorState, url: []const u8, resource_type: []const u8) ?*const Rule {
         for (self.rules.items) |*rule| {
-            if (matchPattern(rule.url_pattern, url)) return rule;
+            if (matchPattern(rule.url_pattern, url) and matchesResourceType(rule, resource_type)) return rule;
         }
         return null;
     }
@@ -236,6 +250,60 @@ test "matchPattern: empty pattern" {
     try testing.expect(!matchPattern("", "something"));
 }
 
+test "matchesResourceType: null filter matches any type" {
+    const rule = Rule{
+        .url_pattern = @constCast("*"),
+        .action = .fail,
+        .mock_body = null,
+        .mock_status = 200,
+        .mock_content_type = @constCast(""),
+        .delay_ms = 0,
+        .error_reason = @constCast(""),
+        .resource_types = null,
+    };
+    try testing.expect(matchesResourceType(&rule, "Document"));
+    try testing.expect(matchesResourceType(&rule, "XHR"));
+    try testing.expect(matchesResourceType(&rule, ""));
+}
+
+test "matchesResourceType: CSV filter, case-insensitive, trimmed" {
+    const rule = Rule{
+        .url_pattern = @constCast("*"),
+        .action = .fail,
+        .mock_body = null,
+        .mock_status = 200,
+        .mock_content_type = @constCast(""),
+        .delay_ms = 0,
+        .error_reason = @constCast(""),
+        .resource_types = @constCast("Script, XHR ,fetch"),
+    };
+    try testing.expect(matchesResourceType(&rule, "script")); // case-insensitive
+    try testing.expect(matchesResourceType(&rule, "XHR")); // trimmed
+    try testing.expect(matchesResourceType(&rule, "Fetch"));
+    try testing.expect(!matchesResourceType(&rule, "Document"));
+    try testing.expect(!matchesResourceType(&rule, "Image"));
+}
+
+test "InterceptorState: findMatch honors resource-type filter" {
+    var state = InterceptorState.init(testing.allocator);
+    defer state.deinit();
+
+    try state.addRule(.{
+        .url_pattern = try testing.allocator.dupe(u8, "*api*"),
+        .action = .fail,
+        .mock_body = null,
+        .mock_status = 200,
+        .mock_content_type = try testing.allocator.dupe(u8, ""),
+        .delay_ms = 0,
+        .error_reason = try testing.allocator.dupe(u8, "BlockedByClient"),
+        .resource_types = try testing.allocator.dupe(u8, "Script,XHR"),
+    });
+
+    try testing.expect(state.findMatch("https://x.com/api/v1", "XHR") != null);
+    try testing.expect(state.findMatch("https://x.com/api/v1", "Document") == null); // type filtered out
+    try testing.expect(state.findMatch("https://x.com/page", "XHR") == null); // url filtered out
+}
+
 test "InterceptorState: add and find rule" {
     var state = InterceptorState.init(testing.allocator);
     defer state.deinit();
@@ -253,11 +321,11 @@ test "InterceptorState: add and find rule" {
     try testing.expect(state.enabled);
     try testing.expectEqual(@as(usize, 1), state.ruleCount());
 
-    const match = state.findMatch("https://example.com/api/data");
+    const match = state.findMatch("https://example.com/api/data", "");
     try testing.expect(match != null);
     try testing.expectEqual(Action.mock, match.?.action);
 
-    const no_match = state.findMatch("https://example.com/page");
+    const no_match = state.findMatch("https://example.com/page", "");
     try testing.expect(no_match == null);
 }
 
@@ -306,12 +374,12 @@ test "InterceptorState: multiple rules, first match wins" {
     });
 
     // specific-api matches the first rule
-    const m1 = state.findMatch("https://example.com/specific-api/data");
+    const m1 = state.findMatch("https://example.com/specific-api/data", "");
     try testing.expect(m1 != null);
     try testing.expectEqual(Action.mock, m1.?.action);
 
     // generic api matches the second rule
-    const m2 = state.findMatch("https://example.com/api/other");
+    const m2 = state.findMatch("https://example.com/api/other", "");
     try testing.expect(m2 != null);
     try testing.expectEqual(Action.fail, m2.?.action);
 }

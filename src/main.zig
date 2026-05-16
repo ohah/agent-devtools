@@ -354,9 +354,9 @@ pub fn main() void {
                 \\Usage: agent-devtools intercept <subcommand> <pattern> [options]
                 \\
                 \\Subcommands:
-                \\  mock <pattern> <json>     Return mock response for matching URLs
-                \\  fail <pattern>            Block matching requests
-                \\  delay <pattern> <ms>      Delay matching requests
+                \\  mock <pattern> <json> [--resource-type <csv>]   Return mock response
+                \\  fail <pattern> [--resource-type <csv>]           Block matching requests
+                \\  delay <pattern> <ms> [--resource-type <csv>]    Delay matching requests
                 \\  remove <pattern>          Remove intercept rule
                 \\  list                      List active rules
                 \\  clear                     Remove all rules
@@ -380,24 +380,24 @@ pub fn main() void {
             sendAction(session, "intercept_remove", pattern, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "mock")) {
             const pattern = args_iter.next() orelse {
-                writeErr("Usage: agent-devtools intercept mock <pattern> <json>\n", .{});
+                writeErr("Usage: agent-devtools intercept mock <pattern> <json> [--resource-type <csv>]\n", .{});
                 std.process.exit(1);
             };
             const body = args_iter.next() orelse "{}";
-            sendAction(session, "intercept_mock", pattern, body, daemon_opts);
+            sendActionEx(session, "intercept_mock", pattern, body, parseResourceTypeFlag(&args_iter), daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "fail")) {
             const pattern = args_iter.next() orelse {
-                writeErr("Usage: agent-devtools intercept fail <pattern>\n", .{});
+                writeErr("Usage: agent-devtools intercept fail <pattern> [--resource-type <csv>]\n", .{});
                 std.process.exit(1);
             };
-            sendAction(session, "intercept_fail", pattern, null, daemon_opts);
+            sendActionEx(session, "intercept_fail", pattern, null, parseResourceTypeFlag(&args_iter), daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "delay")) {
             const pattern = args_iter.next() orelse {
-                writeErr("Usage: agent-devtools intercept delay <pattern> <ms>\n", .{});
+                writeErr("Usage: agent-devtools intercept delay <pattern> <ms> [--resource-type <csv>]\n", .{});
                 std.process.exit(1);
             };
             const ms = args_iter.next() orelse "1000";
-            sendAction(session, "intercept_delay", pattern, ms, daemon_opts);
+            sendActionEx(session, "intercept_delay", pattern, ms, parseResourceTypeFlag(&args_iter), daemon_opts);
         } else {
             writeErr("Unknown intercept subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
@@ -1223,7 +1223,21 @@ pub fn main() void {
 // CLI → Daemon Communication
 // ============================================================================
 
+/// 남은 인자에서 `--resource-type|--resource-types <csv>`를 찾아 CSV 반환. 없으면 null.
+fn parseResourceTypeFlag(it: anytype) ?[]const u8 {
+    while (it.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--resource-type") or std.mem.eql(u8, arg, "--resource-types")) {
+            return it.next();
+        }
+    }
+    return null;
+}
+
 fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8, daemon_opts: daemon.DaemonOptions) void {
+    sendActionEx(session, action, url, pattern, null, daemon_opts);
+}
+
+fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8, extra: ?[]const u8, daemon_opts: daemon.DaemonOptions) void {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
@@ -1250,6 +1264,7 @@ fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern
         .action = action,
         .url = url,
         .pattern = pattern,
+        .extra = extra,
     }) catch {
         writeErr("Failed to serialize request\n", .{});
         std.process.exit(1);
@@ -2261,8 +2276,9 @@ fn handleRequestPaused(
     const request_id = cdp.getString(params, "requestId") orelse return;
     const request = cdp.getObject(params, "request") orelse return;
     const url = cdp.getString(request, "url") orelse return;
+    const resource_type = cdp.getString(params, "resourceType") orelse "";
 
-    if (intercept_state.findMatch(url)) |rule| {
+    if (intercept_state.findMatch(url, resource_type)) |rule| {
         switch (rule.action) {
             .mock => {
                 const cmd = interceptor.buildFulfillCommand(allocator, cmd_id.next(), request_id, rule, session_id) catch return;
@@ -3184,15 +3200,15 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "intercept_mock")) {
         ctx.intercept_mutex.lock();
         defer ctx.intercept_mutex.unlock();
-        return handleInterceptAdd(allocator, sender, cmd_id, session_id, intercept_state, req.url, .mock, req.pattern);
+        return handleInterceptAdd(allocator, sender, cmd_id, session_id, intercept_state, req.url, .mock, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "intercept_fail")) {
         ctx.intercept_mutex.lock();
         defer ctx.intercept_mutex.unlock();
-        return handleInterceptAdd(allocator, sender, cmd_id, session_id, intercept_state, req.url, .fail, null);
+        return handleInterceptAdd(allocator, sender, cmd_id, session_id, intercept_state, req.url, .fail, null, req.extra);
     } else if (std.mem.eql(u8, req.action, "intercept_delay")) {
         ctx.intercept_mutex.lock();
         defer ctx.intercept_mutex.unlock();
-        return handleInterceptAdd(allocator, sender, cmd_id, session_id, intercept_state, req.url, .delay, req.pattern);
+        return handleInterceptAdd(allocator, sender, cmd_id, session_id, intercept_state, req.url, .delay, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "intercept_remove")) {
         ctx.intercept_mutex.lock();
         defer ctx.intercept_mutex.unlock();
@@ -5488,6 +5504,7 @@ fn handleInterceptAdd(
     url_pattern: ?[]const u8,
     action: interceptor.Action,
     extra: ?[]const u8, // mock body or delay ms
+    resource_types_csv: ?[]const u8, // optional --resource-type filter (CSV)
 ) []u8 {
     const pattern = url_pattern orelse return respondErr(allocator, "URL pattern required");
 
@@ -5499,6 +5516,7 @@ fn handleInterceptAdd(
         .mock_content_type = allocator.dupe(u8, "application/json") catch return respondErr(allocator, "alloc error"),
         .delay_ms = 0,
         .error_reason = allocator.dupe(u8, "BlockedByClient") catch return respondErr(allocator, "alloc error"),
+        .resource_types = if (resource_types_csv) |rt| (allocator.dupe(u8, rt) catch return respondErr(allocator, "alloc error")) else null,
     };
 
     switch (action) {
@@ -5573,6 +5591,10 @@ fn handleInterceptList(allocator: Allocator, intercept_state: *const interceptor
         }
         if (rule.action == .delay) {
             std.fmt.format(writer, ",\"delayMs\":{d}", .{rule.delay_ms}) catch {};
+        }
+        if (rule.resource_types) |rt| {
+            writer.writeAll(",\"resourceType\":") catch {};
+            cdp.writeJsonString(writer, rt) catch {};
         }
         writer.writeByte('}') catch {};
     }
