@@ -196,6 +196,7 @@ pub fn main() void {
     var session: []const u8 = "default";
     var headed = false;
     var cdp_port: ?[]const u8 = null;
+    var cdp_url: ?[]const u8 = null;
     var auto_connect = false;
     var user_agent: ?[]const u8 = null;
     var interactive = false;
@@ -227,6 +228,8 @@ pub fn main() void {
             headed = true;
         } else if (std.mem.startsWith(u8, arg, "--port=")) {
             cdp_port = arg["--port=".len..];
+        } else if (std.mem.startsWith(u8, arg, "--cdp=")) {
+            cdp_url = arg["--cdp=".len..];
         } else if (std.mem.eql(u8, arg, "--auto-connect")) {
             auto_connect = true;
         } else if (std.mem.startsWith(u8, arg, "--user-agent=")) {
@@ -267,6 +270,24 @@ pub fn main() void {
         }
     }
 
+    // `connect <port|url>`: 위치 인자 endpoint를 cdp_url/cdp_port로 디슈가 (agent-browser 동일)
+    if (command) |c| {
+        if (std.mem.eql(u8, c, "connect")) {
+            const endpoint = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools connect <port|ws-url|http-url>\n", .{});
+                std.process.exit(1);
+            };
+            switch (classifyCdpEndpoint(endpoint)) {
+                .url => |u| cdp_url = u,
+                .port => |p| cdp_port = p,
+                .invalid => {
+                    writeErr("connect: invalid endpoint '{s}' (expect port number or ws://|wss://|http(s):// URL)\n", .{endpoint});
+                    std.process.exit(1);
+                },
+            }
+        }
+    }
+
     // Apply config file defaults (CLI flags override)
     if (!headed and config_headed) headed = true;
     if (proxy == null) proxy = config_proxy;
@@ -277,6 +298,7 @@ pub fn main() void {
     const daemon_opts = daemon.DaemonOptions{
         .headed = headed,
         .cdp_port = cdp_port,
+        .cdp_url = cdp_url,
         .auto_connect = auto_connect,
         .user_agent = user_agent,
         .proxy = proxy,
@@ -1005,6 +1027,9 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "wait")) {
         const ms = args_iter.next() orelse "1000";
         sendAction(session, "wait", ms, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "connect")) {
+        // endpoint는 이미 cdp_url/cdp_port로 디슈가됨 → 데몬 기동 + 상태 보고
+        sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "status")) {
         sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "close")) {
@@ -1401,6 +1426,47 @@ fn parseResourceTypeFlag(it: anytype) ?[]const u8 {
     return null;
 }
 
+/// `connect <endpoint>` 인자 분류 (agent-browser commands.rs와 동일 규칙):
+/// ws://|wss://|http://|https:// → cdp_url, 그 외 숫자 → cdp_port.
+const CdpEndpoint = union(enum) {
+    url: []const u8, // ws:// wss:// http:// https://
+    port: []const u8, // 숫자 포트
+    invalid,
+};
+
+fn classifyCdpEndpoint(s: []const u8) CdpEndpoint {
+    if (std.mem.startsWith(u8, s, "ws://") or std.mem.startsWith(u8, s, "wss://") or
+        std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://"))
+        return .{ .url = s };
+    if (s.len == 0) return .invalid;
+    for (s) |c| if (c < '0' or c > '9') return .invalid;
+    return .{ .port = s };
+}
+
+const HostPort = struct { host: []const u8, port: u16 };
+
+/// http(s):// CDP URL → host/port (discoverWsUrl 입력용). 비-http 스킴은 null.
+fn parseHttpHostPort(url: []const u8) ?HostPort {
+    const is_https = std.mem.startsWith(u8, url, "https://");
+    const after_scheme: []const u8 = if (is_https)
+        url["https://".len..]
+    else if (std.mem.startsWith(u8, url, "http://"))
+        url["http://".len..]
+    else
+        return null;
+    const default_port: u16 = if (is_https) 443 else 80;
+    const authority_end = std.mem.indexOfAny(u8, after_scheme, "/?#") orelse after_scheme.len;
+    const authority = after_scheme[0..authority_end];
+    if (authority.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |ci| {
+        const host = authority[0..ci];
+        const port = std.fmt.parseInt(u16, authority[ci + 1 ..], 10) catch return null;
+        if (host.len == 0) return null;
+        return .{ .host = host, .port = port };
+    }
+    return .{ .host = authority, .port = default_port };
+}
+
 fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8, daemon_opts: daemon.DaemonOptions) void {
     sendActionEx(session, action, url, pattern, null, daemon_opts);
 }
@@ -1416,8 +1482,8 @@ fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, patte
     };
     if (started) {
         writeErr("Started daemon (session: {s})\n", .{session});
-    } else if (daemon_opts.headed or daemon_opts.cdp_port != null or daemon_opts.auto_connect) {
-        writeErr("Daemon already running — --headed/--port/--auto-connect options ignored. Use 'close' first.\n", .{});
+    } else if (daemon_opts.headed or daemon_opts.cdp_port != null or daemon_opts.cdp_url != null or daemon_opts.auto_connect) {
+        writeErr("Daemon already running — --headed/--port/--cdp/--auto-connect options ignored. Use 'close' first.\n", .{});
     }
 
     // Connect and send command
@@ -2128,6 +2194,7 @@ fn runDaemon() void {
     const session = daemon.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
     const is_headed = daemon.getenv("AGENT_DEVTOOLS_HEADED") != null;
     const ext_port = daemon.getenv("AGENT_DEVTOOLS_PORT");
+    const env_cdp_url = daemon.getenv("AGENT_DEVTOOLS_CDP_URL");
     const env_auto_connect = daemon.getenv("AGENT_DEVTOOLS_AUTO_CONNECT") != null;
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
     const env_init_scripts = daemon.getenv("AGENT_DEVTOOLS_INIT_SCRIPTS");
@@ -2150,7 +2217,20 @@ fn runDaemon() void {
     var discovered_url: ?[]u8 = null;
     defer if (discovered_url) |u| allocator.free(u);
 
-    const ws_url: []const u8 = if (ext_port) |port_str| blk: {
+    const ws_url: []const u8 = if (env_cdp_url) |cdp_url| blk: {
+        // ws(s):// 는 CDP endpoint 직결, http(s):// 는 /json/version discovery 필요
+        if (std.mem.startsWith(u8, cdp_url, "ws://") or std.mem.startsWith(u8, cdp_url, "wss://"))
+            break :blk cdp_url;
+        const hp = parseHttpHostPort(cdp_url) orelse {
+            std.debug.print("Daemon: Invalid --cdp URL: {s}\n", .{cdp_url});
+            return;
+        };
+        discovered_url = chrome.discoverWsUrl(allocator, hp.host, hp.port) catch |err| {
+            std.debug.print("Daemon: Failed to discover CDP URL at {s}: {s}\n", .{ cdp_url, @errorName(err) });
+            return;
+        };
+        break :blk discovered_url.?;
+    } else if (ext_port) |port_str| blk: {
         const port = std.fmt.parseInt(u16, port_str, 10) catch {
             std.debug.print("Daemon: Invalid port: {s}\n", .{port_str});
             return;
@@ -2208,7 +2288,7 @@ fn runDaemon() void {
     var session_id: ?[]u8 = null;
     defer if (session_id) |s| allocator.free(s);
 
-    const is_external = ext_port != null or env_auto_connect;
+    const is_external = ext_port != null or env_cdp_url != null or env_auto_connect;
 
     if (is_external) {
         // External Chrome/Electron: find existing page target and attach to it
@@ -9730,6 +9810,8 @@ fn printUsage() void {
         \\  --session <name>          Isolated session (default: "default")
         \\  --headed                  Show browser window (default: headless)
         \\  --port <port>             Connect to existing Chrome via CDP port
+        \\  --cdp <url>               Attach to a CDP endpoint (ws://|wss://|http(s)://)
+        \\                            Sugar: 'connect <port|url>' (e.g. connect 9222)
         \\  --auto-connect            Connect to running Chrome to reuse its auth state
         \\                            Tip: agent-devtools --auto-connect state save ./auth.json
         \\  --user-agent <ua>         Set user agent on launch
@@ -10877,6 +10959,45 @@ test "parseCountFromJson: zero count" {
     const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":0}}", "requests");
     try std.testing.expect(count != null);
     try std.testing.expectEqual(@as(usize, 0), count.?);
+}
+
+test "classifyCdpEndpoint: ws/wss/http/https → url" {
+    try std.testing.expectEqualStrings("ws://127.0.0.1:9222/devtools/page/X", classifyCdpEndpoint("ws://127.0.0.1:9222/devtools/page/X").url);
+    try std.testing.expectEqualStrings("wss://h/d", classifyCdpEndpoint("wss://h/d").url);
+    try std.testing.expectEqualStrings("http://localhost:9222", classifyCdpEndpoint("http://localhost:9222").url);
+    try std.testing.expectEqualStrings("https://x:1", classifyCdpEndpoint("https://x:1").url);
+}
+
+test "classifyCdpEndpoint: numeric → port" {
+    try std.testing.expectEqualStrings("9222", classifyCdpEndpoint("9222").port);
+    try std.testing.expectEqualStrings("0", classifyCdpEndpoint("0").port);
+}
+
+test "classifyCdpEndpoint: empty / non-numeric → invalid" {
+    try std.testing.expect(classifyCdpEndpoint("") == .invalid);
+    try std.testing.expect(classifyCdpEndpoint("localhost") == .invalid);
+    try std.testing.expect(classifyCdpEndpoint("92x2") == .invalid);
+    try std.testing.expect(classifyCdpEndpoint("tcp://1") == .invalid);
+}
+
+test "parseHttpHostPort: explicit port" {
+    const hp = parseHttpHostPort("http://127.0.0.1:9222").?;
+    try std.testing.expectEqualStrings("127.0.0.1", hp.host);
+    try std.testing.expectEqual(@as(u16, 9222), hp.port);
+}
+
+test "parseHttpHostPort: default ports + path stripped" {
+    const a = parseHttpHostPort("http://example.com/json/version").?;
+    try std.testing.expectEqualStrings("example.com", a.host);
+    try std.testing.expectEqual(@as(u16, 80), a.port);
+    const b = parseHttpHostPort("https://example.com").?;
+    try std.testing.expectEqual(@as(u16, 443), b.port);
+}
+
+test "parseHttpHostPort: rejects non-http and malformed" {
+    try std.testing.expect(parseHttpHostPort("ws://x:1") == null);
+    try std.testing.expect(parseHttpHostPort("http://") == null);
+    try std.testing.expect(parseHttpHostPort("http://h:notaport") == null);
 }
 
 test "buildDebugResponse: merges debug into response" {
