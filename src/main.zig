@@ -736,7 +736,7 @@ pub fn main() void {
         sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "react")) {
         const sub = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools react <tree|inspect>\n", .{});
+            writeErr("Usage: agent-devtools react <tree|inspect|renders>\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, sub, "tree")) {
@@ -747,6 +747,19 @@ pub fn main() void {
                 std.process.exit(1);
             };
             sendAction(session, "react_inspect", fid, null, daemon_opts);
+        } else if (std.mem.eql(u8, sub, "renders")) {
+            const rsub = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools react renders <start|stop>\n", .{});
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, rsub, "start")) {
+                sendAction(session, "react_renders_start", null, null, daemon_opts);
+            } else if (std.mem.eql(u8, rsub, "stop")) {
+                sendAction(session, "react_renders_stop", null, null, daemon_opts);
+            } else {
+                writeErr("Usage: agent-devtools react renders <start|stop>\n", .{});
+                std.process.exit(1);
+            }
         } else {
             writeErr("Unknown react subcommand: {s}\n", .{sub});
             std.process.exit(1);
@@ -3248,6 +3261,10 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, REACT_TREE_SNAPSHOT);
     } else if (std.mem.eql(u8, req.action, "react_inspect")) {
         return handleReactInspect(allocator, sender, resp_map, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "react_renders_start")) {
+        return handleReactRendersStart(allocator, sender, resp_map, cmd_id, session_id);
+    } else if (std.mem.eql(u8, req.action, "react_renders_stop")) {
+        return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, REACT_RENDERS_STOP);
     } else if (std.mem.eql(u8, req.action, "get_url")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
@@ -7000,6 +7017,8 @@ fn handleEvalRaw(allocator: Allocator, sender: *WsSender, resp_map: *response_ma
 
 const REACT_TREE_SNAPSHOT = @embedFile("react/tree_snapshot.js");
 const REACT_TREE_INSPECT = @embedFile("react/tree_inspect.js"); // {{ID}} 치환 필요
+const REACT_RENDERS_INIT = @embedFile("react/renders_init.js");
+const REACT_RENDERS_STOP = @embedFile("react/renders_stop.js");
 
 /// async React 스크립트를 평가해 JSON 문자열(또는 에러)을 daemon 응답으로 반환.
 fn handleReactScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, expression: []const u8) []u8 {
@@ -7040,6 +7059,26 @@ fn handleReactScript(allocator: Allocator, sender: *WsSender, resp_map: *respons
         }
     }
     return respondErr(allocator, "react script returned no value");
+}
+
+/// react renders start — 프로파일러를 새 문서용으로 등록(네비게이션 생존) +
+/// 현재 페이지에서 즉시 실행해 리로드 없이 기록 시작.
+fn handleReactRendersStart(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8) []u8 {
+    const params = cdp.jsonObject1(allocator, "source", REACT_RENDERS_INIT) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const reg_id = cmd_id.next();
+    const reg_cmd = cdp.serializeCommand(allocator, reg_id, "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(reg_cmd);
+    if (sendAndWait(sender, resp_map, reg_cmd, reg_id, 10_000)) |r| allocator.free(r);
+
+    // 현재 페이지에서 즉시 시작 (RENDERS_INIT는 동기 IIFE — 반환값 불필요)
+    if (handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, REACT_RENDERS_INIT)) |r| allocator.free(r);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data =
+        \\{"recording":true,"message":"recording renders — interact with the page, then run `react renders stop`"}
+    }) catch respondErr(allocator, "serialize error");
 }
 
 /// react inspect <fiberId> — TREE_INSPECT의 {{ID}}를 검증된 숫자 id로 치환 후 평가.
@@ -8891,6 +8930,7 @@ fn printUsage() void {
         \\  vitals [url]              Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
         \\  react tree                React 컴포넌트 트리 (--enable=react-devtools 필요)
         \\  react inspect <fiberId>   특정 fiber의 props/hooks/state
+        \\  react renders start|stop  렌더 프로파일링 (start 후 조작 → stop)
         \\  url                       Get current URL
         \\  title                     Get page title
         \\  content                   Get page HTML
@@ -9716,6 +9756,12 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "REACT_RENDERS scripts: init installs profiler, stop returns JSON" {
+    try std.testing.expect(std.mem.indexOf(u8, REACT_RENDERS_INIT, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_RENDERS_STOP, "JSON.stringify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_RENDERS_STOP, "__AB_RENDERS_ACTIVE__") != null);
 }
 
 test "REACT_TREE_INSPECT: embedded template has exactly one {{ID}} placeholder" {

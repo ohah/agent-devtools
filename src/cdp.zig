@@ -234,14 +234,17 @@ pub fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]
     return buf.toOwnedSlice(allocator);
 }
 
-/// CDP exceptionDetails 객체 → 사람이 읽을 메시지.
-/// exception.description 우선(가장 구체적), 없으면 exceptionDetails.text.
+/// CDP exceptionDetails 객체 → 사람이 읽을 한 줄 메시지.
+/// exception.description 우선(없으면 text). description은 error.stack 전체라
+/// 첫 줄만 취하고, CLI가 "Error: "를 다시 붙이므로 선행 "Error: "를 제거.
 pub fn exceptionMessage(details: std.json.Value) []const u8 {
-    if (getObject(details, "exception")) |exc| {
-        if (getString(exc, "description")) |d| return d;
-    }
-    if (getString(details, "text")) |t| return t;
-    return "script threw an exception";
+    var msg: ?[]const u8 = null;
+    if (getObject(details, "exception")) |exc| msg = getString(exc, "description");
+    if (msg == null) msg = getString(details, "text");
+    var out = msg orelse "script threw an exception";
+    if (std.mem.indexOfScalar(u8, out, '\n')) |nl| out = out[0..nl];
+    if (std.mem.startsWith(u8, out, "Error: ")) out = out["Error: ".len..];
+    return out;
 }
 
 /// Write a JSON-escaped string (with quotes) to a writer.
@@ -1202,6 +1205,14 @@ test "exceptionMessage: prefers exception.description, falls back to text" {
         const p = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
         defer p.deinit();
         try testing.expectEqualStrings("script threw an exception", exceptionMessage(p.value));
+    }
+    {
+        // thrown Error: description은 스택 전체 — 첫 줄만 + 선행 "Error: " 제거
+        const p = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"exception":{"description":"Error: renders not active\n    at <anonymous>:3:22\n    at x"}}
+        , .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("renders not active", exceptionMessage(p.value));
     }
 }
 
