@@ -463,6 +463,7 @@ pub const DaemonOptions = struct {
     extensions: ?[]const u8 = null,
     allowed_domains: ?[]const u8 = null,
     content_boundaries: bool = false,
+    no_auto_dialog: bool = false,
 };
 
 /// Ensure a daemon is running for the given session.
@@ -509,6 +510,7 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (opts.extensions) |e| try env_map.put("AGENT_DEVTOOLS_EXTENSIONS", e);
     if (opts.allowed_domains) |d| try env_map.put("AGENT_DEVTOOLS_ALLOWED_DOMAINS", d);
     if (opts.content_boundaries) try env_map.put("AGENT_DEVTOOLS_CONTENT_BOUNDARIES", "1");
+    if (opts.no_auto_dialog) try env_map.put("AGENT_DEVTOOLS_NO_AUTO_DIALOG", "1");
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning

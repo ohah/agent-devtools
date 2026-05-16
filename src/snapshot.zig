@@ -227,6 +227,7 @@ pub fn buildSnapshot(
     ref_map: *RefMap,
     interactive_only: bool,
     cursor_elements: ?*const CursorElementMap,
+    link_urls: ?*const std.AutoHashMap(i64, []const u8),
 ) ![]u8 {
     if (ax_tree_json != .object) return error.InvalidCharacter;
     const nodes_val = ax_tree_json.object.get("nodes") orelse return error.InvalidCharacter;
@@ -485,7 +486,7 @@ pub fn buildSnapshot(
     }
 
     for (root_indices.items) |root_idx| {
-        try renderTree(allocator, tree_nodes.items, root_idx, 0, writer, interactive_only, &owned_names);
+        try renderTree(allocator, tree_nodes.items, root_idx, 0, writer, interactive_only, &owned_names, link_urls);
     }
 
     const result = try buf.toOwnedSlice(allocator);
@@ -516,13 +517,14 @@ fn renderTree(
     writer: anytype,
     interactive_only: bool,
     owned_names: *std.ArrayList([]u8),
+    link_urls: ?*const std.AutoHashMap(i64, []const u8),
 ) !void {
     const node = &nodes[idx];
 
     // Skip cleared/empty nodes but render children
     if (node.cleared or node.role.len == 0) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names);
+            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
         }
         return;
     }
@@ -530,7 +532,7 @@ fn renderTree(
     // Skip generic nodes with <=1 child and no ref (reduce noise)
     if (std.mem.eql(u8, node.role, "generic") and !node.has_ref and node.children.items.len <= 1) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names);
+            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
         }
         return;
     }
@@ -538,7 +540,7 @@ fn renderTree(
     // Skip RootWebArea / WebArea — structural containers
     if (std.mem.eql(u8, node.role, "RootWebArea") or std.mem.eql(u8, node.role, "WebArea")) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names);
+            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
         }
         return;
     }
@@ -550,7 +552,7 @@ fn renderTree(
         defer if (did_alloc) allocator.free(cleaned);
         if (cleaned.len == 0) {
             for (node.children.items) |child_idx| {
-                try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names);
+                try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
             }
             return;
         }
@@ -559,7 +561,7 @@ fn renderTree(
     // Interactive-only mode: skip non-ref nodes, but recurse children
     if (interactive_only and !node.has_ref) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names);
+            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
         }
         return;
     }
@@ -631,6 +633,15 @@ fn renderTree(
         }
     }
 
+    if (link_urls) |urls| url_attr: {
+        const bid = node.backend_node_id orelse break :url_attr;
+        const href = urls.get(bid) orelse break :url_attr;
+        if (href.len == 0) break :url_attr;
+        if (attrs_buf.items.len > 0) try attrs_writer.writeAll(", ");
+        try attrs_writer.writeAll("url=");
+        try attrs_writer.writeAll(href);
+    }
+
     if (node.ref_id) |ref_id| {
         if (attrs_buf.items.len > 0) try attrs_writer.writeAll(", ");
         try attrs_writer.writeAll("ref=");
@@ -666,7 +677,7 @@ fn renderTree(
 
     // Render children
     for (node.children.items) |child_idx| {
-        try renderTree(allocator, nodes, child_idx, indent + 1, writer, interactive_only, owned_names);
+        try renderTree(allocator, nodes, child_idx, indent + 1, writer, interactive_only, owned_names, link_urls);
     }
 }
 
@@ -900,13 +911,53 @@ test "buildSnapshot: simple AX tree" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snapshot = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snapshot = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snapshot);
 
     // New format: - role "name" [ref=eN]
     try testing.expect(std.mem.indexOf(u8, snapshot, "- button \"Submit\" [ref=e1]") != null);
     try testing.expect(std.mem.indexOf(u8, snapshot, "- heading \"Welcome\" [ref=e2]") != null);
     try testing.expectEqual(@as(usize, 2), ref_map.count());
+}
+
+test "buildSnapshot: link_urls renders url= attr for matching backend id" {
+    const json =
+        \\{"nodes":[{"nodeId":"1","ignored":false,"role":{"type":"role","value":"link"},"name":{"type":"computedString","value":"Home"},"backendDOMNodeId":7}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    var ref_map = RefMap.init(testing.allocator);
+    defer ref_map.deinit();
+
+    var urls = std.AutoHashMap(i64, []const u8).init(testing.allocator);
+    defer urls.deinit();
+    try urls.put(7, "https://example.com/home");
+
+    const snapshot = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, &urls);
+    defer testing.allocator.free(snapshot);
+
+    try testing.expect(std.mem.indexOf(u8, snapshot, "url=https://example.com/home") != null);
+    // url= must precede ref= within the bracket group
+    const u = std.mem.indexOf(u8, snapshot, "url=").?;
+    const r = std.mem.indexOf(u8, snapshot, "ref=").?;
+    try testing.expect(u < r);
+}
+
+test "buildSnapshot: link_urls null leaves no url= attr" {
+    const json =
+        \\{"nodes":[{"nodeId":"1","ignored":false,"role":{"type":"role","value":"link"},"name":{"type":"computedString","value":"Home"},"backendDOMNodeId":7}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+
+    var ref_map = RefMap.init(testing.allocator);
+    defer ref_map.deinit();
+
+    const snapshot = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
+    defer testing.allocator.free(snapshot);
+
+    try testing.expect(std.mem.indexOf(u8, snapshot, "url=") == null);
 }
 
 test "buildSnapshot: interactive only" {
@@ -919,7 +970,7 @@ test "buildSnapshot: interactive only" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snapshot = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, null);
+    const snapshot = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, null, null);
     defer testing.allocator.free(snapshot);
 
     // Button gets ref, heading gets ref (content with name)
@@ -983,7 +1034,7 @@ test "buildSnapshot: tree depth preserved" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, null, null);
     defer testing.allocator.free(snap);
 
     // RootWebArea is skipped, so button is at depth 0
@@ -1031,7 +1082,7 @@ test "buildSnapshot: InlineTextBox filtered" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     // InlineTextBox should not appear
@@ -1050,7 +1101,7 @@ test "buildSnapshot: StaticText deduplication" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     // StaticText "Home" should be deduplicated (not rendered)
@@ -1068,7 +1119,7 @@ test "buildSnapshot: RootWebArea skipped" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     // RootWebArea should not appear in output
@@ -1086,7 +1137,7 @@ test "buildSnapshot: ARIA properties rendered" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, "level=2, ref=e1") != null);
@@ -1102,7 +1153,7 @@ test "buildSnapshot: checkbox checked property" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, "checked=true") != null);
@@ -1118,7 +1169,7 @@ test "buildSnapshot: value displayed when different from name" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, ": 75") != null);
@@ -1134,7 +1185,7 @@ test "buildSnapshot: interactive only returns sentinel when empty" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, null, null);
     defer testing.allocator.free(snap);
 
     try testing.expectEqualStrings("(no interactive elements)", snap);
@@ -1150,7 +1201,7 @@ test "buildSnapshot: Iframe gets ref" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, "[ref=e1]") != null);
@@ -1182,7 +1233,7 @@ test "buildSnapshot: StaticText consecutive aggregation" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     // Should show aggregated "Hello World" in a single StaticText
@@ -1239,7 +1290,7 @@ test "buildSnapshot: cursor-interactive element gets ref" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map, null);
     defer testing.allocator.free(snap);
 
     // generic "Menu" should now have a ref and cursor info
@@ -1268,7 +1319,7 @@ test "buildSnapshot: cursor editable element" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, "editable") != null);
@@ -1294,7 +1345,7 @@ test "buildSnapshot: cursor focusable element" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, "focusable") != null);
@@ -1320,7 +1371,7 @@ test "buildSnapshot: cursor element without backendNodeId ignored" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map, null);
     defer testing.allocator.free(snap);
 
     // No ref should be assigned (generic with no cursor match)
@@ -1345,7 +1396,7 @@ test "buildSnapshot: cursor element in interactive-only mode" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, &cursor_map);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, true, &cursor_map, null);
     defer testing.allocator.free(snap);
 
     // Both cursor-interactive generic and content heading should appear
@@ -1364,7 +1415,7 @@ test "buildSnapshot: null cursor_elements works (backward compat)" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, null, null);
     defer testing.allocator.free(snap);
 
     try testing.expect(std.mem.indexOf(u8, snap, "- button \"OK\" [ref=e1]") != null);
@@ -1388,7 +1439,7 @@ test "buildSnapshot: cursor element empty hints" {
     var ref_map = RefMap.init(testing.allocator);
     defer ref_map.deinit();
 
-    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map);
+    const snap = try buildSnapshot(testing.allocator, parsed.value, &ref_map, false, &cursor_map, null);
     defer testing.allocator.free(snap);
 
     // Should show "clickable" but no hints brackets

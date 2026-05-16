@@ -15,6 +15,9 @@ const png = agent.png;
 
 const Allocator = std.mem.Allocator;
 
+/// snapshot --urls 플래그를 daemon 요청의 pattern 필드로 전달하는 센티넬.
+const SNAPSHOT_URLS_FLAG = "urls";
+
 const WsSender = struct {
     ws: *websocket.Client,
     write_mutex: std.Thread.Mutex = .{},
@@ -195,6 +198,7 @@ pub fn main() void {
     var extensions: ?[]const u8 = null;
     var allowed_domains: ?[]const u8 = null;
     var content_boundaries = false;
+    var no_auto_dialog = false;
 
     // Load config file defaults (best-effort)
     var config_headed = false;
@@ -225,6 +229,8 @@ pub fn main() void {
             allowed_domains = arg["--allowed-domains=".len..];
         } else if (std.mem.eql(u8, arg, "--content-boundaries")) {
             content_boundaries = true;
+        } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
+            no_auto_dialog = true;
         } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "--pipe")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -252,6 +258,7 @@ pub fn main() void {
         .extensions = extensions,
         .allowed_domains = allowed_domains,
         .content_boundaries = content_boundaries,
+        .no_auto_dialog = no_auto_dialog,
     };
 
     if (interactive) {
@@ -455,9 +462,28 @@ pub fn main() void {
         } else if (std.mem.eql(u8, subcmd, "clear")) {
             sendAction(session, "cookies_clear", null, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "set")) {
-            const name = args_iter.next() orelse "";
-            const value = args_iter.next() orelse "";
-            sendAction(session, "cookies_set", name, value, daemon_opts);
+            const first = args_iter.next() orelse "";
+            if (std.mem.eql(u8, first, "--curl")) {
+                const path = args_iter.next() orelse {
+                    writeErr("Usage: agent-devtools cookies set --curl <file>\n", .{});
+                    std.process.exit(1);
+                };
+                const cli_alloc = std.heap.page_allocator;
+                const raw = std.fs.cwd().readFileAlloc(cli_alloc, path, 10 * 1024 * 1024) catch {
+                    writeErr("cookies --curl: cannot read '{s}'\n", .{path});
+                    std.process.exit(1);
+                };
+                defer cli_alloc.free(raw);
+                const arr = buildCookieSetArrayJson(cli_alloc, raw) catch |e| {
+                    writeErr("cookies --curl: parse failed ({s})\n", .{@errorName(e)});
+                    std.process.exit(1);
+                };
+                defer cli_alloc.free(arr);
+                sendAction(session, "cookies_set_bulk", arr, null, daemon_opts);
+            } else {
+                const value = args_iter.next() orelse "";
+                sendAction(session, "cookies_set", first, value, daemon_opts);
+            }
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const name = args_iter.next() orelse {
                 writeErr("Usage: agent-devtools cookies get <name>\n", .{});
@@ -624,9 +650,16 @@ pub fn main() void {
             sendAction(session, "screenshot", null, null, daemon_opts);
         }
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
-        const flag = args_iter.next();
-        const interactive_snap = if (flag) |f| std.mem.eql(u8, f, "-i") else false;
-        sendAction(session, if (interactive_snap) "snapshot_interactive" else "snapshot", null, null, daemon_opts);
+        var interactive_snap = false;
+        var with_urls = false;
+        while (args_iter.next()) |f| {
+            if (std.mem.eql(u8, f, "-i")) {
+                interactive_snap = true;
+            } else if (std.mem.eql(u8, f, "-u") or std.mem.eql(u8, f, "--urls")) {
+                with_urls = true;
+            }
+        }
+        sendAction(session, if (interactive_snap) "snapshot_interactive" else "snapshot", null, if (with_urls) SNAPSHOT_URLS_FLAG else null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "click")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools click <@ref or selector>\n", .{});
@@ -671,6 +704,12 @@ pub fn main() void {
         sendAction(session, "forward", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "reload")) {
         sendAction(session, "reload", null, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "pushstate")) {
+        const url = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools pushstate <url>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "pushstate", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "dblclick")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools dblclick <@ref>\n", .{});
@@ -1774,6 +1813,7 @@ fn runDaemon() void {
     const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
     const env_allowed_domains = daemon.getenv("AGENT_DEVTOOLS_ALLOWED_DOMAINS");
     const env_content_boundaries = daemon.getenv("AGENT_DEVTOOLS_CONTENT_BOUNDARIES") != null;
+    const env_no_auto_dialog = daemon.getenv("AGENT_DEVTOOLS_NO_AUTO_DIALOG") != null;
 
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
@@ -2064,6 +2104,7 @@ fn runDaemon() void {
         .trace_complete = &trace_complete,
         .trace_active = &trace_active,
         .trace_mutex = &trace_mutex,
+        .auto_dialog = !env_no_auto_dialog,
     };
     const receiver_handle = std.Thread.spawn(.{}, receiverThread, .{&receiver_ctx}) catch {
         std.debug.print("Daemon: Failed to spawn receiver thread\n", .{});
@@ -2379,6 +2420,23 @@ fn collectDialogEvent(allocator: Allocator, params: std.json.Value, dialog_info:
     };
 }
 
+/// 자동 dismiss 대상 판정: auto_dialog 활성 + alert/beforeunload 타입일 때만.
+/// confirm/prompt는 에이전트가 명시적으로 처리하도록 항상 false.
+fn shouldAutoDismissDialog(auto_dialog: bool, dtype: []const u8) bool {
+    if (!auto_dialog) return false;
+    return std.mem.eql(u8, dtype, "alert") or std.mem.eql(u8, dtype, "beforeunload");
+}
+
+/// alert/beforeunload 다이얼로그를 자동 수락(dismiss)해 페이지 블로킹을 방지.
+/// confirm/prompt는 에이전트가 명시적으로 처리하도록 남겨둔다.
+fn autoDismissDialog(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8) void {
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.handleJavaScriptDialog",
+        \\{"accept":true}
+    , session_id) catch return;
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+}
+
 /// Convert a CDP RemoteObject to a readable text representation.
 /// Handles all types: string, number, boolean, null, undefined, object, function, symbol, bigint.
 /// Reference: js_protocol.json RemoteObject type
@@ -2619,6 +2677,7 @@ const ReceiverContext = struct {
     trace_complete: *std.atomic.Value(bool),
     trace_active: *std.atomic.Value(bool),
     trace_mutex: *std.Thread.Mutex,
+    auto_dialog: bool = true,
 };
 
 /// Thread-safe list of fds that receive event broadcasts (interactive/pipe mode).
@@ -2874,8 +2933,14 @@ fn receiverThread(ctx: *ReceiverContext) void {
                             broadcastErrorEvent(ctx.allocator, ctx.event_subscribers, params);
                         }
                         if (std.mem.eql(u8, method, "Page.javascriptDialogOpening")) {
-                            collectDialogEvent(ctx.allocator, params, ctx.dialog_info);
-                            broadcastDialogEvent(ctx.allocator, ctx.event_subscribers, params);
+                            const dtype = cdp.getString(params, "type") orelse "alert";
+                            if (shouldAutoDismissDialog(ctx.auto_dialog, dtype)) {
+                                // 자동 dismiss: pending dialog로 추적하지 않아 stale 경고 방지
+                                autoDismissDialog(ctx.allocator, ctx.sender, ctx.cmd_id, ctx.session_id);
+                            } else {
+                                collectDialogEvent(ctx.allocator, params, ctx.dialog_info);
+                                broadcastDialogEvent(ctx.allocator, ctx.event_subscribers, params);
+                            }
                         }
                         if (std.mem.eql(u8, method, "Fetch.requestPaused")) {
                             is_request_paused = true;
@@ -2983,7 +3048,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "snapshot") or std.mem.eql(u8, req.action, "snapshot_interactive")) {
         ctx.ref_map_rwlock.lock();
         defer ctx.ref_map_rwlock.unlock();
-        return handleSnapshot(allocator, sender, resp_map, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"));
+        const with_urls = if (req.pattern) |p| std.mem.eql(u8, p, SNAPSHOT_URLS_FLAG) else false;
+        return handleSnapshot(allocator, sender, resp_map, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"), with_urls);
     } else if (std.mem.eql(u8, req.action, "click") or std.mem.eql(u8, req.action, "hover")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -3058,6 +3124,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Network.clearBrowserCookies");
     } else if (std.mem.eql(u8, req.action, "cookies_set")) {
         return handleCookieSet(allocator, sender, cmd_id, session_id, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "cookies_set_bulk")) {
+        return handleCookieSetBulk(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "set_viewport")) {
         return handleSetViewport(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "set_media")) {
@@ -3094,6 +3162,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleNavAction(allocator, sender, cmd_id, session_id, "Page.navigateToHistoryEntry", "1");
     } else if (std.mem.eql(u8, req.action, "reload")) {
         return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Page.reload");
+    } else if (std.mem.eql(u8, req.action, "pushstate")) {
+        return handlePushState(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "get_url")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
@@ -3510,7 +3580,59 @@ fn handleConsoleList(allocator: Allocator, console_msgs: *const std.ArrayList(Co
         respondErr(allocator, "serialize error");
 }
 
-fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool) []u8 {
+/// AX 트리 JSON에서 role=="link"이고 ignored가 아닌 노드의 backendDOMNodeId 수집.
+/// 호출자가 반환 슬라이스를 free.
+fn collectLinkBackendIds(allocator: Allocator, ax_result: std.json.Value) ![]i64 {
+    var ids: std.ArrayList(i64) = .empty;
+    errdefer ids.deinit(allocator);
+
+    if (ax_result != .object) return ids.toOwnedSlice(allocator);
+    const nodes_field = ax_result.object.get("nodes") orelse return ids.toOwnedSlice(allocator);
+    if (nodes_field != .array) return ids.toOwnedSlice(allocator);
+    for (nodes_field.array.items) |node| {
+        if (node != .object) continue;
+        if (cdp.getBool(node, "ignored") orelse false) continue;
+        const role = if (cdp.getObject(node, "role")) |r| cdp.getString(r, "value") orelse "" else "";
+        if (!std.mem.eql(u8, role, "link")) continue;
+        const bid = cdp.getInt(node, "backendDOMNodeId") orelse continue;
+        try ids.append(allocator, bid);
+    }
+    return ids.toOwnedSlice(allocator);
+}
+
+/// backendNodeId → 요소의 절대 href 문자열. 호출자가 free. 실패 시 null.
+fn resolveElementHref(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, backend_id: i64) ?[]u8 {
+    const oid = resolveNodeObjectId(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse return null;
+    defer allocator.free(oid);
+
+    const call_params = buildCallFunctionOnParams(allocator, oid,
+        "function(){var h=this.getAttribute&&this.getAttribute('href');if(!h)return '';try{return new URL(h,document.baseURI).toString()}catch(e){return ''}}", null) orelse return null;
+    defer allocator.free(call_params);
+
+    const call_id = cmd_id.next();
+    const call_cmd = cdp.serializeCommand(allocator, call_id, "Runtime.callFunctionOn", call_params, session_id) catch return null;
+    defer allocator.free(call_cmd);
+
+    const raw = sendAndWait(sender, resp_map, call_cmd, call_id, 10_000) orelse return null;
+    defer allocator.free(raw);
+
+    const parsed = cdp.parseMessage(allocator, raw) catch return null;
+    defer parsed.parsed.deinit();
+
+    if (parsed.message.isResponse()) {
+        if (parsed.message.result) |result| {
+            if (cdp.getObject(result, "result")) |remote_obj| {
+                if (cdp.getString(remote_obj, "value")) |v| {
+                    if (v.len == 0) return null;
+                    return allocator.dupe(u8, v) catch null;
+                }
+            }
+        }
+    }
+    return null;
+}
+
+fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool) []u8 {
     // Clear old refs
     ref_map.deinit();
     ref_map.* = snapshot_mod.RefMap.init(allocator);
@@ -3545,7 +3667,28 @@ fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_m
     if (parsed.message.isResponse()) {
         if (parsed.message.result) |result| {
             const cursor_ptr: ?*const snapshot_mod.CursorElementMap = if (cursor_map) |*cm| cm else null;
-            const snap = snapshot_mod.buildSnapshot(allocator, result, ref_map, interactive_only, cursor_ptr) catch
+
+            // --urls: link 요소의 href를 backendNodeId 기준으로 미리 해석
+            var link_url_map = std.AutoHashMap(i64, []const u8).init(allocator);
+            defer {
+                var uit = link_url_map.iterator();
+                while (uit.next()) |e| allocator.free(@constCast(e.value_ptr.*));
+                link_url_map.deinit();
+            }
+            if (with_urls) {
+                if (collectLinkBackendIds(allocator, result)) |ids| {
+                    defer allocator.free(ids);
+                    for (ids) |bid| {
+                        if (link_url_map.contains(bid)) continue;
+                        if (resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, bid)) |href| {
+                            link_url_map.put(bid, href) catch allocator.free(href);
+                        }
+                    }
+                } else |_| {}
+            }
+            const url_ptr: ?*const std.AutoHashMap(i64, []const u8) = if (with_urls) &link_url_map else null;
+
+            const snap = snapshot_mod.buildSnapshot(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr) catch
                 return respondErr(allocator, "snapshot build error");
             defer allocator.free(snap);
 
@@ -4571,6 +4714,144 @@ fn handleSetHeaders(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Comman
     return respondOk(allocator);
 }
 
+/// haystack에서 `flag <quote>[header:]value<quote>` 패턴을 찾아 value 반환.
+/// expect_header가 주어지면 따옴표 값이 그 헤더명+":"으로 시작해야 하며 접두사 제거.
+/// 반환 슬라이스는 haystack의 부분 슬라이스(별도 할당 아님).
+fn matchQuotedArg(haystack: []const u8, flag: []const u8, expect_header: ?[]const u8) ?[]const u8 {
+    var i: usize = 0;
+    while (i + flag.len < haystack.len) {
+        if (!std.mem.eql(u8, haystack[i .. i + flag.len], flag)) {
+            i += 1;
+            continue;
+        }
+        // 왼쪽 단어 경계 (문자열 시작 또는 공백)
+        if (i > 0 and !std.ascii.isWhitespace(haystack[i - 1])) {
+            i += 1;
+            continue;
+        }
+        var j = i + flag.len;
+        if (j >= haystack.len or !std.ascii.isWhitespace(haystack[j])) {
+            i += 1;
+            continue;
+        }
+        while (j < haystack.len and std.ascii.isWhitespace(haystack[j])) j += 1;
+        if (j >= haystack.len) return null;
+        const quote = haystack[j];
+        if (quote != '\'' and quote != '"') {
+            i = j;
+            continue;
+        }
+        const start = j + 1;
+        var k = start;
+        while (k < haystack.len and haystack[k] != quote) k += 1;
+        if (k >= haystack.len) return null;
+        const value = haystack[start..k];
+        if (expect_header) |header| {
+            if (value.len > header.len + 1 and
+                std.ascii.eqlIgnoreCase(value[0..header.len], header) and
+                value[header.len] == ':')
+            {
+                return std.mem.trim(u8, value[header.len + 1 ..], " \t");
+            }
+            i = k + 1;
+            continue;
+        }
+        return value;
+    }
+    return null;
+}
+
+/// cURL 명령에서 Cookie 헤더 값 추출 (-H 'cookie: ...', -b '...', --cookie '...').
+fn extractCookieHeaderFromCurl(allocator: Allocator, curl: []const u8) !?[]const u8 {
+    // bash(`\`)/cmd(`^`) 줄 연속을 공백으로 평탄화해 -H 등이 한 줄에 오게 함.
+    // 개행/CR을 공백으로 치환하면 앞의 `\`/`^`는 공백에 둘러싸여 무해해진다.
+    const joined = try allocator.dupe(u8, curl);
+    defer allocator.free(joined);
+    std.mem.replaceScalar(u8, joined, '\n', ' ');
+    std.mem.replaceScalar(u8, joined, '\r', ' ');
+    if (matchQuotedArg(joined, "-H", "cookie")) |v| return try allocator.dupe(u8, v);
+    if (matchQuotedArg(joined, "-b", null)) |v| return try allocator.dupe(u8, v);
+    if (matchQuotedArg(joined, "--cookie", null)) |v| return try allocator.dupe(u8, v);
+    return null;
+}
+
+/// Network.setCookies 배열의 단일 쿠키 객체 한 항목을 기록.
+fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8) !void {
+    if (!first) try w.writeByte(',');
+    try w.writeAll("{\"name\":");
+    try cdp.writeJsonString(w, name);
+    try w.writeAll(",\"value\":");
+    try cdp.writeJsonString(w, value);
+    try w.writeAll(",\"url\":\"*\"}");
+}
+
+/// "name=value; name2=value2" 헤더를 Network.setCookies cookies 배열 JSON으로.
+/// 비밀값을 에러 메시지에 절대 노출하지 않음.
+fn cookieHeaderToJson(allocator: Allocator, header: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('[');
+    var count: usize = 0;
+    var it = std.mem.splitScalar(u8, header, ';');
+    while (it.next()) |piece_raw| {
+        const piece = std.mem.trim(u8, piece_raw, " \t\r\n");
+        const eq = std.mem.indexOfScalar(u8, piece, '=') orelse continue;
+        const name = std.mem.trim(u8, piece[0..eq], " \t");
+        const value = std.mem.trim(u8, piece[eq + 1 ..], " \t");
+        if (name.len == 0) continue;
+        try writeCookieEntry(w, count == 0, name, value);
+        count += 1;
+    }
+    try w.writeByte(']');
+    if (count == 0) return error.NoCookies;
+    return buf.toOwnedSlice(allocator);
+}
+
+/// 쿠키 파일을 3가지 형식 자동 감지하여 Network.setCookies cookies 배열 JSON 생성:
+///   1. JSON 배열  [{"name":"x","value":"y"}, ...]
+///   2. cURL 덤프  (DevTools → Copy as cURL; -H/-b/--cookie 에서 추출)
+///   3. 베어 Cookie 헤더  name=value; name2=value2
+fn buildCookieSetArrayJson(allocator: Allocator, raw: []const u8) ![]u8 {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0) return error.EmptyFile;
+
+    if (trimmed[0] == '[') {
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch
+            return error.JsonParse;
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.JsonParse;
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+        try w.writeByte('[');
+        var count: usize = 0;
+        for (parsed.value.array.items) |c| {
+            const name = cdp.getString(c, "name") orelse return error.MissingName;
+            const value = cdp.getString(c, "value") orelse return error.MissingValue;
+            try writeCookieEntry(w, count == 0, name, value);
+            count += 1;
+        }
+        try w.writeByte(']');
+        if (count == 0) return error.NoCookies;
+        return buf.toOwnedSlice(allocator);
+    }
+
+    // cURL 휴리스틱: "curl" + 공백/따옴표로 시작
+    const looks_like_curl = trimmed.len > 4 and
+        std.ascii.eqlIgnoreCase(trimmed[0..4], "curl") and
+        (std.ascii.isWhitespace(trimmed[4]) or trimmed[4] == '\'' or trimmed[4] == '"');
+
+    if (looks_like_curl) {
+        const header = (try extractCookieHeaderFromCurl(allocator, trimmed)) orelse
+            return error.NoCookieHeaderInCurl;
+        defer allocator.free(header);
+        return cookieHeaderToJson(allocator, header);
+    }
+
+    return cookieHeaderToJson(allocator, trimmed);
+}
+
 fn handleCookieSet(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, name: ?[]const u8, value: ?[]const u8) []u8 {
     const n = name orelse return respondErr(allocator, "name required");
     const v = value orelse "";
@@ -4585,6 +4866,24 @@ fn handleCookieSet(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Command
     const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
     defer allocator.free(params);
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Network.setCookie", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
+/// 일괄 쿠키 설정 — req.url에 Network.setCookies cookies 배열 JSON이 담겨옴.
+fn handleCookieSetBulk(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, arr_opt: ?[]const u8) []u8 {
+    const arr = arr_opt orelse return respondErr(allocator, "cookies array required");
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    w.writeAll("{\"cookies\":") catch return respondErr(allocator, "write error");
+    w.writeAll(arr) catch return respondErr(allocator, "write error");
+    w.writeByte('}') catch return respondErr(allocator, "write error");
+    const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Network.setCookies", params, session_id) catch
         return respondErr(allocator, "cmd error");
     defer allocator.free(cmd);
     sender.sendText(cmd) catch {};
@@ -6721,6 +7020,31 @@ fn handleAddStyle(allocator: Allocator, sender: *WsSender, resp_map: *response_m
     return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
 }
 
+// SPA 클라이언트 네비게이션. Next.js 라우터(window.next.router.push)를 우선
+// 시도해 RSC fetch를 트리거하고, 없으면 history.pushState + popstate/navigate
+// 이벤트로 폴백 (React Router / Vue Router 등 history 이벤트 구독 라우터 대응).
+const PUSHSTATE_JS_PREFIX =
+    \\((url)=>{var before=location.href;var absolute=new URL(url,before).href;if(absolute===before)return before;var r=typeof window.next==="object"&&window.next&&window.next.router;if(r&&typeof r.push==="function"){try{r.push(url);return location.href;}catch(e){}}history.pushState(null,"",absolute);try{dispatchEvent(new PopStateEvent("popstate",{state:null}));}catch(e){}try{dispatchEvent(new Event("navigate"));}catch(e){}return location.href;})(
+;
+
+/// pushstate JS 표현식 빌드 (URL을 JSON 문자열로 이스케이프해 인자 주입). 호출자가 free.
+fn buildPushStateExpr(allocator: Allocator, url: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll(PUSHSTATE_JS_PREFIX);
+    try cdp.writeJsonString(w, url);
+    try w.writeAll(")");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn handlePushState(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, url_opt: ?[]const u8) []u8 {
+    const url = url_opt orelse return respondErr(allocator, "url required");
+    const expr = buildPushStateExpr(allocator, url) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(expr);
+    return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
+}
+
 fn jsonToF64(val: std.json.Value) ?f64 {
     return switch (val) {
         .float => |f| f,
@@ -7345,8 +7669,11 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
             else { url = dir; pattern = arg2; }
         }
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
-        if (arg1) |flag| {
-            if (std.mem.eql(u8, flag, "-i")) action = "snapshot_interactive";
+        for ([_]?[]const u8{ arg1, arg2 }) |maybe_flag| {
+            if (maybe_flag) |flag| {
+                if (std.mem.eql(u8, flag, "-i")) action = "snapshot_interactive";
+                if (std.mem.eql(u8, flag, "-u") or std.mem.eql(u8, flag, "--urls")) pattern = SNAPSHOT_URLS_FLAG;
+            }
         }
         url = null;
     } else if (std.mem.eql(u8, cmd, "screenshot")) {
@@ -8098,7 +8425,7 @@ fn handleScreenshotAnnotate(
 
         if (snap_parsed.message.isResponse()) {
             if (snap_parsed.message.result) |result| {
-                const snap_text = snapshot_mod.buildSnapshot(allocator, result, ref_map, true, null) catch
+                const snap_text = snapshot_mod.buildSnapshot(allocator, result, ref_map, true, null, null) catch
                     return respondErr(allocator, "snapshot build error");
                 allocator.free(snap_text);
             }
@@ -8289,7 +8616,7 @@ fn printUsage() void {
         \\  wait <ms>                 Wait milliseconds
         \\  screenshot [--full] [path] Take screenshot (--full for full page)
         \\  pdf [path]                Save as PDF
-        \\  snapshot [-i]             Accessibility tree with refs (-i: interactive only)
+        \\  snapshot [-i] [-u]        Accessibility tree with refs (-i: interactive only, -u/--urls: link hrefs)
         \\  eval <js>                 Run JavaScript
         \\  close                     Close browser and stop daemon
         \\
@@ -8297,6 +8624,7 @@ fn printUsage() void {
         \\  back                      Go back
         \\  forward                   Go forward
         \\  reload                    Reload page
+        \\  pushstate <url>           SPA client-side navigation (history.pushState)
         \\  url                       Get current URL
         \\  title                     Get page title
         \\  content                   Get page HTML
@@ -8351,6 +8679,7 @@ fn printUsage() void {
         \\
         \\Storage:
         \\  cookies [list|set|get|clear]  Manage cookies
+        \\  cookies set --curl <file>     Bulk import (JSON / cURL dump / Cookie header)
         \\  storage <local|session>       Manage web storage
         \\  state save|load|list          Save/restore cookies + storage
         \\
@@ -8424,6 +8753,7 @@ fn printUsage() void {
         \\  --extension <path>        Load Chrome extension (comma-separated paths)
         \\  --allowed-domains <list>  Restrict navigation to domains (e.g. example.com,*.internal.com)
         \\  --content-boundaries      Wrap page content output with boundary markers
+        \\  --no-auto-dialog          Do not auto-dismiss alert/beforeunload dialogs
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
@@ -8741,6 +9071,21 @@ test "collectExceptionEvent: falls back to unknown error" {
 // Tests: collectDialogEvent
 // ============================================================================
 
+test "shouldAutoDismissDialog: alert/beforeunload auto-dismissed when enabled" {
+    try std.testing.expect(shouldAutoDismissDialog(true, "alert"));
+    try std.testing.expect(shouldAutoDismissDialog(true, "beforeunload"));
+}
+
+test "shouldAutoDismissDialog: confirm/prompt never auto-dismissed" {
+    try std.testing.expect(!shouldAutoDismissDialog(true, "confirm"));
+    try std.testing.expect(!shouldAutoDismissDialog(true, "prompt"));
+}
+
+test "shouldAutoDismissDialog: disabled flag suppresses all auto-dismiss" {
+    try std.testing.expect(!shouldAutoDismissDialog(false, "alert"));
+    try std.testing.expect(!shouldAutoDismissDialog(false, "beforeunload"));
+}
+
 test "collectDialogEvent: stores dialog info" {
     const json =
         \\{"type":"prompt","message":"Enter name:","defaultPrompt":"John"}
@@ -9013,6 +9358,112 @@ test "handleDownloadPath: builds correct CDP command params" {
     const allocator = std.testing.allocator;
     _ = allocator;
     // handleDownloadPath needs a sender — tested via build compilation
+}
+
+test "buildCookieSetArrayJson: bare cookie header" {
+    const a = std.testing.allocator;
+    const out = try buildCookieSetArrayJson(a, "  sid=abc; theme=dark ; empty= ");
+    defer a.free(out);
+    try std.testing.expectEqualStrings(
+        "[{\"name\":\"sid\",\"value\":\"abc\",\"url\":\"*\"},{\"name\":\"theme\",\"value\":\"dark\",\"url\":\"*\"},{\"name\":\"empty\",\"value\":\"\",\"url\":\"*\"}]",
+        out,
+    );
+}
+
+test "buildCookieSetArrayJson: JSON array format" {
+    const a = std.testing.allocator;
+    const out = try buildCookieSetArrayJson(a,
+        \\[{"name":"a","value":"1","domain":"x.com"},{"name":"b","value":"2"}]
+    );
+    defer a.free(out);
+    try std.testing.expectEqualStrings(
+        "[{\"name\":\"a\",\"value\":\"1\",\"url\":\"*\"},{\"name\":\"b\",\"value\":\"2\",\"url\":\"*\"}]",
+        out,
+    );
+}
+
+test "buildCookieSetArrayJson: cURL dump extracts -H cookie header" {
+    const a = std.testing.allocator;
+    const curl = "curl 'https://x.com/api' -H 'accept: */*' -H 'cookie: sid=xyz; t=1' --compressed";
+    const out = try buildCookieSetArrayJson(a, curl);
+    defer a.free(out);
+    try std.testing.expectEqualStrings(
+        "[{\"name\":\"sid\",\"value\":\"xyz\",\"url\":\"*\"},{\"name\":\"t\",\"value\":\"1\",\"url\":\"*\"}]",
+        out,
+    );
+}
+
+test "buildCookieSetArrayJson: cURL with -b flag" {
+    const a = std.testing.allocator;
+    const out = try buildCookieSetArrayJson(a, "curl \"https://x.com\" -b \"k=v\"");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("[{\"name\":\"k\",\"value\":\"v\",\"url\":\"*\"}]", out);
+}
+
+test "buildCookieSetArrayJson: empty file errors" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.EmptyFile, buildCookieSetArrayJson(a, "   \n  "));
+}
+
+test "buildCookieSetArrayJson: cURL without cookie header errors" {
+    const a = std.testing.allocator;
+    try std.testing.expectError(error.NoCookieHeaderInCurl, buildCookieSetArrayJson(a, "curl 'https://x.com' -H 'accept: */*'"));
+}
+
+test "matchQuotedArg: respects word boundary and header prefix" {
+    // -H 'cookie: ...' → strips 'cookie:' prefix
+    try std.testing.expectEqualStrings("a=b", matchQuotedArg("x -H 'cookie: a=b'", "-H", "cookie").?);
+    // -b without expected header returns whole value
+    try std.testing.expectEqualStrings("a=b", matchQuotedArg("x -b 'a=b'", "-b", null).?);
+    // no match
+    try std.testing.expect(matchQuotedArg("x --data 'a=b'", "-b", null) == null);
+}
+
+test "collectLinkBackendIds: collects link nodes, skips non-links and ignored" {
+    const allocator = std.testing.allocator;
+    const json =
+        \\{"nodes":[
+        \\{"role":{"value":"link"},"backendDOMNodeId":11,"ignored":false},
+        \\{"role":{"value":"button"},"backendDOMNodeId":22,"ignored":false},
+        \\{"role":{"value":"link"},"backendDOMNodeId":33,"ignored":true},
+        \\{"role":{"value":"link"},"backendDOMNodeId":44}
+        \\]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, json, .{});
+    defer parsed.deinit();
+
+    const ids = try collectLinkBackendIds(allocator, parsed.value);
+    defer allocator.free(ids);
+
+    try std.testing.expectEqual(@as(usize, 2), ids.len);
+    try std.testing.expectEqual(@as(i64, 11), ids[0]);
+    try std.testing.expectEqual(@as(i64, 44), ids[1]);
+}
+
+test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
+    const allocator = std.testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const ids = try collectLinkBackendIds(allocator, parsed.value);
+    defer allocator.free(ids);
+    try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "buildPushStateExpr: embeds URL as escaped JSON arg" {
+    const allocator = std.testing.allocator;
+    const expr = try buildPushStateExpr(allocator, "/foo");
+    defer allocator.free(expr);
+    try std.testing.expect(std.mem.indexOf(u8, expr, "history.pushState") != null);
+    try std.testing.expect(std.mem.indexOf(u8, expr, "window.next") != null);
+    try std.testing.expect(std.mem.endsWith(u8, expr, "(\"/foo\")"));
+}
+
+test "buildPushStateExpr: escapes special characters in URL" {
+    const allocator = std.testing.allocator;
+    const expr = try buildPushStateExpr(allocator, "/a?q=\"x\"&b=1");
+    defer allocator.free(expr);
+    // 따옴표가 \" 로 이스케이프되어 JS 문자열 깨짐 방지
+    try std.testing.expect(std.mem.indexOf(u8, expr, "\\\"x\\\"") != null);
 }
 
 test "handleAddStyle: builds correct JS expression" {
