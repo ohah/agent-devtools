@@ -558,8 +558,48 @@ pub fn main() void {
                 defer cli_alloc.free(arr);
                 sendAction(session, "cookies_set_bulk", arr, null, daemon_opts);
             } else {
-                const value = args_iter.next() orelse "";
-                sendAction(session, "cookies_set", first, value, daemon_opts);
+                const name = first;
+                const value = args_iter.next() orelse {
+                    writeErr("Usage: agent-devtools cookies set <name> <value> [--url <u>] [--domain <d>] [--path <p>] [--httpOnly] [--secure] [--sameSite <Strict|Lax|None>] [--expires <ts>]\n", .{});
+                    std.process.exit(1);
+                };
+                var attrs = CookieAttrs{};
+                while (args_iter.next()) |fl| {
+                    if (std.mem.eql(u8, fl, "--url")) {
+                        attrs.url = args_iter.next() orelse missingCookieFlag("--url");
+                    } else if (std.mem.eql(u8, fl, "--domain")) {
+                        attrs.domain = args_iter.next() orelse missingCookieFlag("--domain");
+                    } else if (std.mem.eql(u8, fl, "--path")) {
+                        attrs.path = args_iter.next() orelse missingCookieFlag("--path");
+                    } else if (std.mem.eql(u8, fl, "--httpOnly")) {
+                        attrs.http_only = true;
+                    } else if (std.mem.eql(u8, fl, "--secure")) {
+                        attrs.secure = true;
+                    } else if (std.mem.eql(u8, fl, "--sameSite")) {
+                        const sv = args_iter.next() orelse missingCookieFlag("--sameSite");
+                        if (!std.mem.eql(u8, sv, "Strict") and !std.mem.eql(u8, sv, "Lax") and !std.mem.eql(u8, sv, "None")) {
+                            writeErr("cookies set --sameSite: expected Strict|Lax|None\n", .{});
+                            std.process.exit(1);
+                        }
+                        attrs.same_site = sv;
+                    } else if (std.mem.eql(u8, fl, "--expires")) {
+                        const ev = args_iter.next() orelse missingCookieFlag("--expires");
+                        attrs.expires = std.fmt.parseInt(i64, ev, 10) catch {
+                            writeErr("cookies set --expires: expected integer timestamp\n", .{});
+                            std.process.exit(1);
+                        };
+                    } else {
+                        writeErr("cookies set: unknown flag '{s}'\n", .{fl});
+                        std.process.exit(1);
+                    }
+                }
+                const cli_alloc = std.heap.page_allocator;
+                const arr = buildSingleCookieArrayJson(cli_alloc, name, value, attrs) catch {
+                    writeErr("cookies set: build error\n", .{});
+                    std.process.exit(1);
+                };
+                defer cli_alloc.free(arr);
+                sendAction(session, "cookies_set_bulk", arr, null, daemon_opts);
             }
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const name = args_iter.next() orelse {
@@ -1508,6 +1548,53 @@ fn buildCountExpr(allocator: Allocator, selector: []const u8) ![]u8 {
     try w.writeAll("String(document.querySelectorAll(");
     try cdp.writeJsonString(w, selector);
     try w.writeAll(").length)");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `cookies set <name> <value>`의 선택적 CDP CookieParam 속성.
+const CookieAttrs = struct {
+    url: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    http_only: bool = false,
+    secure: bool = false,
+    same_site: ?[]const u8 = null, // Strict|Lax|None
+    expires: ?i64 = null,
+};
+
+fn missingCookieFlag(flag: []const u8) noreturn {
+    writeErr("cookies set {s}: missing value\n", .{flag});
+    std.process.exit(1);
+}
+
+/// name/value + 속성을 CDP Network.setCookies가 받는 단일 쿠키 배열 JSON `[{...}]`
+/// 으로 직렬화 (bulk 경로 재사용). 문자열은 JSON 인코딩.
+fn buildSingleCookieArrayJson(allocator: Allocator, name: []const u8, value: []const u8, attrs: CookieAttrs) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('[');
+    try writeCookieNameValue(w, name, value);
+    if (attrs.url) |v| {
+        try w.writeAll(",\"url\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.domain) |v| {
+        try w.writeAll(",\"domain\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.path) |v| {
+        try w.writeAll(",\"path\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.http_only) try w.writeAll(",\"httpOnly\":true");
+    if (attrs.secure) try w.writeAll(",\"secure\":true");
+    if (attrs.same_site) |v| {
+        try w.writeAll(",\"sameSite\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.expires) |e| try w.print(",\"expires\":{d}", .{e});
+    try w.writeAll("}]");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -5377,12 +5464,17 @@ fn extractCookieHeaderFromCurl(allocator: Allocator, curl: []const u8) !?[]const
 /// 단일 쿠키 객체 기록. domain이 주어지면 포함(없으면 daemon이 현재 URL 주입).
 /// CDP CookieParam은 url 또는 domain 중 하나가 필요 — 여기선 url을 넣지 않고
 /// daemon(handleCookieSetBulk/handleCookieSet)이 현재 페이지 URL을 채운다.
-fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8, domain: ?[]const u8) !void {
-    if (!first) try w.writeByte(',');
+/// `{"name":<json>,"value":<json>` (객체 시작 + 닫는 `}` 없음) — 쿠키 JSON 공통 머리.
+fn writeCookieNameValue(w: anytype, name: []const u8, value: []const u8) !void {
     try w.writeAll("{\"name\":");
     try cdp.writeJsonString(w, name);
     try w.writeAll(",\"value\":");
     try cdp.writeJsonString(w, value);
+}
+
+fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8, domain: ?[]const u8) !void {
+    if (!first) try w.writeByte(',');
+    try writeCookieNameValue(w, name, value);
     if (domain) |d| {
         try w.writeAll(",\"domain\":");
         try cdp.writeJsonString(w, d);
@@ -11065,6 +11157,37 @@ test "buildCountExpr: JSON-encodes selector into querySelectorAll" {
     const e2 = try buildCountExpr(a, "a[href=\"x\"]");
     defer a.free(e2);
     try std.testing.expectEqualStrings("String(document.querySelectorAll(\"a[href=\\\"x\\\"]\").length)", e2);
+}
+
+test "buildSingleCookieArrayJson: name/value only" {
+    const a = std.testing.allocator;
+    const j = try buildSingleCookieArrayJson(a, "sid", "abc", .{});
+    defer a.free(j);
+    try std.testing.expectEqualStrings("[{\"name\":\"sid\",\"value\":\"abc\"}]", j);
+}
+
+test "buildSingleCookieArrayJson: all attributes + JSON-escaped" {
+    const a = std.testing.allocator;
+    const j = try buildSingleCookieArrayJson(a, "n\"x", "v", .{
+        .domain = "example.com",
+        .path = "/app",
+        .http_only = true,
+        .secure = true,
+        .same_site = "Lax",
+        .expires = 1700000000,
+    });
+    defer a.free(j);
+    try std.testing.expectEqualStrings(
+        "[{\"name\":\"n\\\"x\",\"value\":\"v\",\"domain\":\"example.com\",\"path\":\"/app\",\"httpOnly\":true,\"secure\":true,\"sameSite\":\"Lax\",\"expires\":1700000000}]",
+        j,
+    );
+}
+
+test "buildSingleCookieArrayJson: url only (no domain)" {
+    const a = std.testing.allocator;
+    const j = try buildSingleCookieArrayJson(a, "k", "1", .{ .url = "https://h/p" });
+    defer a.free(j);
+    try std.testing.expectEqualStrings("[{\"name\":\"k\",\"value\":\"1\",\"url\":\"https://h/p\"}]", j);
 }
 
 test "buildDebugResponse: merges debug into response" {
