@@ -837,14 +837,37 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         var interactive_snap = false;
         var with_urls = false;
+        var depth: ?[]const u8 = null;
+        var selector: ?[]const u8 = null;
+        // -c/--compact, -C/--cursor: agent-devtools 기본 출력이 이미 compact +
+        // cursor 힌트 포함 → 플래그 수용(파서 호환), 동작 변화 없음.
         while (args_iter.next()) |f| {
-            if (std.mem.eql(u8, f, "-i")) {
+            if (std.mem.eql(u8, f, "-i") or std.mem.eql(u8, f, "--interactive")) {
                 interactive_snap = true;
             } else if (std.mem.eql(u8, f, "-u") or std.mem.eql(u8, f, "--urls")) {
                 with_urls = true;
+            } else if (std.mem.eql(u8, f, "-d") or std.mem.eql(u8, f, "--depth")) {
+                depth = args_iter.next();
+            } else if (std.mem.eql(u8, f, "-s") or std.mem.eql(u8, f, "--selector")) {
+                selector = args_iter.next();
+            } else if (std.mem.eql(u8, f, "-c") or std.mem.eql(u8, f, "--compact") or
+                std.mem.eql(u8, f, "-C") or std.mem.eql(u8, f, "--cursor"))
+            {
+                // accepted no-op (already default behavior)
             }
         }
-        sendAction(session, if (interactive_snap) "snapshot_interactive" else "snapshot", null, if (with_urls) SNAPSHOT_URLS_FLAG else null, daemon_opts);
+        const action = if (interactive_snap) "snapshot_interactive" else "snapshot";
+        if (depth == null and selector == null) {
+            sendAction(session, action, null, if (with_urls) SNAPSHOT_URLS_FLAG else null, daemon_opts);
+        } else {
+            const pa = std.heap.page_allocator;
+            const extra = buildSnapshotExtraJson(pa, depth, selector) catch {
+                writeErr("snapshot: build error (depth must be an integer)\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(extra);
+            sendActionEx(session, action, null, if (with_urls) SNAPSHOT_URLS_FLAG else null, extra, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "click")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools click <@ref or selector>\n", .{});
@@ -1728,6 +1751,27 @@ fn buildNetFilterExtraJson(allocator: Allocator, rtype: ?[]const u8, method: ?[]
             try cdp.writeJsonString(w, val);
             first = false;
         }
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// snapshot -d/-s → 데몬 전달 JSON `{"depth":N,"selector":".."}`. depth는 정수 검증.
+fn buildSnapshotExtraJson(allocator: Allocator, depth: ?[]const u8, selector: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    if (depth) |d| {
+        const n = std.fmt.parseInt(u32, d, 10) catch return error.InvalidDepth;
+        try w.print("\"depth\":{d}", .{n});
+        first = false;
+    }
+    if (selector) |s| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"selector\":");
+        try cdp.writeJsonString(w, s);
     }
     try w.writeByte('}');
     return buf.toOwnedSlice(allocator);
@@ -3788,7 +3832,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lock();
         defer ctx.ref_map_rwlock.unlock();
         const with_urls = if (req.pattern) |p| std.mem.eql(u8, p, SNAPSHOT_URLS_FLAG) else false;
-        return handleSnapshot(allocator, sender, resp_map, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"), with_urls);
+        return handleSnapshot(allocator, sender, resp_map, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"), with_urls, req.extra);
     } else if (std.mem.eql(u8, req.action, "click") or std.mem.eql(u8, req.action, "hover")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -4466,7 +4510,28 @@ fn resolveElementHref(allocator: Allocator, sender: *WsSender, resp_map: *respon
     return null;
 }
 
-fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool) []u8 {
+fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool, extra_opt: ?[]const u8) []u8 {
+    // -d/--depth, -s/--selector 옵션 파싱
+    var snap_opts = snapshot_mod.SnapOpts{};
+    var parsed_extra: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_extra) |p| p.deinit();
+    if (extra_opt) |ex| {
+        parsed_extra = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch null;
+        if (parsed_extra) |p| {
+            if (p.value == .object) {
+                if (p.value.object.get("depth")) |dv| {
+                    if (dv == .integer and dv.integer > 0) snap_opts.max_depth = @intCast(dv.integer);
+                }
+                if (p.value.object.get("selector")) |sv| {
+                    if (sv == .string and sv.string.len > 0) {
+                        snap_opts.root_backend_id = resolveSelectorBackendId(allocator, sender, resp_map, cmd_id, session_id, sv.string);
+                        if (snap_opts.root_backend_id == null)
+                            return respondErr(allocator, "snapshot --selector: element not found");
+                    }
+                }
+            }
+        }
+    }
     // Clear old refs
     ref_map.deinit();
     ref_map.* = snapshot_mod.RefMap.init(allocator);
@@ -4522,7 +4587,7 @@ fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_m
             }
             const url_ptr: ?*const std.AutoHashMap(i64, []const u8) = if (with_urls) &link_url_map else null;
 
-            const snap = snapshot_mod.buildSnapshot(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr) catch
+            const snap = snapshot_mod.buildSnapshotWithOpts(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr, snap_opts) catch
                 return respondErr(allocator, "snapshot build error");
             defer allocator.free(snap);
 
@@ -5223,6 +5288,62 @@ fn handleDrag(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
 }
 
 /// DOM.resolveNode → objectId. Caller must free the returned slice.
+/// CSS selector → backendNodeId. DOM.getDocument → DOM.querySelector →
+/// describeNode. 미발견/오류 시 null. (snapshot --selector)
+fn resolveSelectorBackendId(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, selector: []const u8) ?i64 {
+    // 1. DOM.getDocument → root nodeId
+    const doc_id = cmd_id.next();
+    const doc_cmd = cdp.serializeCommand(allocator, doc_id, "DOM.getDocument", "{\"depth\":0}", session_id) catch return null;
+    defer allocator.free(doc_cmd);
+    const doc_raw = sendAndWait(sender, resp_map, doc_cmd, doc_id, 5_000) orelse return null;
+    defer allocator.free(doc_raw);
+    const doc_parsed = cdp.parseMessage(allocator, doc_raw) catch return null;
+    defer doc_parsed.parsed.deinit();
+    const root_nid: i64 = blk: {
+        if (doc_parsed.message.isResponse()) if (doc_parsed.message.result) |r|
+            if (cdp.getObject(r, "root")) |root|
+                if (cdp.getInt(root, "nodeId")) |nid| break :blk nid;
+        return null;
+    };
+
+    // 2. DOM.querySelector(root, selector) → nodeId
+    var qp: std.ArrayList(u8) = .empty;
+    defer qp.deinit(allocator);
+    const qw = qp.writer(allocator);
+    qw.print("{{\"nodeId\":{d},\"selector\":", .{root_nid}) catch return null;
+    cdp.writeJsonString(qw, selector) catch return null;
+    qw.writeByte('}') catch return null;
+    const qs_id = cmd_id.next();
+    const qs_cmd = cdp.serializeCommand(allocator, qs_id, "DOM.querySelector", qp.items, session_id) catch return null;
+    defer allocator.free(qs_cmd);
+    const qs_raw = sendAndWait(sender, resp_map, qs_cmd, qs_id, 5_000) orelse return null;
+    defer allocator.free(qs_raw);
+    const qs_parsed = cdp.parseMessage(allocator, qs_raw) catch return null;
+    defer qs_parsed.parsed.deinit();
+    const node_nid: i64 = blk: {
+        if (qs_parsed.message.isResponse()) if (qs_parsed.message.result) |r|
+            if (cdp.getInt(r, "nodeId")) |nid| {
+                if (nid != 0) break :blk nid;
+            };
+        return null; // 미발견 시 nodeId 0
+    };
+
+    // 3. DOM.describeNode → backendNodeId
+    var dp_buf: [64]u8 = undefined;
+    const dp = std.fmt.bufPrint(&dp_buf, "{{\"nodeId\":{d}}}", .{node_nid}) catch return null;
+    const d_id = cmd_id.next();
+    const d_cmd = cdp.serializeCommand(allocator, d_id, "DOM.describeNode", dp, session_id) catch return null;
+    defer allocator.free(d_cmd);
+    const d_raw = sendAndWait(sender, resp_map, d_cmd, d_id, 5_000) orelse return null;
+    defer allocator.free(d_raw);
+    const d_parsed = cdp.parseMessage(allocator, d_raw) catch return null;
+    defer d_parsed.parsed.deinit();
+    if (d_parsed.message.isResponse()) if (d_parsed.message.result) |r|
+        if (cdp.getObject(r, "node")) |n|
+            if (cdp.getInt(n, "backendNodeId")) |bid| return bid;
+    return null;
+}
+
 fn resolveNodeObjectId(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, backend_id: i64) ?[]u8 {
     var resolve_buf: [128]u8 = undefined;
     const resolve_params = std.fmt.bufPrint(&resolve_buf, "{{\"backendNodeId\":{d}}}", .{backend_id}) catch return null;
@@ -11698,6 +11819,20 @@ test "buildNetFilterExtraJson: subset + escaping" {
     const e2 = try buildNetFilterExtraJson(a, null, "POST", null);
     defer a.free(e2);
     try std.testing.expectEqualStrings("{\"method\":\"POST\"}", e2);
+}
+
+test "buildSnapshotExtraJson: depth/selector subsets" {
+    const a = std.testing.allocator;
+    const e1 = try buildSnapshotExtraJson(a, "3", "#main");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"depth\":3,\"selector\":\"#main\"}", e1);
+    const e2 = try buildSnapshotExtraJson(a, null, ".x");
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{\"selector\":\".x\"}", e2);
+    const e3 = try buildSnapshotExtraJson(a, "5", null);
+    defer a.free(e3);
+    try std.testing.expectEqualStrings("{\"depth\":5}", e3);
+    try std.testing.expectError(error.InvalidDepth, buildSnapshotExtraJson(a, "abc", null));
 }
 
 test "buildDebugResponse: merges debug into response" {
