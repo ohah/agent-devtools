@@ -106,6 +106,9 @@ pub const Request = struct {
     action: []const u8,
     url: ?[]const u8 = null,
     pattern: ?[]const u8 = null,
+    /// 범용 보조 인자 — url/pattern 슬롯이 이미 점유된 명령에서 추가 값 전달용.
+    /// 현재 사용처: intercept의 --resource-type CSV.
+    extra: ?[]const u8 = null,
 };
 
 pub const Response = struct {
@@ -132,6 +135,10 @@ pub fn serializeRequest(allocator: Allocator, req: Request) ![]u8 {
     if (req.pattern) |pattern| {
         try writer.writeAll(",\"pattern\":");
         try cdp.writeJsonString(writer, pattern);
+    }
+    if (req.extra) |extra| {
+        try writer.writeAll(",\"extra\":");
+        try cdp.writeJsonString(writer, extra);
     }
 
     try writer.writeAll("}\n");
@@ -172,6 +179,7 @@ pub fn parseRequest(allocator: Allocator, line: []const u8) !Request {
     const action_raw = cdp.getString(parsed.value, "action") orelse return error.InvalidCharacter;
     const url_raw = cdp.getString(parsed.value, "url");
     const pattern_raw = cdp.getString(parsed.value, "pattern");
+    const extra_raw = cdp.getString(parsed.value, "extra");
 
     // Dupe strings since parsed will be freed
     const id = try allocator.dupe(u8, id_raw);
@@ -181,12 +189,16 @@ pub fn parseRequest(allocator: Allocator, line: []const u8) !Request {
     const url = if (url_raw) |u| try allocator.dupe(u8, u) else null;
     errdefer if (url) |u| allocator.free(u);
     const pattern = if (pattern_raw) |p| try allocator.dupe(u8, p) else null;
+    errdefer if (pattern) |p| allocator.free(p);
+    const extra = if (extra_raw) |e| try allocator.dupe(u8, e) else null;
+    errdefer if (extra) |e| allocator.free(e);
 
     return .{
         .id = id,
         .action = action,
         .url = url,
         .pattern = pattern,
+        .extra = extra,
     };
 }
 
@@ -195,6 +207,7 @@ pub fn freeRequest(allocator: Allocator, req: Request) void {
     allocator.free(req.action);
     if (req.url) |u| allocator.free(u);
     if (req.pattern) |p| allocator.free(p);
+    if (req.extra) |e| allocator.free(e);
 }
 
 /// Parse a response from a JSON-line.
@@ -463,6 +476,8 @@ pub const DaemonOptions = struct {
     extensions: ?[]const u8 = null,
     allowed_domains: ?[]const u8 = null,
     content_boundaries: bool = false,
+    no_auto_dialog: bool = false,
+    init_scripts: ?[]const u8 = null, // 쉼표 구분 스크립트 파일 경로 목록
 };
 
 /// Ensure a daemon is running for the given session.
@@ -509,6 +524,8 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (opts.extensions) |e| try env_map.put("AGENT_DEVTOOLS_EXTENSIONS", e);
     if (opts.allowed_domains) |d| try env_map.put("AGENT_DEVTOOLS_ALLOWED_DOMAINS", d);
     if (opts.content_boundaries) try env_map.put("AGENT_DEVTOOLS_CONTENT_BOUNDARIES", "1");
+    if (opts.no_auto_dialog) try env_map.put("AGENT_DEVTOOLS_NO_AUTO_DIALOG", "1");
+    if (opts.init_scripts) |s| try env_map.put("AGENT_DEVTOOLS_INIT_SCRIPTS", s);
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning
@@ -634,6 +651,24 @@ test "parseRequest: with url and pattern" {
     try testing.expectEqualStrings("network_filter", req.action);
     try testing.expectEqualStrings("https://test.com", req.url.?);
     try testing.expectEqualStrings("api", req.pattern.?);
+}
+
+test "Request: extra field roundtrip" {
+    const req = Request{
+        .id = "9",
+        .action = "intercept_fail",
+        .url = "*api*",
+        .pattern = null,
+        .extra = "Script,XHR",
+    };
+    const line = try serializeRequest(testing.allocator, req);
+    defer testing.allocator.free(line);
+    try testing.expect(std.mem.indexOf(u8, line, "\"extra\":\"Script,XHR\"") != null);
+
+    const back = try parseRequest(testing.allocator, line);
+    defer freeRequest(testing.allocator, back);
+    try testing.expectEqualStrings("Script,XHR", back.extra.?);
+    try testing.expect(back.pattern == null);
 }
 
 test "parseResponse: success with nested data" {
