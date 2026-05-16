@@ -297,7 +297,15 @@ pub fn main() void {
         return;
     };
 
-    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+    if (std.mem.eql(u8, cmd, "batch")) {
+        const bail = blk: {
+            while (args_iter.next()) |a| if (std.mem.eql(u8, a, "--bail")) break :blk true;
+            break :blk false;
+        };
+        const exit_code = runBatch(session, daemon_opts, bail);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         printUsage();
     } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
         write("agent-devtools {s}\n", .{version});
@@ -1664,6 +1672,73 @@ fn buildDebugResponse(
     return result.toOwnedSlice(allocator) catch null;
 }
 
+/// batch [--bail]: stdin에서 줄당 한 명령(대화형과 동일 문법)을 읽어
+/// 같은 데몬에 순차 실행, 각 응답을 한 줄씩 출력. --bail은 첫 실패에서 중단.
+/// 하나라도 실패하면 종료코드 1.
+/// 세션 데몬에 사전 직렬화된 요청 1건 송신 후 응답 라인 반환 (호출자 free).
+fn sendOneCommand(allocator: Allocator, session: []const u8, data: []const u8) ![]u8 {
+    var client = try daemon.SocketClient.connect(session);
+    defer client.close();
+    try client.send(data);
+    return client.recvLineAlloc(allocator);
+}
+
+/// daemon 응답이 실패인지 판정. 최상위 success 불리언을 파싱(견고).
+/// 파싱 실패 시에만 substring 폴백 (payload 오탐 방지).
+fn responseFailed(allocator: Allocator, resp: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
+        return std.mem.indexOf(u8, resp, "\"success\":false") != null;
+    defer parsed.deinit();
+    return (cdp.getBool(parsed.value, "success") orelse true) == false;
+}
+
+fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) u8 {
+    var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa_impl.deinit();
+    const allocator = gpa_impl.allocator();
+
+    const started = daemon.ensureDaemon(allocator, session, daemon_opts) catch |err| {
+        writeErr("Failed to start daemon: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    if (started) writeErr("Started daemon (session: {s})\n", .{session});
+
+    const stdin = std.fs.File.stdin();
+    const input = stdin.readToEndAlloc(allocator, 16 * 1024 * 1024) catch {
+        writeErr("batch: failed to read stdin\n", .{});
+        return 1;
+    };
+    defer allocator.free(input);
+
+    var had_failure = false;
+    var counter: usize = 1;
+    var it = std.mem.splitScalar(u8, input, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var id_buf: [20]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{counter}) catch unreachable; // [20]u8는 usize 10진수 충분
+        counter += 1;
+
+        const resp: []u8 = blk: {
+            const data = parseTextCommand(allocator, line, id_str) orelse
+                break :blk allocator.dupe(u8, "{\"success\":false,\"error\":\"parse error\"}") catch return 1;
+            defer allocator.free(data);
+            break :blk sendOneCommand(allocator, session, data) catch
+                allocator.dupe(u8, "{\"success\":false,\"error\":\"daemon send/recv failed\"}") catch return 1;
+        };
+        defer allocator.free(resp);
+        writeLine(resp);
+
+        if (responseFailed(allocator, resp)) {
+            had_failure = true;
+            if (bail) return 1;
+        }
+    }
+    return if (had_failure) 1 else 0;
+}
+
 /// Interactive/pipe mode: persistent REPL that reads JSON commands from stdin,
 /// sends them to the daemon, and writes responses + events to stdout.
 fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_mode: bool) u8 {
@@ -1881,7 +1956,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_
                         _ = stdout_f.write(debug_resp) catch {};
                         _ = stdout_f.write("\n") catch {};
 
-                        if (std.mem.indexOf(u8, resp_line, "\"success\":false") != null) {
+                        if (responseFailed(allocator, resp_line)) {
                             had_failure = true;
                         }
                         continue;
@@ -1895,7 +1970,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_
             _ = stdout_f.write("\n") catch {};
 
             // Track failures for exit code
-            if (std.mem.indexOf(u8, resp_line, "\"success\":false") != null) {
+            if (responseFailed(allocator, resp_line)) {
                 had_failure = true;
             }
         }
@@ -9329,6 +9404,7 @@ fn printUsage() void {
         \\  --init-script <path>      Register a script file to run before page JS (repeatable)
         \\  --enable=react-devtools   Install React DevTools hook (exposes __REACT_DEVTOOLS_GLOBAL_HOOK__)
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
+        \\  batch [--bail]            Run stdin commands (one per line); --bail stops on first failure
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
         \\
@@ -9953,6 +10029,16 @@ test "buildCookieSetParams: injects page_url only when no url/domain; valid JSON
     try std.testing.expectEqualStrings("https://x.com", cookies[0].object.get("url").?.string);
     try std.testing.expect(cookies[1].object.get("url") == null); // domain만
     try std.testing.expectEqualStrings("https://page.example/", cookies[2].object.get("url").?.string);
+}
+
+test "responseFailed: parses top-level success, ignores payload substring" {
+    const a = std.testing.allocator;
+    try std.testing.expect(responseFailed(a, "{\"success\":false,\"error\":\"x\"}"));
+    try std.testing.expect(!responseFailed(a, "{\"success\":true}"));
+    // payload에 "success":false 가 들어가도 최상위는 true → 실패 아님 (오탐 방지)
+    try std.testing.expect(!responseFailed(a, "{\"success\":true,\"data\":\"{\\\"success\\\":false}\"}"));
+    // 깨진 JSON → substring 폴백
+    try std.testing.expect(responseFailed(a, "garbage \"success\":false tail"));
 }
 
 test "buildCookieSetParams: empty array yields empty cookies" {
