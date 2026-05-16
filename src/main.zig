@@ -697,9 +697,12 @@ pub fn main() void {
         const v1 = args_iter.next() orelse "";
         const v2 = args_iter.next();
         if (std.mem.eql(u8, what, "viewport")) {
-            sendAction(session, "set_viewport", v1, v2, daemon_opts);
+            // set viewport <w> <h> [scale] — scale는 viewport에서만 소비
+            // (다른 set 하위명령의 가변 인자 소비를 깨지 않도록 선소비 금지)
+            sendActionEx(session, "set_viewport", v1, v2, args_iter.next(), daemon_opts);
         } else if (std.mem.eql(u8, what, "media")) {
-            sendAction(session, "set_media", v1, null, daemon_opts);
+            // set media <scheme> [reduced-motion]
+            sendAction(session, "set_media", v1, v2, daemon_opts);
         } else if (std.mem.eql(u8, what, "offline")) {
             sendAction(session, "set_offline", v1, null, daemon_opts);
         } else if (std.mem.eql(u8, what, "timezone")) {
@@ -794,11 +797,18 @@ pub fn main() void {
         }
     } else if (std.mem.eql(u8, cmd, "mouse")) {
         const action = args_iter.next() orelse "move";
-        const x = args_iter.next() orelse "0";
-        const y = args_iter.next() orelse "0";
-        // Pack "x:y" into pattern field since Request only has url+pattern
-        var coords_buf: [32]u8 = undefined;
-        const coords = std.fmt.bufPrint(&coords_buf, "{s}:{s}", .{ x, y }) catch "0:0";
+        var coords_buf: [48]u8 = undefined;
+        var coords: []const u8 = "0:0";
+        if (std.mem.eql(u8, action, "down") or std.mem.eql(u8, action, "up")) {
+            // mouse down|up [button]  (좌표 없이 버튼만 — 0:0:button)
+            const btn = args_iter.next() orelse "left";
+            coords = std.fmt.bufPrint(&coords_buf, "0:0:{s}", .{btn}) catch "0:0:left";
+        } else {
+            // mouse move|wheel <a> <b>  (move=x:y, wheel=dx:dy)
+            const a = args_iter.next() orelse "0";
+            const b = args_iter.next() orelse "0";
+            coords = std.fmt.bufPrint(&coords_buf, "{s}:{s}", .{ a, b }) catch "0:0";
+        }
         sendAction(session, "mouse", action, coords, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "screenshot")) {
         var annotate = false;
@@ -1101,11 +1111,11 @@ pub fn main() void {
             writeErr("Usage: agent-devtools clipboard <get|set> [text]\n", .{});
             std.process.exit(1);
         };
-        if (std.mem.eql(u8, subcmd, "get")) {
+        if (std.mem.eql(u8, subcmd, "get") or std.mem.eql(u8, subcmd, "paste") or std.mem.eql(u8, subcmd, "read")) {
             sendAction(session, "clipboard_get", null, null, daemon_opts);
-        } else if (std.mem.eql(u8, subcmd, "set")) {
+        } else if (std.mem.eql(u8, subcmd, "set") or std.mem.eql(u8, subcmd, "copy") or std.mem.eql(u8, subcmd, "write")) {
             const text = args_iter.next() orelse {
-                writeErr("Usage: agent-devtools clipboard set <text>\n", .{});
+                writeErr("Usage: agent-devtools clipboard <set|copy> <text>\n", .{});
                 std.process.exit(1);
             };
             sendAction(session, "clipboard_set", text, null, daemon_opts);
@@ -4023,9 +4033,9 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "cookies_set_bulk")) {
         return handleCookieSetBulk(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "set_viewport")) {
-        return handleSetViewport(allocator, sender, cmd_id, session_id, req.url, req.pattern);
+        return handleSetViewport(allocator, sender, cmd_id, session_id, req.url, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "set_media")) {
-        return handleSetMedia(allocator, sender, cmd_id, session_id, req.url);
+        return handleSetMedia(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "set_offline")) {
         return handleSetOffline(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "set_user_agent")) {
@@ -6265,11 +6275,13 @@ fn handleCookieSetBulk(allocator: Allocator, sender: *WsSender, resp_map: *respo
     return respondOk(allocator);
 }
 
-fn handleSetViewport(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, width_str: ?[]const u8, height_str: ?[]const u8) []u8 {
+fn handleSetViewport(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, width_str: ?[]const u8, height_str: ?[]const u8, scale_str: ?[]const u8) []u8 {
     const w = std.fmt.parseInt(i32, width_str orelse "1280", 10) catch 1280;
     const h = std.fmt.parseInt(i32, height_str orelse "720", 10) catch 720;
+    // set viewport <w> <h> [scale] — deviceScaleFactor (기본 1)
+    const scale = if (scale_str) |s| (std.fmt.parseFloat(f64, s) catch 1.0) else 1.0;
     var buf: [128]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":1,\"mobile\":false}}", .{ w, h }) catch
+    const params = std.fmt.bufPrint(&buf, "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":{d},\"mobile\":false}}", .{ w, h, scale }) catch
         return respondErr(allocator, "format error");
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Emulation.setDeviceMetricsOverride", params, session_id) catch
         return respondErr(allocator, "cmd error");
@@ -6278,15 +6290,27 @@ fn handleSetViewport(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Comma
     return respondOk(allocator);
 }
 
-fn handleSetMedia(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, scheme: ?[]const u8) []u8 {
-    const s = scheme orelse "dark";
+/// Emulation.setEmulatedMedia params. prefers-color-scheme + 선택적
+/// prefers-reduced-motion:reduce (set media <scheme> [reduced-motion]).
+fn buildEmulatedMediaParams(allocator: Allocator, scheme: []const u8, reduced: bool) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    w.writeAll("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(w, s) catch return respondErr(allocator, "write error");
-    w.writeAll("}]}") catch {};
-    const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    try w.writeAll("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":");
+    try cdp.writeJsonString(w, scheme);
+    try w.writeByte('}');
+    if (reduced) try w.writeAll(",{\"name\":\"prefers-reduced-motion\",\"value\":\"reduce\"}");
+    try w.writeAll("]}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn handleSetMedia(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, scheme: ?[]const u8, reduced_opt: ?[]const u8) []u8 {
+    const s = scheme orelse "dark";
+    const reduced = if (reduced_opt) |rm|
+        (std.mem.eql(u8, rm, "reduced-motion") or std.mem.eql(u8, rm, "reduce"))
+    else
+        false;
+    const params = buildEmulatedMediaParams(allocator, s, reduced) catch return respondErr(allocator, "alloc error");
     defer allocator.free(params);
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Emulation.setEmulatedMedia", params, session_id) catch
         return respondErr(allocator, "cmd error");
@@ -6324,24 +6348,53 @@ fn handleSetUserAgent(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Comm
     return respondOk(allocator);
 }
 
+const MouseCoords = struct { a: i32, b: i32, button: ?[]const u8 };
+/// 패킹된 coords "a:b" 또는 "a:b:button" 파싱 (move=x:y, wheel=dx:dy).
+fn parseMouseCoords(s: []const u8) MouseCoords {
+    var parts = std.mem.splitScalar(u8, s, ':');
+    const a_str = parts.next() orelse "0";
+    const b_str = parts.next() orelse "0";
+    const btn = parts.next();
+    return .{
+        .a = std.fmt.parseInt(i32, a_str, 10) catch 0,
+        .b = std.fmt.parseInt(i32, b_str, 10) catch 0,
+        .button = if (btn) |x| (if (x.len > 0) x else null) else null,
+    };
+}
+
 fn handleMouse(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, action: ?[]const u8, coords: ?[]const u8) []u8 {
     const act = action orelse "move";
-    const coord_str = coords orelse "0:0";
+    const mc = parseMouseCoords(coords orelse "0:0");
+    const a_val = mc.a;
+    const b_val = mc.b;
+    const btn_part = mc.button;
 
-    // Parse "x:y" packed coords
-    var x: i32 = 0;
-    var y: i32 = 0;
-    if (std.mem.indexOf(u8, coord_str, ":")) |sep| {
-        x = std.fmt.parseInt(i32, coord_str[0..sep], 10) catch 0;
-        y = std.fmt.parseInt(i32, coord_str[sep + 1 ..], 10) catch 0;
-    } else {
-        x = std.fmt.parseInt(i32, coord_str, 10) catch 0;
+    if (std.mem.eql(u8, act, "wheel")) {
+        // mouse wheel <dx> <dy> → 공용 mouseWheel 디스패치
+        return dispatchMouseWheel(allocator, sender, cmd_id, session_id, a_val, b_val);
     }
 
     const mouse_type = if (std.mem.eql(u8, act, "down")) "mousePressed" else if (std.mem.eql(u8, act, "up")) "mouseReleased" else "mouseMoved";
+    // button: left(기본)|right|middle. down/up은 좌표 생략 시 0,0 (현재 위치 의도면 move 선행).
+    const button: []const u8 = if (btn_part) |b|
+        (if (std.mem.eql(u8, b, "right") or std.mem.eql(u8, b, "middle")) b else "left")
+    else
+        "left";
 
-    var buf: [128]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"left\"}}", .{ mouse_type, x, y }) catch
+    var buf: [160]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"{s}\",\"buttons\":1}}", .{ mouse_type, a_val, b_val, button }) catch
+        return respondErr(allocator, "format error");
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
+/// Input.dispatchMouseEvent type:mouseWheel 디스패치 (handleScroll/handleMouse 공용).
+fn dispatchMouseWheel(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, delta_x: i32, delta_y: i32) []u8 {
+    var buf: [160]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"mouseWheel\",\"x\":400,\"y\":300,\"deltaX\":{d},\"deltaY\":{d}}}", .{ delta_x, delta_y }) catch
         return respondErr(allocator, "format error");
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
         return respondErr(allocator, "cmd error");
@@ -6352,22 +6405,10 @@ fn handleMouse(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, 
 
 fn handleScroll(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, dir_opt: ?[]const u8, px_opt: ?[]const u8) []u8 {
     const direction = dir_opt orelse "down";
-    const px_str = px_opt orelse "300";
-    const px = std.fmt.parseInt(i32, px_str, 10) catch 300;
-
+    const px = std.fmt.parseInt(i32, px_opt orelse "300", 10) catch 300;
     const delta_x: i32 = if (std.mem.eql(u8, direction, "left")) -px else if (std.mem.eql(u8, direction, "right")) px else 0;
     const delta_y: i32 = if (std.mem.eql(u8, direction, "up")) -px else if (std.mem.eql(u8, direction, "down")) px else 0;
-
-    var buf: [256]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"mouseWheel\",\"x\":400,\"y\":300,\"deltaX\":{d},\"deltaY\":{d}}}", .{ delta_x, delta_y }) catch
-        return respondErr(allocator, "format error");
-
-    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
-        return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd);
-    sender.sendText(cmd) catch {};
-
-    return respondOk(allocator);
+    return dispatchMouseWheel(allocator, sender, cmd_id, session_id, delta_x, delta_y);
 }
 
 fn handleStorage(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, action: []const u8, key: ?[]const u8, value: ?[]const u8) []u8 {
@@ -12230,6 +12271,28 @@ test "lookupTabLabel: label→targetId, passthrough, null" {
     try std.testing.expectEqualStrings("TARGET-123", lookupTabLabel(&map, "login").?);
     try std.testing.expectEqualStrings("other", lookupTabLabel(&map, "other").?); // passthrough
     try std.testing.expect(lookupTabLabel(&map, null) == null);
+}
+
+test "parseMouseCoords: x:y and x:y:button" {
+    const m1 = parseMouseCoords("10:20");
+    try std.testing.expectEqual(@as(i32, 10), m1.a);
+    try std.testing.expectEqual(@as(i32, 20), m1.b);
+    try std.testing.expect(m1.button == null);
+    const m2 = parseMouseCoords("0:0:right");
+    try std.testing.expectEqualStrings("right", m2.button.?);
+    const m3 = parseMouseCoords("-50:100"); // wheel deltas
+    try std.testing.expectEqual(@as(i32, -50), m3.a);
+    try std.testing.expectEqual(@as(i32, 100), m3.b);
+}
+
+test "buildEmulatedMediaParams: scheme + optional reduced-motion" {
+    const a = std.testing.allocator;
+    const p1 = try buildEmulatedMediaParams(a, "dark", false);
+    defer a.free(p1);
+    try std.testing.expectEqualStrings("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"dark\"}]}", p1);
+    const p2 = try buildEmulatedMediaParams(a, "light", true);
+    defer a.free(p2);
+    try std.testing.expectEqualStrings("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"light\"},{\"name\":\"prefers-reduced-motion\",\"value\":\"reduce\"}]}", p2);
 }
 
 test "buildDebugResponse: merges debug into response" {
