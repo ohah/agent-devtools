@@ -1130,6 +1130,12 @@ pub fn main() void {
             std.process.exit(1);
         };
         sendAction(session, "tap", target, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "swipe")) {
+        const dir = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools swipe <up|down|left|right> [distance]\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "swipe", dir, args_iter.next(), daemon_opts);
     } else if (std.mem.eql(u8, cmd, "title")) {
         sendAction(session, "get_title", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "url")) {
@@ -3172,6 +3178,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
         return handleTap(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
+    } else if (std.mem.eql(u8, req.action, "swipe")) {
+        return handleSwipe(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "is_visible") or std.mem.eql(u8, req.action, "is_enabled") or std.mem.eql(u8, req.action, "is_checked")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -4109,19 +4117,62 @@ fn handleTap(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mo
     const center = resolveCenter(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse
         return respondErr(allocator, "element not visible");
 
-    // touchStart with touchPoints
-    var start_buf: [256]u8 = undefined;
-    const start_params = std.fmt.bufPrint(&start_buf, "{{\"type\":\"touchStart\",\"touchPoints\":[{{\"x\":{d},\"y\":{d}}}]}}", .{ center.x, center.y }) catch
+    const start_cmd = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchStart", center.x, center.y, session_id) catch
         return respondErr(allocator, "cmd error");
-    const start_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchTouchEvent", start_params, session_id) catch return respondErr(allocator, "cmd error");
     defer allocator.free(start_cmd);
     sender.sendText(start_cmd) catch {};
 
-    // touchEnd with empty touchPoints
-    const end_params = "{\"type\":\"touchEnd\",\"touchPoints\":[]}";
-    const end_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchTouchEvent", end_params, session_id) catch return respondErr(allocator, "cmd error");
+    const end_cmd = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchEnd", 0, 0, session_id) catch
+        return respondErr(allocator, "cmd error");
     defer allocator.free(end_cmd);
     sender.sendText(end_cmd) catch {};
+
+    return respondOk(allocator);
+}
+
+/// swipe <up|down|left|right> [distance] — (200,400)에서 시작해 touchStart →
+/// 10단계 touchMove → touchEnd. agent-browser 동작과 동일.
+fn handleSwipe(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, dir_opt: ?[]const u8, dist_opt: ?[]const u8) []u8 {
+    const dir = dir_opt orelse return respondErr(allocator, "direction required");
+    const distance: f64 = if (dist_opt) |d| (std.fmt.parseFloat(f64, d) catch 300.0) else 300.0;
+    var dx: f64 = 0;
+    var dy: f64 = 0;
+    if (std.mem.eql(u8, dir, "up")) {
+        dy = -distance;
+    } else if (std.mem.eql(u8, dir, "down")) {
+        dy = distance;
+    } else if (std.mem.eql(u8, dir, "left")) {
+        dx = -distance;
+    } else if (std.mem.eql(u8, dir, "right")) {
+        dx = distance;
+    } else {
+        return respondErr(allocator, "direction must be up|down|left|right");
+    }
+
+    // 고정 시작점: 일반적 뷰포트에서 안전한 중앙 근처 (agent-browser와 동일)
+    const cx: f64 = 200;
+    const cy: f64 = 400;
+
+    const sc = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchStart", cx, cy, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(sc);
+    sender.sendText(sc) catch {};
+
+    const steps: usize = 10;
+    var i: usize = 1;
+    while (i <= steps) : (i += 1) {
+        const f = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
+        // 중간 프레임 1개가 누락돼도 제스처에 무해 — touchStart/End 쌍은 유지됨
+        const mc = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchMove", cx + dx * f, cy + dy * f, session_id) catch continue;
+        defer allocator.free(mc);
+        sender.sendText(mc) catch {};
+        std.Thread.sleep(16 * std.time.ns_per_ms); // ~60fps 간격으로 자연스러운 fling 인식
+    }
+
+    const ec = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchEnd", 0, 0, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(ec);
+    sender.sendText(ec) catch {};
 
     return respondOk(allocator);
 }
@@ -9036,6 +9087,7 @@ fn printUsage() void {
         \\  click <@ref>              Click element
         \\  dblclick <@ref>           Double-click element
         \\  tap <@ref>                Touch tap element
+        \\  swipe <dir> [distance]    Touch swipe (up/down/left/right, default 300px)
         \\  type <@ref> <text>        Type into element
         \\  fill <@ref> <text>        Clear and fill
         \\  press <key>               Press key (Enter, Tab, Control+a)
