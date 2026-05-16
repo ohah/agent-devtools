@@ -361,12 +361,21 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "network")) {
         const subcmd = args_iter.next() orelse "requests";
         if (std.mem.eql(u8, subcmd, "requests") or std.mem.eql(u8, subcmd, "list")) {
-            // network requests [--filter pattern] [--clear] [pattern]
+            // network requests [--filter pat] [--clear] [--type t] [--method m] [--status s] [pat]
             var filter_pattern: ?[]const u8 = null;
+            var rtype: ?[]const u8 = null;
+            var method: ?[]const u8 = null;
+            var status: ?[]const u8 = null;
             var do_clear = false;
             while (args_iter.next()) |narg| {
                 if (std.mem.eql(u8, narg, "--filter")) {
                     filter_pattern = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--type")) {
+                    rtype = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--method")) {
+                    method = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--status")) {
+                    status = args_iter.next();
                 } else if (std.mem.eql(u8, narg, "--clear")) {
                     do_clear = true;
                 } else if (filter_pattern == null) {
@@ -375,8 +384,36 @@ pub fn main() void {
             }
             if (do_clear) {
                 sendAction(session, "network_clear", null, null, daemon_opts);
-            } else {
+            } else if (rtype == null and method == null and status == null) {
                 sendAction(session, "network_list", null, filter_pattern, daemon_opts);
+            } else {
+                const pa = std.heap.page_allocator;
+                const extra = buildNetFilterExtraJson(pa, rtype, method, status) catch {
+                    writeErr("network requests: build error\n", .{});
+                    std.process.exit(1);
+                };
+                defer pa.free(extra);
+                sendActionEx(session, "network_list", null, filter_pattern, extra, daemon_opts);
+            }
+        } else if (std.mem.eql(u8, subcmd, "har")) {
+            const har_sub = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools network har <start|stop> [path]\n", .{});
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, har_sub, "start")) {
+                sendAction(session, "har_start", null, null, daemon_opts);
+            } else if (std.mem.eql(u8, har_sub, "stop")) {
+                sendAction(session, "har", args_iter.next(), null, daemon_opts);
+            } else {
+                writeErr("network har: expected start|stop\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, subcmd, "unroute")) {
+            // unroute [pattern]: 패턴 있으면 해당 룰 제거, 없으면 전체 해제
+            if (args_iter.next()) |pat| {
+                sendAction(session, "intercept_remove", pat, null, daemon_opts);
+            } else {
+                sendAction(session, "intercept_clear", null, null, daemon_opts);
             }
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const req_id = args_iter.next() orelse {
@@ -391,9 +428,11 @@ pub fn main() void {
                 \\Usage: agent-devtools network <subcommand>
                 \\
                 \\Subcommands:
-                \\  requests [--filter pattern] [--clear]  List or clear network requests
+                \\  requests [--filter p] [--type t] [--method m] [--status s] [--clear]
                 \\  get <requestId>   Get request details (headers, body)
                 \\  clear             Clear collected requests (alias)
+                \\  har <start|stop> [path]   HAR capture start / stop+export
+                \\  unroute [pattern]         Remove intercept rule(s)
                 \\  help              Show this help
                 \\
                 \\Aliases: 'list' works as alias for 'requests'
@@ -1664,6 +1703,31 @@ fn buildScreenshotExtraJson(allocator: Allocator, selector: ?[]const u8, fmt: ?[
     if (full) {
         if (!first) try w.writeByte(',');
         try w.writeAll("\"full\":true");
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// network requests 필터 → 데몬 전달 JSON `{"type":..,"method":..,"status":..}`.
+fn buildNetFilterExtraJson(allocator: Allocator, rtype: ?[]const u8, method: ?[]const u8, status: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    const fields = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "type", .v = rtype },
+        .{ .k = "method", .v = method },
+        .{ .k = "status", .v = status },
+    };
+    for (fields) |fld| {
+        if (fld.v) |val| {
+            if (!first) try w.writeByte(',');
+            try cdp.writeJsonString(w, fld.k);
+            try w.writeByte(':');
+            try cdp.writeJsonString(w, val);
+            first = false;
+        }
     }
     try w.writeByte('}');
     return buf.toOwnedSlice(allocator);
@@ -3695,10 +3759,11 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "network_list")) {
         collector_mutex.lock();
         defer collector_mutex.unlock();
-        return handleNetworkList(allocator, collector, req.pattern);
+        return handleNetworkList(allocator, collector, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "network_get")) {
         return handleNetworkGet(allocator, sender, resp_map, cmd_id, session_id, collector, collector_mutex, req.url);
-    } else if (std.mem.eql(u8, req.action, "network_clear")) {
+    } else if (std.mem.eql(u8, req.action, "network_clear") or std.mem.eql(u8, req.action, "har_start")) {
+        // har_start: 새 캡처 시작 = 수집기 초기화 (network은 상시 활성)
         collector_mutex.lock();
         defer collector_mutex.unlock();
         collector.deinit();
@@ -4104,7 +4169,61 @@ fn handleOpen(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, s
     return respondOk(allocator);
 }
 
-fn handleNetworkList(allocator: Allocator, collector: *network.Collector, pattern: ?[]const u8) []u8 {
+const NetFilter = struct {
+    url: ?[]const u8 = null, // URL 부분 문자열
+    rtype: ?[]const u8 = null, // resourceType (대소문자 무시)
+    method: ?[]const u8 = null, // HTTP 메서드 (대소문자 무시)
+    status: ?[]const u8 = null, // "404" 정확히 또는 "4xx" 클래스
+};
+
+/// status 필터: "404" 정확 매치, "4xx"/"4XX" 백 자리 클래스 매치.
+fn netStatusMatches(s: ?i64, want: []const u8) bool {
+    const code = s orelse return false;
+    if (want.len == 3 and (want[1] == 'x' or want[1] == 'X') and (want[2] == 'x' or want[2] == 'X')) {
+        const cls = std.fmt.charToDigit(want[0], 10) catch return false;
+        return @divTrunc(code, 100) == cls;
+    }
+    const n = std.fmt.parseInt(i64, want, 10) catch return false;
+    return code == n;
+}
+
+fn netMatches(info: network.RequestInfo, f: NetFilter) bool {
+    if (f.url) |u| if (std.mem.indexOf(u8, info.url, u) == null) return false;
+    if (f.rtype) |t| if (!std.ascii.eqlIgnoreCase(info.resource_type, t)) return false;
+    if (f.method) |m| if (!std.ascii.eqlIgnoreCase(info.method, m)) return false;
+    if (f.status) |st| if (!netStatusMatches(info.status, st)) return false;
+    return true;
+}
+
+/// network requests 필터 JSON `{"type":..,"method":..,"status":..}` 파싱.
+/// url(부분 문자열)은 별도 pattern 파라미터로 전달됨.
+fn parseNetFilterExtra(parsed: std.json.Value, url: ?[]const u8) NetFilter {
+    var f = NetFilter{ .url = url };
+    if (parsed != .object) return f;
+    if (parsed.object.get("type")) |v| {
+        if (v == .string and v.string.len > 0) f.rtype = v.string;
+    }
+    if (parsed.object.get("method")) |v| {
+        if (v == .string and v.string.len > 0) f.method = v.string;
+    }
+    if (parsed.object.get("status")) |v| {
+        if (v == .string and v.string.len > 0) f.status = v.string;
+    }
+    return f;
+}
+
+fn handleNetworkList(allocator: Allocator, collector: *network.Collector, pattern: ?[]const u8, extra_opt: ?[]const u8) []u8 {
+    var filter = NetFilter{ .url = pattern };
+    var parsed_extra: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_extra) |p| p.deinit();
+    if (extra_opt) |ex| {
+        parsed_extra = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch null;
+        if (parsed_extra) |p| filter = parseNetFilterExtra(p.value, pattern);
+    }
+    return handleNetworkListFiltered(allocator, collector, filter);
+}
+
+fn handleNetworkListFiltered(allocator: Allocator, collector: *network.Collector, filter: NetFilter) []u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
@@ -4115,9 +4234,7 @@ fn handleNetworkList(allocator: Allocator, collector: *network.Collector, patter
     while (it.next()) |entry| {
         const info = entry.value_ptr.info;
 
-        if (pattern) |p| {
-            if (std.mem.indexOf(u8, info.url, p) == null) continue;
-        }
+        if (!netMatches(info, filter)) continue;
 
         if (!first) writer.writeByte(',') catch {};
         first = false;
@@ -11548,6 +11665,39 @@ test "stripJsonExt: trailing .json removed once" {
     try std.testing.expectEqualStrings("auth", stripJsonExt("auth.json"));
     try std.testing.expectEqualStrings("auth", stripJsonExt("auth"));
     try std.testing.expectEqualStrings("a.json", stripJsonExt("a.json.json"));
+}
+
+test "netStatusMatches: exact + class" {
+    try std.testing.expect(netStatusMatches(404, "404"));
+    try std.testing.expect(!netStatusMatches(404, "403"));
+    try std.testing.expect(netStatusMatches(404, "4xx"));
+    try std.testing.expect(netStatusMatches(200, "2XX"));
+    try std.testing.expect(!netStatusMatches(500, "4xx"));
+    try std.testing.expect(!netStatusMatches(null, "200"));
+    try std.testing.expect(!netStatusMatches(200, "abc"));
+}
+
+test "netMatches: combined filters (case-insensitive)" {
+    const info = network.RequestInfo{
+        .request_id = "1", .url = "https://api.example.com/users", .method = "POST",
+        .resource_type = "XHR", .status = 201, .status_text = "", .mime_type = "",
+        .timestamp = 0, .encoded_data_length = null, .error_text = "", .state = .finished,
+    };
+    try std.testing.expect(netMatches(info, .{ .url = "api.example" }));
+    try std.testing.expect(netMatches(info, .{ .method = "post" })); // case-insensitive
+    try std.testing.expect(netMatches(info, .{ .rtype = "xhr", .status = "2xx" }));
+    try std.testing.expect(!netMatches(info, .{ .method = "GET" }));
+    try std.testing.expect(!netMatches(info, .{ .url = "nope" }));
+}
+
+test "buildNetFilterExtraJson: subset + escaping" {
+    const a = std.testing.allocator;
+    const e1 = try buildNetFilterExtraJson(a, "XHR", "GET", "404");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"type\":\"XHR\",\"method\":\"GET\",\"status\":\"404\"}", e1);
+    const e2 = try buildNetFilterExtraJson(a, null, "POST", null);
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{\"method\":\"POST\"}", e2);
 }
 
 test "buildDebugResponse: merges debug into response" {
