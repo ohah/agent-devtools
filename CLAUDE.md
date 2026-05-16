@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 519개 (`zig build test`)
+- **테스트**: 529개 (`zig build test`)
 - **CLI 명령**: 90+개
 
 ## Architecture
@@ -113,7 +113,14 @@ agent-browser의 모든 핵심 기능을 포함하면서, 추가로:
 - `intercept ... --resource-type <csv>` — CDP resourceType 필터
 - `vitals [url]` — Core Web Vitals + TTFB
 - `--init-script` / `removeinitscript` — 페이지 JS 이전 실행 스크립트 등록/제거
-- 범위 외 제외: AI chat, 대시보드, 클라우드 프로바이더, skills, React 인트로스펙션
+- **React 인트로스펙션** — `--enable=react-devtools`로 React DevTools hook
+  (facebook/react, MIT, @embedFile 벤더링) 설치 후:
+  - `react tree` — 컴포넌트 트리 JSON
+  - `react inspect <fiberId>` — fiber props/hooks/state
+  - `react renders start|stop` — 렌더 프로파일링 (fps/mount/re-render)
+  - `react suspense [--only-dynamic]` — Suspense 경계 분석
+- 범위 외 제외: AI chat, 대시보드, 클라우드 프로바이더, skills 시스템
+  (Zig CDP CLI 성격과 무관)
 
 ## Project Structure
 
@@ -130,6 +137,11 @@ src/
 ├── recorder.zig      # 플로우 녹화/재생/비교
 ├── snapshot.zig      # AX 트리 스냅샷 + @ref + 페이지 조작 CDP 명령
 ├── png.zig           # PNG 디코딩 + 픽셀 비교 (diff-screenshot)
+├── react/            # React 인트로스펙션 JS (벤더링, @embedFile)
+│   ├── install_hook.js   # React DevTools hook (facebook/react, MIT)
+│   ├── tree_snapshot.js / tree_inspect.js
+│   ├── renders_init.js / renders_stop.js
+│   └── suspense_walk.js
 └── root.zig          # 모듈 루트
 
 docs/
@@ -143,7 +155,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 (`test` 블록, 소스 파일 내)
-- `zig build test` → 519개
+- `zig build test` → 529개
 - 유닛 + 통합 (실제 Chrome E2E 확인)
 
 ### 테스트 분포
@@ -177,7 +189,7 @@ reference/            # 참조 코드 (gitignored)
 
 ```bash
 zig build              # 빌드
-zig build test         # 테스트 (519개)
+zig build test         # 테스트 (529개)
 ./zig-out/bin/agent-devtools --help
 ```
 
@@ -357,6 +369,15 @@ agent-devtools profiler stop [path]    # 프로파일러 중지 + 저장
 agent-devtools vitals [url]            # Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
 ```
 
+### React Introspection (차별화, `--enable=react-devtools` 필요)
+```bash
+agent-devtools react tree              # 컴포넌트 트리 JSON
+agent-devtools react inspect <fiberId> # fiber props/hooks/state
+agent-devtools react renders start     # 렌더 프로파일링 시작
+agent-devtools react renders stop      # 프로파일 JSON (fps/mount/re-render)
+agent-devtools react suspense [--only-dynamic]  # Suspense 경계 분석
+```
+
 ### Auth Vault (차별화)
 ```bash
 agent-devtools auth save <name> --url <url> --username <user> --password <pass>
@@ -380,6 +401,7 @@ agent-devtools --allowed-domains=LIST  # 도메인 제한
 agent-devtools --content-boundaries    # 콘텐츠 경계 마커
 agent-devtools --no-auto-dialog        # alert/beforeunload 자동 dismiss 비활성
 agent-devtools --init-script=PATH      # 페이지 JS 이전 실행 스크립트 등록 (반복 가능)
+agent-devtools --enable=react-devtools # React DevTools hook 설치 (react 명령 활성화)
 agent-devtools find-chrome             # Chrome 경로
 ```
 

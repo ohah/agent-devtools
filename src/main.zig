@@ -18,6 +18,14 @@ const Allocator = std.mem.Allocator;
 /// snapshot --urls 플래그를 daemon 요청의 pattern 필드로 전달하는 센티넬.
 const SNAPSHOT_URLS_FLAG = "urls";
 
+/// react suspense --only-dynamic 플래그를 daemon 요청의 url 필드로 전달하는 센티넬.
+const REACT_SUSPENSE_DYNAMIC_FLAG = "dynamic";
+
+/// React DevTools hook (facebook/react, MIT). `--enable=react-devtools` 시
+/// Page.addScriptToEvaluateOnNewDocument로 페이지 JS 이전에 설치되어
+/// window.__REACT_DEVTOOLS_GLOBAL_HOOK__을 노출 (React 인트로스펙션 기반).
+const REACT_INSTALL_HOOK = @embedFile("react/install_hook.js");
+
 const WsSender = struct {
     ws: *websocket.Client,
     write_mutex: std.Thread.Mutex = .{},
@@ -199,6 +207,7 @@ pub fn main() void {
     var allowed_domains: ?[]const u8 = null;
     var content_boundaries = false;
     var no_auto_dialog = false;
+    var enable_react = false;
     // --init-script=PATH (반복 가능) → 쉼표로 join 누적
     var init_scripts_buf: std.ArrayList(u8) = .empty;
 
@@ -233,6 +242,14 @@ pub fn main() void {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
+        } else if (std.mem.startsWith(u8, arg, "--enable=")) {
+            const feature = arg["--enable=".len..];
+            if (std.mem.eql(u8, feature, "react-devtools") or std.mem.eql(u8, feature, "react")) {
+                enable_react = true;
+            } else {
+                writeErr("Unknown --enable feature '{s}' (supported: react-devtools)\n", .{feature});
+                std.process.exit(1);
+            }
         } else if (std.mem.startsWith(u8, arg, "--init-script=")) {
             const path = arg["--init-script=".len..];
             if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
@@ -266,6 +283,7 @@ pub fn main() void {
         .content_boundaries = content_boundaries,
         .no_auto_dialog = no_auto_dialog,
         .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
+        .enable_react = enable_react,
     };
 
     if (interactive) {
@@ -719,6 +737,40 @@ pub fn main() void {
         sendAction(session, "pushstate", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "vitals")) {
         sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "react")) {
+        const sub = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools react <tree|inspect|renders|suspense>\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, sub, "tree")) {
+            sendAction(session, "react_tree", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, sub, "inspect")) {
+            const fid = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools react inspect <fiberId>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "react_inspect", fid, null, daemon_opts);
+        } else if (std.mem.eql(u8, sub, "renders")) {
+            const rsub = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools react renders <start|stop>\n", .{});
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, rsub, "start")) {
+                sendAction(session, "react_renders_start", null, null, daemon_opts);
+            } else if (std.mem.eql(u8, rsub, "stop")) {
+                sendAction(session, "react_renders_stop", null, null, daemon_opts);
+            } else {
+                writeErr("Usage: agent-devtools react renders <start|stop>\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, sub, "suspense")) {
+            const flag = args_iter.next();
+            const only_dyn = if (flag) |f| std.mem.eql(u8, f, "--only-dynamic") else false;
+            sendAction(session, "react_suspense", if (only_dyn) REACT_SUSPENSE_DYNAMIC_FLAG else null, null, daemon_opts);
+        } else {
+            writeErr("Unknown react subcommand: {s}\n", .{sub});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, cmd, "dblclick")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools dblclick <@ref>\n", .{});
@@ -1291,16 +1343,16 @@ fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, patte
         std.process.exit(1);
     };
 
-    // Read response
-    var recv_buf: [65536]u8 = undefined;
-    const response_line = client.recvLine(&recv_buf) catch |err| {
+    // Read response (동적 — 64KB 초과 응답 대응)
+    const response_line = client.recvLineAlloc(allocator) catch |err| {
         writeErr("Failed to read response: {s}\n", .{@errorName(err)});
         std.process.exit(1);
     };
+    defer allocator.free(response_line);
 
     const resp = daemon.parseResponse(allocator, response_line) catch {
         // Raw output if not valid JSON
-        write("{s}\n", .{response_line});
+        writeLine(response_line);
         return;
     };
     defer daemon.freeResponse(allocator, resp);
@@ -1312,7 +1364,7 @@ fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, patte
             if (daemon_opts.content_boundaries and isContentAction(action)) {
                 write("---AGENT_DEVTOOLS_CONTENT_START---\n{s}\n---AGENT_DEVTOOLS_CONTENT_END---\n", .{result.output});
             } else {
-                write("{s}\n", .{result.output});
+                writeLine(result.output);
             }
         } else {
             write("OK\n", .{});
@@ -1839,6 +1891,7 @@ fn runDaemon() void {
     const env_auto_connect = daemon.getenv("AGENT_DEVTOOLS_AUTO_CONNECT") != null;
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
     const env_init_scripts = daemon.getenv("AGENT_DEVTOOLS_INIT_SCRIPTS");
+    const env_enable_react = daemon.getenv("AGENT_DEVTOOLS_ENABLE_REACT") != null;
     const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
     const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
     const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
@@ -2031,10 +2084,15 @@ fn runDaemon() void {
 
     // --init-script: 파일들을 Page.addScriptToEvaluateOnNewDocument로 등록
     // (다음 네비게이션의 페이지 JS보다 먼저 실행됨)
-    const init_script_count: usize = if (env_init_scripts) |csv|
+    var init_script_count: usize = if (env_init_scripts) |csv|
         registerInitScripts(allocator, &ws, &cmd_id, session_id, csv)
     else
         0;
+
+    // --enable=react-devtools: React DevTools hook을 페이지 JS 이전에 설치
+    if (env_enable_react and sendAddScriptOnNewDocument(allocator, &ws, &cmd_id, session_id, REACT_INSTALL_HOOK)) {
+        init_script_count += 1;
+    }
 
     // Drain enable responses (short timeout to avoid 5s hang on last iteration).
     // 캡을 init 스크립트 수만큼 늘려 각 addScript 응답까지 흡수.
@@ -3206,6 +3264,17 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handlePushState(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "vitals")) {
         return handleVitals(allocator, sender, resp_map, cmd_id, session_id, req.url, ctx.allowed_domains);
+    } else if (std.mem.eql(u8, req.action, "react_tree")) {
+        return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, REACT_TREE_SNAPSHOT);
+    } else if (std.mem.eql(u8, req.action, "react_inspect")) {
+        return handleReactInspect(allocator, sender, resp_map, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "react_renders_start")) {
+        return handleReactRendersStart(allocator, sender, resp_map, cmd_id, session_id);
+    } else if (std.mem.eql(u8, req.action, "react_renders_stop")) {
+        return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, REACT_RENDERS_STOP);
+    } else if (std.mem.eql(u8, req.action, "react_suspense")) {
+        const only_dyn = if (req.url) |u| std.mem.eql(u8, u, REACT_SUSPENSE_DYNAMIC_FLAG) else false;
+        return handleReactSuspense(allocator, sender, resp_map, cmd_id, session_id, only_dyn);
     } else if (std.mem.eql(u8, req.action, "get_url")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
@@ -5877,6 +5946,16 @@ fn handleSetContent(allocator: Allocator, sender: *WsSender, resp_map: *response
 // AddScript (Page.addScriptToEvaluateOnNewDocument)
 // ============================================================================
 
+/// source를 Page.addScriptToEvaluateOnNewDocument로 등록 (응답 대기 없음). 성공 시 true.
+fn sendAddScriptOnNewDocument(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, source: []const u8) bool {
+    const params = cdp.jsonObject1(allocator, "source", source) catch return false;
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch return false;
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch return false;
+    return true;
+}
+
 /// 쉼표/개행 구분 경로 목록의 각 파일을 읽어
 /// Page.addScriptToEvaluateOnNewDocument로 등록 (best-effort, 실패는 stderr 경고).
 fn registerInitScripts(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, csv: []const u8) usize {
@@ -5890,14 +5969,7 @@ fn registerInitScripts(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp
             continue;
         };
         defer allocator.free(source);
-
-        const params = cdp.jsonObject1(allocator, "source", source) catch continue;
-        defer allocator.free(params);
-
-        const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch continue;
-        defer allocator.free(cmd);
-        ws.sendText(cmd) catch continue;
-        sent += 1;
+        if (sendAddScriptOnNewDocument(allocator, ws, cmd_id, session_id, source)) sent += 1;
     }
     return sent;
 }
@@ -5929,14 +6001,7 @@ fn handleRemoveInitScript(allocator: Allocator, sender: *WsSender, resp_map: *re
 fn handleAddScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, js_code_opt: ?[]const u8) []u8 {
     const js_code = js_code_opt orelse return respondErr(allocator, "js code required");
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    w.writeAll("{\"source\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(w, js_code) catch return respondErr(allocator, "write error");
-    w.writeByte('}') catch {};
-
-    const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    const params = cdp.jsonObject1(allocator, "source", js_code) catch return respondErr(allocator, "alloc error");
     defer allocator.free(params);
 
     const sent_id = cmd_id.next();
@@ -6952,6 +7017,165 @@ fn handleEvalRaw(allocator: Allocator, sender: *WsSender, resp_map: *response_ma
         }
     }
     return null;
+}
+
+// ============================================================================
+// React Introspection (window.__REACT_DEVTOOLS_GLOBAL_HOOK__ 기반)
+// 스크립트는 async IIFE → awaitPromise+returnByValue 필요. throw 시
+// exceptionDetails를 사용자 친화 에러로 변환.
+// ============================================================================
+
+const REACT_TREE_SNAPSHOT = @embedFile("react/tree_snapshot.js");
+const REACT_TREE_INSPECT = @embedFile("react/tree_inspect.js"); // {{ID}} 치환 필요
+const REACT_RENDERS_INIT = @embedFile("react/renders_init.js");
+const REACT_RENDERS_STOP = @embedFile("react/renders_stop.js");
+const REACT_SUSPENSE_WALK = @embedFile("react/suspense_walk.js");
+
+/// async React 스크립트 평가 결과.
+/// .ok = 스크립트가 반환한 JSON 문자열(allocator 소유, 호출자 free).
+/// .fail = 완성된 daemon 에러 응답 바이트(respondErr 산출, 그대로 반환).
+const ReactEval = union(enum) { ok: []u8, fail: []u8 };
+
+/// awaitPromise+returnByValue로 평가. throw/실패 시 .fail(완성된 에러 응답).
+fn reactEval(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, expression: []const u8) ReactEval {
+    var pbuf: std.ArrayList(u8) = .empty;
+    defer pbuf.deinit(allocator);
+    const pw = pbuf.writer(allocator);
+    pw.writeAll("{\"expression\":") catch return .{ .fail = respondErr(allocator, "write error") };
+    cdp.writeJsonString(pw, expression) catch return .{ .fail = respondErr(allocator, "write error") };
+    pw.writeAll(",\"awaitPromise\":true,\"returnByValue\":true}") catch return .{ .fail = respondErr(allocator, "write error") };
+    const params = pbuf.toOwnedSlice(allocator) catch return .{ .fail = respondErr(allocator, "alloc error") };
+    defer allocator.free(params);
+
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Runtime.evaluate", params, session_id) catch
+        return .{ .fail = respondErr(allocator, "cmd error") };
+    defer allocator.free(cmd);
+
+    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
+        return .{ .fail = respondErr(allocator, "react eval timeout") };
+    defer allocator.free(raw);
+
+    const parsed = cdp.parseMessage(allocator, raw) catch return .{ .fail = respondErr(allocator, "parse error") };
+    defer parsed.parsed.deinit();
+
+    if (!parsed.message.isResponse()) return .{ .fail = respondErr(allocator, "react eval failed") };
+    const result = parsed.message.result orelse return .{ .fail = respondErr(allocator, "react eval failed") };
+
+    // 스크립트 내 throw (hook 미설치 등) → 사용자 친화 에러 (respondErr가 메시지 복사)
+    if (cdp.getObject(result, "exceptionDetails")) |exc| {
+        return .{ .fail = respondErr(allocator, cdp.exceptionMessage(exc)) };
+    }
+    if (cdp.getObject(result, "result")) |remote_obj| {
+        if (cdp.getString(remote_obj, "value")) |v| {
+            return .{ .ok = allocator.dupe(u8, v) catch return .{ .fail = respondErr(allocator, "alloc error") } };
+        }
+    }
+    return .{ .fail = respondErr(allocator, "react script returned no value") };
+}
+
+fn handleReactScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, expression: []const u8) []u8 {
+    switch (reactEval(allocator, sender, resp_map, cmd_id, session_id, expression)) {
+        .fail => |resp| return resp,
+        .ok => |v| {
+            defer allocator.free(v);
+            return daemon.serializeResponse(allocator, .{ .success = true, .data = v }) catch
+                respondErr(allocator, "serialize error");
+        },
+    }
+}
+
+/// react suspense [--only-dynamic] — Suspense 경계 목록.
+/// --only-dynamic: 동적 경계만 (isSuspended | suspendedBy 존재 | unknownSuspenders).
+/// (스크립트가 이미 parentID===0 루트 경계는 제외함)
+/// 동적 Suspense 경계만 JSON 배열로 재직렬화.
+/// 동적 = isSuspended | suspendedBy 존재 | unknownSuspenders!=null.
+/// (SUSPENSE_WALK가 parentID===0 루트 경계는 이미 제외함)
+fn buildDynamicBoundaries(allocator: Allocator, items: []const std.json.Value) !std.ArrayList(u8) {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('[');
+    var count: usize = 0;
+    for (items) |b| {
+        if (b != .object) continue;
+        const is_suspended = if (b.object.get("isSuspended")) |s| (s == .bool and s.bool) else false;
+        const has_suspended_by = if (b.object.get("suspendedBy")) |sb| (sb == .array and sb.array.items.len > 0) else false;
+        const has_unknown = if (b.object.get("unknownSuspenders")) |u| (u != .null) else false;
+        if (!(is_suspended or has_suspended_by or has_unknown)) continue;
+        if (count > 0) try w.writeByte(',');
+        try daemon.writeJsonValue(w, b);
+        count += 1;
+    }
+    try w.writeByte(']');
+    return buf;
+}
+
+fn handleReactSuspense(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, only_dynamic: bool) []u8 {
+    const r = reactEval(allocator, sender, resp_map, cmd_id, session_id, REACT_SUSPENSE_WALK);
+    const json = switch (r) {
+        .fail => |resp| return resp,
+        .ok => |v| v,
+    };
+    defer allocator.free(json);
+
+    if (!only_dynamic) {
+        return daemon.serializeResponse(allocator, .{ .success = true, .data = json }) catch
+            respondErr(allocator, "serialize error");
+    }
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json, .{}) catch
+        return respondErr(allocator, "suspense parse error");
+    defer parsed.deinit();
+    if (parsed.value != .array) return respondErr(allocator, "suspense: expected array");
+
+    var buf = buildDynamicBoundaries(allocator, parsed.value.array.items) catch
+        return respondErr(allocator, "suspense build error");
+    defer buf.deinit(allocator);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = buf.items }) catch
+        respondErr(allocator, "serialize error");
+}
+
+/// react renders start — 프로파일러를 새 문서용으로 등록(네비게이션 생존) +
+/// 현재 페이지에서 즉시 실행해 리로드 없이 기록 시작.
+fn handleReactRendersStart(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8) []u8 {
+    const params = cdp.jsonObject1(allocator, "source", REACT_RENDERS_INIT) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const reg_id = cmd_id.next();
+    const reg_cmd = cdp.serializeCommand(allocator, reg_id, "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(reg_cmd);
+    if (sendAndWait(sender, resp_map, reg_cmd, reg_id, 10_000)) |r| allocator.free(r);
+
+    // 현재 페이지에서 즉시 시작 (RENDERS_INIT는 동기 IIFE — 반환값 불필요)
+    if (handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, REACT_RENDERS_INIT)) |r| allocator.free(r);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data =
+        \\{"recording":true,"message":"recording renders — interact with the page, then run `react renders stop`"}
+    }) catch respondErr(allocator, "serialize error");
+}
+
+/// react inspect <fiberId> — TREE_INSPECT의 {{ID}}를 검증된 숫자 id로 치환 후 평가.
+fn handleReactInspect(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, id_opt: ?[]const u8) []u8 {
+    const id_str = id_opt orelse return respondErr(allocator, "fiber id required");
+    // 숫자만 허용 — id는 JS 표현식 `const id = {{ID}};`에 그대로 치환되므로
+    // 검증 실패 시 거부해 인젝션 방지. fiber id는 음수 아님 → u32.
+    _ = std.fmt.parseInt(u32, id_str, 10) catch return respondErr(allocator, "fiber id must be a non-negative number");
+
+    const placeholder = "{{ID}}";
+    const idx = std.mem.indexOf(u8, REACT_TREE_INSPECT, placeholder) orelse
+        return respondErr(allocator, "inspect template malformed");
+
+    const script = std.mem.concat(allocator, u8, &.{
+        REACT_TREE_INSPECT[0..idx],
+        id_str,
+        REACT_TREE_INSPECT[idx + placeholder.len ..],
+    }) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(script);
+
+    return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, script);
 }
 
 fn handleStateLoad(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, name_opt: ?[]const u8) []u8 {
@@ -8718,8 +8942,22 @@ fn unescapeJsonString(allocator: Allocator, data: []const u8) UnescapeResult {
 fn write(comptime fmt: []const u8, args: anytype) void {
     const stdout = std.fs.File.stdout();
     var buf: [4096]u8 = undefined;
-    const msg = std.fmt.bufPrint(&buf, fmt, args) catch return;
-    _ = stdout.write(msg) catch {};
+    if (std.fmt.bufPrint(&buf, fmt, args)) |msg| {
+        stdout.writeAll(msg) catch {};
+        return;
+    } else |_| {}
+    // 4KB 초과 출력 (스냅샷, 네트워크, react 트리 등): 동적 할당으로 폴백.
+    // CLI는 단발 프로세스라 page_allocator로 충분 (defer free로 정리).
+    const msg = std.fmt.allocPrint(std.heap.page_allocator, fmt, args) catch return;
+    defer std.heap.page_allocator.free(msg);
+    stdout.writeAll(msg) catch {};
+}
+
+/// 대형 페이로드(스냅샷/네트워크/react 트리)를 포맷·재할당 없이 그대로 출력 + 개행.
+fn writeLine(slice: []const u8) void {
+    const stdout = std.fs.File.stdout();
+    stdout.writeAll(slice) catch {};
+    stdout.writeAll("\n") catch {};
 }
 
 fn writeErr(comptime fmt: []const u8, args: anytype) void {
@@ -8766,6 +9004,10 @@ fn printUsage() void {
         \\  reload                    Reload page
         \\  pushstate <url>           SPA client-side navigation (history.pushState)
         \\  vitals [url]              Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
+        \\  react tree                React 컴포넌트 트리 (--enable=react-devtools 필요)
+        \\  react inspect <fiberId>   특정 fiber의 props/hooks/state
+        \\  react renders start|stop  렌더 프로파일링 (start 후 조작 → stop)
+        \\  react suspense [--only-dynamic]  Suspense 경계 분석
         \\  url                       Get current URL
         \\  title                     Get page title
         \\  content                   Get page HTML
@@ -8897,6 +9139,7 @@ fn printUsage() void {
         \\  --content-boundaries      Wrap page content output with boundary markers
         \\  --no-auto-dialog          Do not auto-dismiss alert/beforeunload dialogs
         \\  --init-script <path>      Register a script file to run before page JS (repeatable)
+        \\  --enable=react-devtools   Install React DevTools hook (exposes __REACT_DEVTOOLS_GLOBAL_HOOK__)
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
@@ -9590,6 +9833,64 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "buildDynamicBoundaries: keeps only dynamic boundaries" {
+    const a = std.testing.allocator;
+    const json =
+        \\[{"id":1,"isSuspended":false,"suspendedBy":[],"unknownSuspenders":null},
+        \\{"id":2,"isSuspended":true,"suspendedBy":[],"unknownSuspenders":null},
+        \\{"id":3,"isSuspended":false,"suspendedBy":[{"x":1}],"unknownSuspenders":null},
+        \\{"id":4,"isSuspended":false,"suspendedBy":[],"unknownSuspenders":{"k":1}},
+        \\"not-an-object"]
+    ;
+    const p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer p.deinit();
+    var buf = try buildDynamicBoundaries(a, p.value.array.items);
+    defer buf.deinit(a);
+
+    const out = try std.json.parseFromSlice(std.json.Value, a, buf.items, .{});
+    defer out.deinit();
+    try std.testing.expectEqual(@as(usize, 3), out.value.array.items.len); // 2,3,4 — not 1, not the string
+    try std.testing.expectEqual(@as(i64, 2), out.value.array.items[0].object.get("id").?.integer);
+    try std.testing.expectEqual(@as(i64, 4), out.value.array.items[2].object.get("id").?.integer);
+}
+
+test "buildDynamicBoundaries: empty input yields empty array" {
+    const a = std.testing.allocator;
+    var buf = try buildDynamicBoundaries(a, &.{});
+    defer buf.deinit(a);
+    try std.testing.expectEqualStrings("[]", buf.items);
+}
+
+test "REACT_SUSPENSE_WALK: async script returns boundary JSON" {
+    try std.testing.expect(std.mem.indexOf(u8, REACT_SUSPENSE_WALK, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_SUSPENSE_WALK, "JSON.stringify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_SUSPENSE_WALK, "suspendedBy") != null);
+}
+
+test "REACT_RENDERS scripts: init installs profiler, stop returns JSON" {
+    try std.testing.expect(std.mem.indexOf(u8, REACT_RENDERS_INIT, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_RENDERS_STOP, "JSON.stringify") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_RENDERS_STOP, "__AB_RENDERS_ACTIVE__") != null);
+}
+
+test "REACT_TREE_INSPECT: embedded template has exactly one {{ID}} placeholder" {
+    const ph = "{{ID}}";
+    const first = std.mem.indexOf(u8, REACT_TREE_INSPECT, ph) orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_INSPECT[first + ph.len ..], ph) == null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_INSPECT, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
+}
+
+test "REACT_TREE_SNAPSHOT: embedded async script references hook and returns JSON" {
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_SNAPSHOT, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_SNAPSHOT, "JSON.stringify") != null);
+}
+
+test "REACT_INSTALL_HOOK: embedded hook is present and installs the global" {
+    // 벤더링 blob ~183KB — @embedFile 누락/절단 회귀 방지용 하한
+    try std.testing.expect(REACT_INSTALL_HOOK.len > 100_000);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_INSTALL_HOOK, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
 }
 
 test "init-script CSV: comma/newline separated paths, trimmed, blanks skipped" {

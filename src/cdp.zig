@@ -234,6 +234,19 @@ pub fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]
     return buf.toOwnedSlice(allocator);
 }
 
+/// CDP exceptionDetails 객체 → 사람이 읽을 한 줄 메시지.
+/// exception.description 우선(없으면 text). description은 error.stack 전체라
+/// 첫 줄만 취하고, CLI가 "Error: "를 다시 붙이므로 선행 "Error: "를 제거.
+pub fn exceptionMessage(details: std.json.Value) []const u8 {
+    var msg: ?[]const u8 = null;
+    if (getObject(details, "exception")) |exc| msg = getString(exc, "description");
+    if (msg == null) msg = getString(details, "text");
+    var out = msg orelse "script threw an exception";
+    if (std.mem.indexOfScalar(u8, out, '\n')) |nl| out = out[0..nl];
+    if (std.mem.startsWith(u8, out, "Error: ")) out = out["Error: ".len..];
+    return out;
+}
+
 /// Write a JSON-escaped string (with quotes) to a writer.
 pub fn writeJsonString(writer: anytype, s: []const u8) !void {
     try writer.writeByte('"');
@@ -1173,6 +1186,35 @@ test "targetSetDiscoverTargets: discover=true" {
 // ============================================================================
 // Tests: writeJsonString edge cases
 // ============================================================================
+
+test "exceptionMessage: prefers exception.description, falls back to text" {
+    const a = testing.allocator;
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"exception":{"description":"TypeError: x is not a function"},"text":"Uncaught"}
+        , .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("TypeError: x is not a function", exceptionMessage(p.value));
+    }
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{\"text\":\"Uncaught (in promise)\"}", .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("Uncaught (in promise)", exceptionMessage(p.value));
+    }
+    {
+        const p = try std.json.parseFromSlice(std.json.Value, a, "{}", .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("script threw an exception", exceptionMessage(p.value));
+    }
+    {
+        // thrown Error: description은 스택 전체 — 첫 줄만 + 선행 "Error: " 제거
+        const p = try std.json.parseFromSlice(std.json.Value, a,
+            \\{"exception":{"description":"Error: renders not active\n    at <anonymous>:3:22\n    at x"}}
+        , .{});
+        defer p.deinit();
+        try testing.expectEqualStrings("renders not active", exceptionMessage(p.value));
+    }
+}
 
 test "writeJsonString: simple string" {
     var buf: std.ArrayList(u8) = .empty;

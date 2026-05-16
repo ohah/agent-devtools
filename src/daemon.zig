@@ -242,7 +242,7 @@ pub fn parseResponse(allocator: Allocator, line: []const u8) !Response {
 }
 
 /// Write a std.json.Value to a writer as JSON text.
-fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
+pub fn writeJsonValue(writer: anytype, value: std.json.Value) !void {
     switch (value) {
         .null => try writer.writeAll("null"),
         .bool => |b| try writer.writeAll(if (b) "true" else "false"),
@@ -451,6 +451,26 @@ pub const SocketClient = struct {
         return buf[0..total];
     }
 
+    /// 개행까지(또는 EOF) 동적으로 읽음 — 64KB 초과 응답(스냅샷, react 트리 등) 대응.
+    /// 반환 슬라이스는 호출자가 free.
+    pub fn recvLineAlloc(self: *SocketClient, allocator: std.mem.Allocator) ![]u8 {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        var chunk: [65536]u8 = undefined;
+        while (true) {
+            const n = try posix.read(self.fd, &chunk);
+            if (n == 0) {
+                if (buf.items.len > 0) return buf.toOwnedSlice(allocator);
+                return error.EndOfStream;
+            }
+            try buf.appendSlice(allocator, chunk[0..n]);
+            if (std.mem.indexOfScalar(u8, buf.items, '\n')) |nl| {
+                buf.shrinkRetainingCapacity(nl);
+                return buf.toOwnedSlice(allocator);
+            }
+        }
+    }
+
     pub fn close(self: *SocketClient) void {
         posix.close(self.fd);
     }
@@ -478,6 +498,7 @@ pub const DaemonOptions = struct {
     content_boundaries: bool = false,
     no_auto_dialog: bool = false,
     init_scripts: ?[]const u8 = null, // 쉼표 구분 스크립트 파일 경로 목록
+    enable_react: bool = false, // --enable=react-devtools
 };
 
 /// Ensure a daemon is running for the given session.
@@ -526,6 +547,7 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (opts.content_boundaries) try env_map.put("AGENT_DEVTOOLS_CONTENT_BOUNDARIES", "1");
     if (opts.no_auto_dialog) try env_map.put("AGENT_DEVTOOLS_NO_AUTO_DIALOG", "1");
     if (opts.init_scripts) |s| try env_map.put("AGENT_DEVTOOLS_INIT_SCRIPTS", s);
+    if (opts.enable_react) try env_map.put("AGENT_DEVTOOLS_ENABLE_REACT", "1");
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning
@@ -718,6 +740,43 @@ test "roundtrip: response serialize → parse" {
 
 test "SocketClient.isReady: returns false for non-existent session" {
     try testing.expect(!SocketClient.isReady("nonexistent-test-session-xyz"));
+}
+
+test "recvLineAlloc: reads >64KB line across chunk boundary, trims at newline" {
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[0]);
+
+    // 64KB 청크 경계를 넘는 200KB 페이로드 + 개행 + 잔여(다음 줄)
+    const payload_len = 200 * 1024;
+    const payload = try testing.allocator.alloc(u8, payload_len);
+    defer testing.allocator.free(payload);
+    @memset(payload, 'x');
+
+    const writer_thread = try std.Thread.spawn(.{}, struct {
+        fn run(wfd: std.posix.fd_t, body: []const u8) void {
+            _ = std.posix.write(wfd, body) catch {};
+            _ = std.posix.write(wfd, "\nLEFTOVER") catch {};
+            std.posix.close(wfd);
+        }
+    }.run, .{ fds[1], payload });
+
+    var client = SocketClient{ .fd = fds[0] };
+    const line = try client.recvLineAlloc(testing.allocator);
+    defer testing.allocator.free(line);
+    writer_thread.join();
+
+    try testing.expectEqual(payload_len, line.len);
+    try testing.expect(std.mem.indexOfScalar(u8, line, '\n') == null);
+    try testing.expectEqual(@as(u8, 'x'), line[0]);
+    try testing.expectEqual(@as(u8, 'x'), line[line.len - 1]);
+}
+
+test "recvLineAlloc: EndOfStream on empty closed stream" {
+    const fds = try std.posix.pipe();
+    defer std.posix.close(fds[0]);
+    std.posix.close(fds[1]);
+    var client = SocketClient{ .fd = fds[0] };
+    try testing.expectError(error.EndOfStream, client.recvLineAlloc(testing.allocator));
 }
 
 test "writeJsonValue: null" {
