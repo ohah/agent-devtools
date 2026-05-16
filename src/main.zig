@@ -315,6 +315,9 @@ pub fn main() void {
         } else {
             write("Chrome not found.\n", .{});
         }
+    } else if (std.mem.eql(u8, cmd, "doctor")) {
+        const json_out = if (args_iter.next()) |a| std.mem.eql(u8, a, "--json") else false;
+        runDoctor(json_out);
     } else if (std.mem.eql(u8, cmd, "open") or std.mem.eql(u8, cmd, "navigate") or std.mem.eql(u8, cmd, "goto")) {
         const url = args_iter.next() orelse {
             writeErr("Usage: agent-devtools open <url>\n", .{});
@@ -1690,6 +1693,78 @@ fn responseFailed(allocator: Allocator, resp: []const u8) bool {
         return std.mem.indexOf(u8, resp, "\"success\":false") != null;
     defer parsed.deinit();
     return (cdp.getBool(parsed.value, "success") orelse true) == false;
+}
+
+/// abs_dir 안에서 suffix로 끝나는 파일 개수. 디렉터리 없으면 0.
+fn countDirEntries(abs_dir: []const u8, suffix: []const u8) usize {
+    var dir = std.fs.openDirAbsolute(abs_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var n: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, suffix)) n += 1;
+    }
+    return n;
+}
+
+/// 활성 세션 소켓(*.sock) 개수 + 설정파일 절대경로(없으면 null).
+const DoctorInfo = struct { sessions: usize, config_path: ?[]const u8 };
+
+/// config_path는 path_buf를 가리킴 — 호출자가 path_buf를 살아있게 유지해야 함.
+fn collectDoctorInfo(path_buf: []u8) DoctorInfo {
+    var dir_buf: [512]u8 = undefined;
+    const sessions = countDirEntries(daemon.getSocketDir(&dir_buf), ".sock");
+
+    // 진단 가치를 위해 라벨이 아닌 해석된 절대경로를 보고
+    var config_path: ?[]const u8 = null;
+    if (std.fs.cwd().realpath("agent-devtools.json", path_buf)) |abs| {
+        config_path = abs;
+    } else |_| {
+        if (daemon.getenv("HOME")) |home| {
+            const hp = std.fmt.bufPrint(path_buf, "{s}/.agent-devtools/config.json", .{home}) catch return .{ .sessions = sessions, .config_path = null };
+            if (std.fs.accessAbsolute(hp, .{})) |_| config_path = hp else |_| {}
+        }
+    }
+    return .{ .sessions = sessions, .config_path = config_path };
+}
+
+fn writeDoctorJson(w: anytype, ver: []const u8, os: []const u8, arch: []const u8, chrome_path: ?[]const u8, info: DoctorInfo, ok: bool) !void {
+    try w.print("{{\"version\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\",\"chrome\":", .{ ver, os, arch });
+    if (chrome_path) |p| try cdp.writeJsonString(w, p) else try w.writeAll("null");
+    try w.print(",\"sessions\":{d},\"config\":", .{info.sessions});
+    if (info.config_path) |c| try cdp.writeJsonString(w, c) else try w.writeAll("null");
+    try w.print(",\"status\":\"{s}\"}}", .{if (ok) "ok" else "Chrome missing"});
+}
+
+/// doctor [--json] — 데몬 없이 환경/Chrome/세션/설정 진단.
+fn runDoctor(json_out: bool) void {
+    const chrome_path = chrome.findChrome();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const info = collectDoctorInfo(&path_buf);
+    const os = @tagName(builtin.os.tag);
+    const arch = @tagName(builtin.cpu.arch);
+    const ok = chrome_path != null;
+
+    if (json_out) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.heap.page_allocator);
+        // 실패 시 부분 출력 대신 전체 중단 (일관)
+        writeDoctorJson(buf.writer(std.heap.page_allocator), version, os, arch, chrome_path, info, ok) catch return;
+        writeLine(buf.items);
+        return;
+    }
+
+    write("agent-devtools doctor\n", .{});
+    write("  version : {s}\n", .{version});
+    write("  platform: {s}/{s}\n", .{ os, arch });
+    if (chrome_path) |p| {
+        write("  chrome  : {s}\n", .{p});
+    } else {
+        write("  chrome  : NOT FOUND — install Chrome/Chromium\n", .{});
+    }
+    write("  sessions: {d} active\n", .{info.sessions});
+    write("  config  : {s}\n", .{info.config_path orelse "(none)"});
+    write("  status  : {s}\n", .{if (ok) "ok" else "Chrome missing"});
 }
 
 fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) u8 {
@@ -9380,6 +9455,7 @@ fn printUsage() void {
         \\  pause / resume            Pause/resume JavaScript execution
         \\  status                    Show daemon status
         \\  find-chrome               Find Chrome executable path
+        \\  doctor [--json]           Diagnose install (version/Chrome/sessions/config)
         \\
         \\Auth Vault:
         \\  auth save <name> --url <url> --username <user> --password <pass>
