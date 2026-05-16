@@ -1,6 +1,6 @@
 ---
 name: agent-devtools
-description: Browser automation and web debugging CLI for AI agents. Use when the user needs to interact with websites, fill forms, click buttons, take screenshots, extract data, test web apps, inspect network traffic, reverse-engineer APIs, intercept requests, or record/diff network flows. Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data", "test this web app", "login to a site", "inspect network requests", "find API endpoints", "mock an API", or any task requiring programmatic web interaction.
+description: Browser automation and web debugging CLI for AI agents. Use when the user needs to interact with websites, fill forms, click buttons, take screenshots, extract data, test web apps, inspect network traffic, reverse-engineer APIs, intercept requests, record/diff network flows, measure Core Web Vitals, or introspect React apps (component tree, props/hooks/state, render profiling, Suspense). Triggers include requests to "open a website", "fill out a form", "click a button", "take a screenshot", "scrape data", "test this web app", "login to a site", "inspect network requests", "find API endpoints", "mock an API", "measure web vitals / performance", "inspect React components", or any task requiring programmatic web interaction.
 allowed-tools: Bash(agent-devtools:*), Bash(./zig-out/bin/agent-devtools:*)
 ---
 
@@ -38,6 +38,7 @@ agent-devtools snapshot -i  # Re-snapshot after submit
 open <url>          Navigate (aliases: navigate, goto)
 back / forward      History navigation
 reload              Reload page
+pushstate <url>     SPA client-side navigation (history.pushState)
 close               Close browser + daemon
 url / title         Get current URL / page title
 ```
@@ -45,6 +46,7 @@ url / title         Get current URL / page title
 ### Snapshot + Interaction
 ```
 snapshot -i         Interactive elements only (recommended)
+snapshot -u         Include link href URLs (combine: snapshot -i -u)
 snapshot            Full accessibility tree
 click @e1           Click
 dblclick @e1        Double-click
@@ -86,6 +88,23 @@ eval <js>                   Run JavaScript
 video start/stop [path]     Record video (requires FFmpeg)
 trace start/stop [path]     Chrome DevTools trace
 profiler start/stop [path]  CPU profiler
+vitals [url]                Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
+addscript <js>              Run script on every new page (returns identifier)
+removeinitscript <id>       Remove a script added by addscript/--init-script
+```
+
+### React Introspection (requires `--enable=react-devtools` at launch)
+```
+react tree                  Component tree (JSON)
+react inspect <fiberId>     Fiber props / hooks / state
+react renders start         Begin render profiling
+react renders stop          Profile (fps, mounts, re-renders, per-component)
+react suspense [--only-dynamic]  Suspense boundary analysis
+```
+Launch the daemon with the hook installed before the page boots React:
+```bash
+agent-devtools --enable=react-devtools open https://myapp.com
+agent-devtools react tree
 ```
 
 ### Network (unique feature)
@@ -96,6 +115,7 @@ analyze                     API reverse engineering + schema
 intercept mock "/api" '{}'  Mock response
 intercept fail "/api"       Block request
 intercept delay "/api" 3000 Delay request
+  ... [--resource-type <csv>]  Limit rule to CDP resourceType (Document/XHR/Script/...)
 har [file]                  Export HAR 1.2
 ```
 
@@ -127,6 +147,7 @@ set permissions grant geo  Grant permission
 ### Storage & State
 ```
 cookies [list/set/get/clear]   Cookies
+cookies set --curl <file>      Bulk import (JSON / cURL dump / Cookie header)
 storage local [key]            localStorage
 state save/load/list           Save/restore cookies + storage
 credentials <user> <pass>      HTTP basic auth
@@ -137,7 +158,7 @@ credentials <user> <pass>      HTTP basic auth
 tab list / new / close / switch <n>
 console list / clear
 errors [clear]
-dialog accept/dismiss/info
+dialog accept/dismiss/info  (alert/beforeunload auto-dismissed by default)
 ```
 
 ### Recording
@@ -161,6 +182,9 @@ auth list / show / delete <name>
 --extension <path>          Load Chrome extension
 --allowed-domains <list>    Restrict navigation domains
 --content-boundaries        Wrap output with boundary markers
+--no-auto-dialog            Disable alert/beforeunload auto-dismiss
+--init-script=<path>        Run a script before page JS (repeatable)
+--enable=react-devtools     Install React DevTools hook (enables `react` cmds)
 --auto-connect              Auto-discover running Chrome/Electron
 agent-devtools.json         Config file (project or ~/.agent-devtools/config.json)
 ```
