@@ -1283,7 +1283,7 @@ pub fn main() void {
         sendAction(session, "har", filename, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "state")) {
         const subcmd = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools state <save|load|list> [name]\n", .{});
+            writeErr("Usage: agent-devtools state <save|load|list|clear|show|clean|rename> [args]\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, subcmd, "save")) {
@@ -1300,6 +1300,39 @@ pub fn main() void {
             sendAction(session, "state_load", name, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "list")) {
             sendAction(session, "state_list", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "clear")) {
+            var nm: ?[]const u8 = null;
+            var all = false;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--all") or std.mem.eql(u8, a, "-a")) all = true else if (!std.mem.startsWith(u8, a, "-")) nm = a;
+            }
+            sendActionEx(session, "state_clear", nm, if (all) "all" else null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "show")) {
+            const name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools state show <name>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "state_show", name, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "clean")) {
+            var days: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--older-than")) days = args_iter.next();
+            }
+            const d = days orelse {
+                writeErr("Usage: agent-devtools state clean --older-than <days>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "state_clean", d, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "rename")) {
+            const old_name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools state rename <old> <new>\n", .{});
+                std.process.exit(1);
+            };
+            const new_name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools state rename <old> <new>\n", .{});
+                std.process.exit(1);
+            };
+            sendActionEx(session, "state_rename", old_name, new_name, null, daemon_opts);
         } else {
             writeErr("Unknown state subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
@@ -3939,6 +3972,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleStateLoad(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "state_list")) {
         return handleStateList(allocator);
+    } else if (std.mem.eql(u8, req.action, "state_clear")) {
+        return handleStateClear(allocator, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "state_show")) {
+        return handleStateShow(allocator, req.url);
+    } else if (std.mem.eql(u8, req.action, "state_clean")) {
+        return handleStateClean(allocator, req.url);
+    } else if (std.mem.eql(u8, req.action, "state_rename")) {
+        return handleStateRename(allocator, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "addstyle")) {
         return handleAddStyle(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "check")) {
@@ -8258,6 +8299,133 @@ fn handleStateList(allocator: Allocator) []u8 {
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
 }
 
+/// state 이름 검증: 경로 분리자/`..` 금지, 영숫자·`-_.`만 허용 (디렉터리 탈출 방지).
+fn isValidStateName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// 후행 ".json" 제거 (agent-browser는 rename/show에서 확장자 허용).
+fn stripJsonExt(name: []const u8) []const u8 {
+    return if (std.mem.endsWith(u8, name, ".json")) name[0 .. name.len - ".json".len] else name;
+}
+
+fn statesDirPath(buf: []u8) ![]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const socket_dir = daemon.getSocketDir(&dir_buf);
+    return std.fmt.bufPrint(buf, "{s}/states", .{socket_dir});
+}
+
+/// `{states_dir}/{name}.json` 경로 (name은 호출 전 isValidStateName 검증 가정).
+fn stateFilePath(buf: []u8, states_dir: []const u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}.json", .{ states_dir, name });
+}
+
+/// state clear [name] | state clear --all
+fn handleStateClear(allocator: Allocator, name_opt: ?[]const u8, flag_opt: ?[]const u8) []u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    const all = if (flag_opt) |f| std.mem.eql(u8, f, "all") else false;
+
+    if (all) {
+        var dir = std.fs.openDirAbsolute(states_dir, .{ .iterate = true }) catch
+            return respondOk(allocator);
+        defer dir.close();
+        var n: usize = 0;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
+                dir.deleteFile(entry.name) catch continue;
+                n += 1;
+            }
+        }
+        var b: [64]u8 = undefined;
+        const d = std.fmt.bufPrint(&b, "{{\"cleared\":{d}}}", .{n}) catch return respondOk(allocator);
+        return daemon.serializeResponse(allocator, .{ .success = true, .data = d }) catch respondOk(allocator);
+    }
+
+    const name = name_opt orelse return respondErr(allocator, "state clear: name or --all required");
+    const sname = stripJsonExt(name);
+    if (!isValidStateName(sname)) return respondErr(allocator, "invalid state name");
+    var fbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const fpath = stateFilePath(&fbuf, states_dir, sname) catch
+        return respondErr(allocator, "path error");
+    std.fs.deleteFileAbsolute(fpath) catch return respondErr(allocator, "state not found");
+    return respondOk(allocator);
+}
+
+/// state show <name>: 저장된 상태 JSON 원문 반환.
+fn handleStateShow(allocator: Allocator, name_opt: ?[]const u8) []u8 {
+    const name = name_opt orelse return respondErr(allocator, "state show: name required");
+    const sname = stripJsonExt(name);
+    if (!isValidStateName(sname)) return respondErr(allocator, "invalid state name");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    var fbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const fpath = stateFilePath(&fbuf, states_dir, sname) catch
+        return respondErr(allocator, "path error");
+    const content = std.fs.cwd().readFileAlloc(allocator, fpath, 16 * 1024 * 1024) catch
+        return respondErr(allocator, "state not found");
+    defer allocator.free(content);
+    if (content.len == 0) return respondErr(allocator, "state file empty/corrupt");
+    // 파일 내용은 이미 JSON — data로 그대로 전달
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = content }) catch
+        respondErr(allocator, "resp error");
+}
+
+/// state clean --older-than <days>: mtime이 N일보다 오래된 상태 삭제.
+fn handleStateClean(allocator: Allocator, days_opt: ?[]const u8) []u8 {
+    const days_str = days_opt orelse return respondErr(allocator, "state clean: --older-than <days> required");
+    const days = std.fmt.parseInt(i64, days_str, 10) catch
+        return respondErr(allocator, "state clean: days must be an integer");
+    if (days < 0) return respondErr(allocator, "state clean: days must be >= 0");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    var dir = std.fs.openDirAbsolute(states_dir, .{ .iterate = true }) catch
+        return respondOk(allocator);
+    defer dir.close();
+    const cutoff: i128 = @as(i128, std.time.nanoTimestamp()) - @as(i128, days) * std.time.ns_per_day;
+    var n: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const st = dir.statFile(entry.name) catch continue;
+        if (st.mtime < cutoff) {
+            dir.deleteFile(entry.name) catch continue;
+            n += 1;
+        }
+    }
+    var b: [64]u8 = undefined;
+    const d = std.fmt.bufPrint(&b, "{{\"cleaned\":{d}}}", .{n}) catch return respondOk(allocator);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = d }) catch respondOk(allocator);
+}
+
+/// state rename <old> <new>
+fn handleStateRename(allocator: Allocator, old_opt: ?[]const u8, new_opt: ?[]const u8) []u8 {
+    const old_raw = old_opt orelse return respondErr(allocator, "state rename: old/new required");
+    const new_raw = new_opt orelse return respondErr(allocator, "state rename: old/new required");
+    const old_name = stripJsonExt(old_raw);
+    const new_name = stripJsonExt(new_raw);
+    if (!isValidStateName(old_name) or !isValidStateName(new_name))
+        return respondErr(allocator, "invalid state name");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var nb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = stateFilePath(&ob, states_dir, old_name) catch
+        return respondErr(allocator, "path error");
+    const np = stateFilePath(&nb, states_dir, new_name) catch
+        return respondErr(allocator, "path error");
+    std.fs.renameAbsolute(op, np) catch return respondErr(allocator, "state rename failed (source not found?)");
+    return respondOk(allocator);
+}
+
 // ============================================================================
 // Add Style (inject CSS via eval)
 // ============================================================================
@@ -11364,6 +11532,22 @@ test "buildScreenshotParams: format/quality/clip" {
     const p5 = try buildScreenshotParams(a, .{ .full_page = true }, .{ .x = 1, .y = 2, .width = 3, .height = 4 });
     defer a.free(p5);
     try std.testing.expectEqualStrings("{\"format\":\"png\",\"clip\":{\"x\":1,\"y\":2,\"width\":3,\"height\":4,\"scale\":1},\"captureBeyondViewport\":true}", p5);
+}
+
+test "isValidStateName: rejects traversal/empty/bad chars" {
+    try std.testing.expect(isValidStateName("auth"));
+    try std.testing.expect(isValidStateName("my-state_1.bak"));
+    try std.testing.expect(!isValidStateName(""));
+    try std.testing.expect(!isValidStateName(".."));
+    try std.testing.expect(!isValidStateName("a/b"));
+    try std.testing.expect(!isValidStateName("../etc"));
+    try std.testing.expect(!isValidStateName("a b"));
+}
+
+test "stripJsonExt: trailing .json removed once" {
+    try std.testing.expectEqualStrings("auth", stripJsonExt("auth.json"));
+    try std.testing.expectEqualStrings("auth", stripJsonExt("auth"));
+    try std.testing.expectEqualStrings("a.json", stripJsonExt("a.json.json"));
 }
 
 test "buildDebugResponse: merges debug into response" {
