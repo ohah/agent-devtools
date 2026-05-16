@@ -18,6 +18,11 @@ const Allocator = std.mem.Allocator;
 /// snapshot --urls 플래그를 daemon 요청의 pattern 필드로 전달하는 센티넬.
 const SNAPSHOT_URLS_FLAG = "urls";
 
+/// React DevTools hook (facebook/react, MIT). `--enable=react-devtools` 시
+/// Page.addScriptToEvaluateOnNewDocument로 페이지 JS 이전에 설치되어
+/// window.__REACT_DEVTOOLS_GLOBAL_HOOK__을 노출 (React 인트로스펙션 기반).
+const REACT_INSTALL_HOOK = @embedFile("react/install_hook.js");
+
 const WsSender = struct {
     ws: *websocket.Client,
     write_mutex: std.Thread.Mutex = .{},
@@ -199,6 +204,7 @@ pub fn main() void {
     var allowed_domains: ?[]const u8 = null;
     var content_boundaries = false;
     var no_auto_dialog = false;
+    var enable_react = false;
     // --init-script=PATH (반복 가능) → 쉼표로 join 누적
     var init_scripts_buf: std.ArrayList(u8) = .empty;
 
@@ -233,6 +239,14 @@ pub fn main() void {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
+        } else if (std.mem.startsWith(u8, arg, "--enable=")) {
+            const feature = arg["--enable=".len..];
+            if (std.mem.eql(u8, feature, "react-devtools") or std.mem.eql(u8, feature, "react")) {
+                enable_react = true;
+            } else {
+                writeErr("Unknown --enable feature '{s}' (supported: react-devtools)\n", .{feature});
+                std.process.exit(1);
+            }
         } else if (std.mem.startsWith(u8, arg, "--init-script=")) {
             const path = arg["--init-script=".len..];
             if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
@@ -266,6 +280,7 @@ pub fn main() void {
         .content_boundaries = content_boundaries,
         .no_auto_dialog = no_auto_dialog,
         .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
+        .enable_react = enable_react,
     };
 
     if (interactive) {
@@ -1839,6 +1854,7 @@ fn runDaemon() void {
     const env_auto_connect = daemon.getenv("AGENT_DEVTOOLS_AUTO_CONNECT") != null;
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
     const env_init_scripts = daemon.getenv("AGENT_DEVTOOLS_INIT_SCRIPTS");
+    const env_enable_react = daemon.getenv("AGENT_DEVTOOLS_ENABLE_REACT") != null;
     const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
     const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
     const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
@@ -2031,10 +2047,15 @@ fn runDaemon() void {
 
     // --init-script: 파일들을 Page.addScriptToEvaluateOnNewDocument로 등록
     // (다음 네비게이션의 페이지 JS보다 먼저 실행됨)
-    const init_script_count: usize = if (env_init_scripts) |csv|
+    var init_script_count: usize = if (env_init_scripts) |csv|
         registerInitScripts(allocator, &ws, &cmd_id, session_id, csv)
     else
         0;
+
+    // --enable=react-devtools: React DevTools hook을 페이지 JS 이전에 설치
+    if (env_enable_react and sendAddScriptOnNewDocument(allocator, &ws, &cmd_id, session_id, REACT_INSTALL_HOOK)) {
+        init_script_count += 1;
+    }
 
     // Drain enable responses (short timeout to avoid 5s hang on last iteration).
     // 캡을 init 스크립트 수만큼 늘려 각 addScript 응답까지 흡수.
@@ -5877,6 +5898,16 @@ fn handleSetContent(allocator: Allocator, sender: *WsSender, resp_map: *response
 // AddScript (Page.addScriptToEvaluateOnNewDocument)
 // ============================================================================
 
+/// source를 Page.addScriptToEvaluateOnNewDocument로 등록 (응답 대기 없음). 성공 시 true.
+fn sendAddScriptOnNewDocument(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, source: []const u8) bool {
+    const params = cdp.jsonObject1(allocator, "source", source) catch return false;
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch return false;
+    defer allocator.free(cmd);
+    ws.sendText(cmd) catch return false;
+    return true;
+}
+
 /// 쉼표/개행 구분 경로 목록의 각 파일을 읽어
 /// Page.addScriptToEvaluateOnNewDocument로 등록 (best-effort, 실패는 stderr 경고).
 fn registerInitScripts(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, csv: []const u8) usize {
@@ -5890,14 +5921,7 @@ fn registerInitScripts(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp
             continue;
         };
         defer allocator.free(source);
-
-        const params = cdp.jsonObject1(allocator, "source", source) catch continue;
-        defer allocator.free(params);
-
-        const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch continue;
-        defer allocator.free(cmd);
-        ws.sendText(cmd) catch continue;
-        sent += 1;
+        if (sendAddScriptOnNewDocument(allocator, ws, cmd_id, session_id, source)) sent += 1;
     }
     return sent;
 }
@@ -5929,14 +5953,7 @@ fn handleRemoveInitScript(allocator: Allocator, sender: *WsSender, resp_map: *re
 fn handleAddScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, js_code_opt: ?[]const u8) []u8 {
     const js_code = js_code_opt orelse return respondErr(allocator, "js code required");
 
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
-    const w = buf.writer(allocator);
-    w.writeAll("{\"source\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(w, js_code) catch return respondErr(allocator, "write error");
-    w.writeByte('}') catch {};
-
-    const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    const params = cdp.jsonObject1(allocator, "source", js_code) catch return respondErr(allocator, "alloc error");
     defer allocator.free(params);
 
     const sent_id = cmd_id.next();
@@ -8897,6 +8914,7 @@ fn printUsage() void {
         \\  --content-boundaries      Wrap page content output with boundary markers
         \\  --no-auto-dialog          Do not auto-dismiss alert/beforeunload dialogs
         \\  --init-script <path>      Register a script file to run before page JS (repeatable)
+        \\  --enable=react-devtools   Install React DevTools hook (exposes __REACT_DEVTOOLS_GLOBAL_HOOK__)
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
@@ -9590,6 +9608,12 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "REACT_INSTALL_HOOK: embedded hook is present and installs the global" {
+    // 벤더링 blob ~183KB — @embedFile 누락/절단 회귀 방지용 하한
+    try std.testing.expect(REACT_INSTALL_HOOK.len > 100_000);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_INSTALL_HOOK, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
 }
 
 test "init-script CSV: comma/newline separated paths, trimmed, blanks skipped" {

@@ -478,6 +478,7 @@ pub const DaemonOptions = struct {
     content_boundaries: bool = false,
     no_auto_dialog: bool = false,
     init_scripts: ?[]const u8 = null, // 쉼표 구분 스크립트 파일 경로 목록
+    enable_react: bool = false, // --enable=react-devtools
 };
 
 /// Ensure a daemon is running for the given session.
@@ -526,6 +527,7 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (opts.content_boundaries) try env_map.put("AGENT_DEVTOOLS_CONTENT_BOUNDARIES", "1");
     if (opts.no_auto_dialog) try env_map.put("AGENT_DEVTOOLS_NO_AUTO_DIALOG", "1");
     if (opts.init_scripts) |s| try env_map.put("AGENT_DEVTOOLS_INIT_SCRIPTS", s);
+    if (opts.enable_react) try env_map.put("AGENT_DEVTOOLS_ENABLE_REACT", "1");
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning
