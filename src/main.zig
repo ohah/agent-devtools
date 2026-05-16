@@ -752,19 +752,48 @@ pub fn main() void {
         const coords = std.fmt.bufPrint(&coords_buf, "{s}:{s}", .{ x, y }) catch "0:0";
         sendAction(session, "mouse", action, coords, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "screenshot")) {
-        const first_arg = args_iter.next();
-        if (first_arg) |fa| {
-            if (std.mem.eql(u8, fa, "--annotate") or std.mem.eql(u8, fa, "-a")) {
-                const path = args_iter.next();
-                sendAction(session, "screenshot_annotate", path, null, daemon_opts);
-            } else if (std.mem.eql(u8, fa, "--full")) {
-                const path = args_iter.next();
-                sendAction(session, "screenshot_full", path, null, daemon_opts);
-            } else {
-                sendAction(session, "screenshot", fa, null, daemon_opts);
+        var annotate = false;
+        var full = false;
+        var fmt: ?[]const u8 = null;
+        var quality: ?[]const u8 = null;
+        var positionals: [2]?[]const u8 = .{ null, null };
+        var np: usize = 0;
+        while (args_iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--annotate") or std.mem.eql(u8, a, "-a")) {
+                annotate = true;
+            } else if (std.mem.eql(u8, a, "--full") or std.mem.eql(u8, a, "-f")) {
+                full = true;
+            } else if (std.mem.eql(u8, a, "--format")) {
+                fmt = args_iter.next();
+            } else if (std.mem.eql(u8, a, "--quality")) {
+                quality = args_iter.next();
+            } else if (np < 2) {
+                positionals[np] = a;
+                np += 1;
             }
+        }
+        // [selector] [path] 구분: agent-browser 규칙 (@/./# 접두 & 경로 아님 → selector)
+        var selector: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        if (np == 2) {
+            selector = positionals[0];
+            path = positionals[1];
+        } else if (np == 1) {
+            const f = positionals[0].?;
+            if (isScreenshotSelector(f)) selector = f else path = f;
+        }
+        if (annotate) {
+            sendAction(session, "screenshot_annotate", path, null, daemon_opts);
+        } else if (selector == null and fmt == null and quality == null) {
+            sendAction(session, if (full) "screenshot_full" else "screenshot", path, null, daemon_opts);
         } else {
-            sendAction(session, "screenshot", null, null, daemon_opts);
+            const pa = std.heap.page_allocator;
+            const extra = buildScreenshotExtraJson(pa, selector, fmt, quality, full) catch {
+                writeErr("screenshot: build error\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(extra);
+            sendActionEx(session, "screenshot", path, null, extra, daemon_opts);
         }
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         var interactive_snap = false;
@@ -1561,6 +1590,51 @@ const CookieAttrs = struct {
     same_site: ?[]const u8 = null, // Strict|Lax|None
     expires: ?i64 = null,
 };
+
+/// 단일 위치 인자가 selector인지 path인지 판별 (agent-browser 규칙과 동일):
+/// 상대경로(./ ../)·`/` 포함·이미지 확장자면 path, 그 외(@/./# 접두 및
+/// 접두 없는 평문 selector 포함)는 모두 selector. (`is_selector || !is_path`)
+fn isScreenshotSelector(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.startsWith(u8, s, "./") or std.mem.startsWith(u8, s, "../")) return false;
+    if (std.mem.indexOfScalar(u8, s, '/') != null) return false;
+    if (std.mem.endsWith(u8, s, ".png") or std.mem.endsWith(u8, s, ".jpg") or
+        std.mem.endsWith(u8, s, ".jpeg") or std.mem.endsWith(u8, s, ".webp")) return false;
+    return true;
+}
+
+/// screenshot opts → 데몬 전달용 JSON `{"sel":..,"fmt":..,"q":..,"full":..}`.
+fn buildScreenshotExtraJson(allocator: Allocator, selector: ?[]const u8, fmt: ?[]const u8, quality: ?[]const u8, full: bool) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    if (selector) |s| {
+        try w.writeAll("\"sel\":");
+        try cdp.writeJsonString(w, s);
+        first = false;
+    }
+    if (fmt) |f| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"fmt\":");
+        try cdp.writeJsonString(w, f);
+        first = false;
+    }
+    if (quality) |q| {
+        const qn = std.fmt.parseInt(u32, q, 10) catch return error.InvalidQuality;
+        if (qn == 0 or qn > 100) return error.InvalidQuality;
+        if (!first) try w.writeByte(',');
+        try w.print("\"q\":{d}", .{qn});
+        first = false;
+    }
+    if (full) {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"full\":true");
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
 
 fn missingCookieFlag(flag: []const u8) noreturn {
     writeErr("cookies set {s}: missing value\n", .{flag});
@@ -3728,7 +3802,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "mouse")) {
         return handleMouse(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "screenshot")) {
-        return handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, req.url);
+        return handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, req.url, req.extra);
     } else if (std.mem.eql(u8, req.action, "screenshot_full")) {
         return handleScreenshotFull(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "eval")) {
@@ -5861,11 +5935,83 @@ fn handleGetElementProp(allocator: Allocator, sender: *WsSender, resp_map: *resp
     return respondErr(allocator, "get property timeout");
 }
 
-fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
+const ElementRect = struct { x: f64, y: f64, width: f64, height: f64 };
+
+/// querySelector 요소의 페이지 좌표 rect를 "x,y,w,h" CSV로 반환하는 JS 표현식.
+/// selector는 JSON 인코딩(인젝션 안전), 미발견 시 빈 문자열.
+fn buildRectExpr(allocator: Allocator, selector: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("(function(){var e=document.querySelector(");
+    try cdp.writeJsonString(w, selector);
+    try w.writeAll(");if(!e)return'';var r=e.getBoundingClientRect();" ++
+        "return [r.left+scrollX,r.top+scrollY,r.width,r.height].join(',')})()");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn parseRectCsv(s: []const u8) ?ElementRect {
+    var it = std.mem.splitScalar(u8, s, ',');
+    const x = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    const y = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    const wd = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    const ht = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    if (it.next() != null) return null;
+    return .{ .x = x, .y = y, .width = wd, .height = ht };
+}
+
+const ScreenshotOpts = struct {
+    selector: ?[]const u8 = null,
+    format: []const u8 = "png", // png|jpeg|webp
+    quality: ?u32 = null,
+    full_page: bool = false,
+};
+
+/// CDP Page.captureScreenshot params JSON. clip(요소 영역) 우선, 없고 full_page면
+/// 전체 페이지. quality는 png가 아닐 때만 적용 (agent-browser와 동일).
+fn buildScreenshotParams(allocator: Allocator, opts: ScreenshotOpts, clip: ?ElementRect) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"format\":");
+    try cdp.writeJsonString(w, opts.format);
+    if (opts.quality) |q| {
+        if (!std.mem.eql(u8, opts.format, "png")) try w.print(",\"quality\":{d}", .{q});
+    }
+    if (clip) |c| {
+        // clip 좌표는 페이지(문서) 기준 CSS px (buildRectExpr가 scrollX/Y 가산).
+        // captureBeyondViewport로 스크롤 밖 요소도 정확히 캡처.
+        try w.print(",\"clip\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"scale\":1}},\"captureBeyondViewport\":true", .{ c.x, c.y, c.width, c.height });
+    } else if (opts.full_page) {
+        try w.writeAll(",\"captureBeyondViewport\":true,\"fromSurface\":true");
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// screenshot opts JSON (`{"sel":..,"fmt":..,"q":..,"full":..}`) 파싱.
+fn parseScreenshotOpts(parsed: std.json.Value) ScreenshotOpts {
+    var o = ScreenshotOpts{};
+    if (parsed != .object) return o;
+    if (parsed.object.get("sel")) |v| {
+        if (v == .string and v.string.len > 0) o.selector = v.string;
+    }
+    if (parsed.object.get("fmt")) |v| {
+        if (v == .string and v.string.len > 0) o.format = v.string;
+    }
+    if (parsed.object.get("q")) |v| {
+        if (v == .integer and v.integer > 0) o.quality = @intCast(v.integer);
+    }
+    if (parsed.object.get("full")) |v| {
+        if (v == .bool) o.full_page = v.bool;
+    }
+    return o;
+}
+
+/// 공통: Page.captureScreenshot 전송 → 응답을 파일 저장 또는 base64로 반환.
+fn captureScreenshotRespond(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, params: []const u8, path_opt: ?[]const u8) []u8 {
     const sent_id = cmd_id.next();
-    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
-        \\{"format":"png"}
-    , session_id) catch return respondErr(allocator, "cmd error");
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot", params, session_id) catch return respondErr(allocator, "cmd error");
     defer allocator.free(cmd);
 
     const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
@@ -5922,65 +6068,35 @@ fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response
     return respondErr(allocator, "screenshot timeout");
 }
 
-fn handleScreenshotFull(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
-    const sent_id = cmd_id.next();
-    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
-        \\{"format":"png","captureBeyondViewport":true,"fromSurface":true}
-    , session_id) catch return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd);
-
-    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
-        return respondErr(allocator, "screenshot timeout");
-    defer allocator.free(raw);
-
-    const parsed = cdp.parseMessage(allocator, raw) catch
-        return respondErr(allocator, "parse error");
-    defer parsed.parsed.deinit();
-
-    if (parsed.message.isResponse()) {
-        if (parsed.message.result) |result| {
-            if (cdp.getString(result, "data")) |base64_data| {
-                // If path provided, save to file
-                if (path_opt) |file_path| {
-                    const decoded_size = std.base64.standard.Decoder.calcSizeUpperBound(base64_data.len) catch
-                        return respondErr(allocator, "invalid base64");
-                    const buf = allocator.alloc(u8, decoded_size) catch return respondErr(allocator, "alloc error");
-                    defer allocator.free(buf);
-
-                    std.base64.standard.Decoder.decode(buf, base64_data) catch
-                        return respondErr(allocator, "decode error");
-
-                    const file = std.fs.cwd().createFile(file_path, .{}) catch
-                        return respondErr(allocator, "file create error");
-                    defer file.close();
-                    _ = file.write(buf[0..decoded_size]) catch return respondErr(allocator, "write error");
-
-                    var resp_buf2: std.ArrayList(u8) = .empty;
-                    defer resp_buf2.deinit(allocator);
-                    const rw2 = resp_buf2.writer(allocator);
-                    rw2.writeAll("{\"file\":") catch return respondOk(allocator);
-                    cdp.writeJsonString(rw2, file_path) catch return respondOk(allocator);
-                    rw2.print(",\"size\":{d}}}", .{decoded_size}) catch return respondOk(allocator);
-                    const data = resp_buf2.toOwnedSlice(allocator) catch return respondOk(allocator);
-                    defer allocator.free(data);
-                    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
-                } else {
-                    // Return base64 data directly
-                    var resp_buf: std.ArrayList(u8) = .empty;
-                    defer resp_buf.deinit(allocator);
-                    const writer = resp_buf.writer(allocator);
-                    writer.writeAll("{\"data\":\"") catch return respondErr(allocator, "write error");
-                    writer.writeAll(base64_data) catch return respondErr(allocator, "write error");
-                    writer.writeAll("\"}") catch {};
-
-                    const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-                    defer allocator.free(data);
-                    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
-                }
-            }
-        }
+/// screenshot: selector(요소 clip)/format/quality 지원. extra_opt = opts JSON.
+fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8, extra_opt: ?[]const u8) []u8 {
+    var opts = ScreenshotOpts{};
+    var parsed_opts: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_opts) |p| p.deinit();
+    if (extra_opt) |ex| {
+        parsed_opts = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch null;
+        if (parsed_opts) |p| opts = parseScreenshotOpts(p.value);
     }
-    return respondErr(allocator, "screenshot full-page timeout");
+
+    var clip: ?ElementRect = null;
+    if (opts.selector) |sel| {
+        const expr = buildRectExpr(allocator, sel) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(expr);
+        const rect_str = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, expr) orelse
+            return respondErr(allocator, "selector eval failed");
+        defer allocator.free(rect_str);
+        clip = parseRectCsv(rect_str) orelse return respondErr(allocator, "selector not found");
+    }
+
+    const params = buildScreenshotParams(allocator, opts, clip) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    return captureScreenshotRespond(allocator, sender, resp_map, cmd_id, session_id, params, path_opt);
+}
+
+fn handleScreenshotFull(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
+    return captureScreenshotRespond(allocator, sender, resp_map, cmd_id, session_id,
+        \\{"format":"png","captureBeyondViewport":true,"fromSurface":true}
+    , path_opt);
 }
 
 fn handleDiffScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, baseline_path_opt: ?[]const u8, params_opt: ?[]const u8) []u8 {
@@ -9693,7 +9809,7 @@ fn handleScreenshotAnnotate(
     }
 
     // Step 4: Take the screenshot
-    const result = handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, path_opt);
+    const result = handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, path_opt, null);
 
     // Step 5: Remove the overlay
     {
@@ -11188,6 +11304,66 @@ test "buildSingleCookieArrayJson: url only (no domain)" {
     const j = try buildSingleCookieArrayJson(a, "k", "1", .{ .url = "https://h/p" });
     defer a.free(j);
     try std.testing.expectEqualStrings("[{\"name\":\"k\",\"value\":\"1\",\"url\":\"https://h/p\"}]", j);
+}
+
+test "isScreenshotSelector: selector vs path" {
+    try std.testing.expect(isScreenshotSelector("#main"));
+    try std.testing.expect(isScreenshotSelector(".btn"));
+    try std.testing.expect(isScreenshotSelector("@e3"));
+    try std.testing.expect(!isScreenshotSelector("out.png"));
+    try std.testing.expect(!isScreenshotSelector("./shot.png"));
+    try std.testing.expect(!isScreenshotSelector("dir/file"));
+    // agent-browser 패리티: 접두 없는 평문도 selector (path 마커 없으면)
+    try std.testing.expect(isScreenshotSelector("body"));
+    try std.testing.expect(isScreenshotSelector("main"));
+    try std.testing.expect(!isScreenshotSelector(""));
+}
+
+test "buildScreenshotExtraJson: subsets + escaping" {
+    const a = std.testing.allocator;
+    const e1 = try buildScreenshotExtraJson(a, "#x", "jpeg", "80", true);
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"sel\":\"#x\",\"fmt\":\"jpeg\",\"q\":80,\"full\":true}", e1);
+    const e2 = try buildScreenshotExtraJson(a, null, null, null, false);
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{}", e2);
+    try std.testing.expectError(error.InvalidQuality, buildScreenshotExtraJson(a, null, "jpeg", "abc", false));
+}
+
+test "parseRectCsv: valid + invalid" {
+    const r = parseRectCsv("10.5,20,300,150").?;
+    try std.testing.expectEqual(@as(f64, 10.5), r.x);
+    try std.testing.expectEqual(@as(f64, 150), r.height);
+    try std.testing.expect(parseRectCsv("") == null);
+    try std.testing.expect(parseRectCsv("1,2,3") == null);
+    try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildRectExpr: selector JSON-encoded" {
+    const a = std.testing.allocator;
+    const e = try buildRectExpr(a, "a[data-x=\"1\"]");
+    defer a.free(e);
+    try std.testing.expect(std.mem.indexOf(u8, e, "querySelector(\"a[data-x=\\\"1\\\"]\")") != null);
+}
+
+test "buildScreenshotParams: format/quality/clip" {
+    const a = std.testing.allocator;
+    const p1 = try buildScreenshotParams(a, .{}, null);
+    defer a.free(p1);
+    try std.testing.expectEqualStrings("{\"format\":\"png\"}", p1);
+    const p2 = try buildScreenshotParams(a, .{ .format = "jpeg", .quality = 70 }, null);
+    defer a.free(p2);
+    try std.testing.expectEqualStrings("{\"format\":\"jpeg\",\"quality\":70}", p2);
+    // quality ignored for png
+    const p3 = try buildScreenshotParams(a, .{ .format = "png", .quality = 70 }, null);
+    defer a.free(p3);
+    try std.testing.expectEqualStrings("{\"format\":\"png\"}", p3);
+    const p4 = try buildScreenshotParams(a, .{ .full_page = true }, null);
+    defer a.free(p4);
+    try std.testing.expectEqualStrings("{\"format\":\"png\",\"captureBeyondViewport\":true,\"fromSurface\":true}", p4);
+    const p5 = try buildScreenshotParams(a, .{ .full_page = true }, .{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    defer a.free(p5);
+    try std.testing.expectEqualStrings("{\"format\":\"png\",\"clip\":{\"x\":1,\"y\":2,\"width\":3,\"height\":4,\"scale\":1},\"captureBeyondViewport\":true}", p5);
 }
 
 test "buildDebugResponse: merges debug into response" {
