@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 495개 (`zig build test`)
+- **테스트**: 519개 (`zig build test`)
 - **CLI 명령**: 90+개
 
 ## Architecture
@@ -105,6 +105,16 @@ agent-browser의 모든 핵심 기능을 포함하면서, 추가로:
 - `screenshot --annotate` — @ref 오버레이 스크린샷
 - `diff-screenshot <baseline> [current]` — 스크린샷 픽셀 비교
 
+### ✅ agent-browser 0.27 동기화
+- `pushstate <url>` — SPA 클라이언트 네비게이션 (Next.js 라우터 우선 + history.pushState 폴백)
+- alert/beforeunload 다이얼로그 자동 dismiss (`--no-auto-dialog`로 opt-out)
+- `snapshot -u/--urls` — link 요소 href 포함
+- `cookies set --curl <file>` — JSON/cURL 덤프/Cookie 헤더 자동 감지 일괄 임포트
+- `intercept ... --resource-type <csv>` — CDP resourceType 필터
+- `vitals [url]` — Core Web Vitals + TTFB
+- `--init-script` / `removeinitscript` — 페이지 JS 이전 실행 스크립트 등록/제거
+- 범위 외 제외: AI chat, 대시보드, 클라우드 프로바이더, skills, React 인트로스펙션
+
 ## Project Structure
 
 ```
@@ -133,7 +143,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 (`test` 블록, 소스 파일 내)
-- `zig build test` → 495개
+- `zig build test` → 519개
 - 유닛 + 통합 (실제 Chrome E2E 확인)
 
 ### 테스트 분포
@@ -167,7 +177,7 @@ reference/            # 참조 코드 (gitignored)
 
 ```bash
 zig build              # 빌드
-zig build test         # 테스트 (495개)
+zig build test         # 테스트 (519개)
 ./zig-out/bin/agent-devtools --help
 ```
 
@@ -179,12 +189,13 @@ agent-devtools open <url>              # 페이지 열기 (데몬 자동 시작)
 agent-devtools back                    # 뒤로
 agent-devtools forward                 # 앞으로
 agent-devtools reload                  # 새로고침
+agent-devtools pushstate <url>         # SPA 클라이언트 네비게이션 (history.pushState)
 agent-devtools close                   # 브라우저 + 데몬 종료
 ```
 
 ### Snapshot + Interaction (@ref)
 ```bash
-agent-devtools snapshot [-i]           # AX 트리 (-i: interactive only)
+agent-devtools snapshot [-i] [-u]      # AX 트리 (-i: interactive only, -u/--urls: link href 포함)
 agent-devtools click @ref              # 클릭
 agent-devtools dblclick @ref           # 더블클릭
 agent-devtools fill @ref "text"        # 입력 (clear + type)
@@ -262,12 +273,13 @@ agent-devtools analyze                 # API 역공학 + 스키마
 
 ### Intercept (차별화)
 ```bash
-agent-devtools intercept mock <pattern> <json>
-agent-devtools intercept fail <pattern>
-agent-devtools intercept delay <pattern> <ms>
+agent-devtools intercept mock <pattern> <json> [--resource-type <csv>]
+agent-devtools intercept fail <pattern> [--resource-type <csv>]
+agent-devtools intercept delay <pattern> <ms> [--resource-type <csv>]
 agent-devtools intercept remove <pattern>
 agent-devtools intercept list
 agent-devtools intercept clear
+# --resource-type: CDP resourceType(Document/XHR/Script 등) CSV로 룰 적용 범위 제한
 ```
 
 ### Recording (차별화)
@@ -296,6 +308,7 @@ agent-devtools set offline on/off      # 오프라인 모드
 ```bash
 agent-devtools cookies [list]          # 쿠키 목록
 agent-devtools cookies set <n> <v>     # 쿠키 설정
+agent-devtools cookies set --curl <file>  # 일괄 임포트 (JSON/cURL 덤프/Cookie 헤더 자동 감지)
 agent-devtools cookies clear           # 쿠키 삭제
 agent-devtools storage local [key]     # localStorage
 agent-devtools storage session [key]   # sessionStorage
@@ -329,6 +342,8 @@ agent-devtools state list              # 저장된 상태 목록
 ### Page Injection
 ```bash
 agent-devtools addstyle <css>          # <style> 태그 추가
+agent-devtools addscript <js>          # 새 페이지마다 실행할 스크립트 등록 (identifier 반환)
+agent-devtools removeinitscript <id>   # addscript/--init-script 스크립트 제거
 ```
 
 ### Performance (차별화)
@@ -339,6 +354,7 @@ agent-devtools trace start             # Chrome DevTools 트레이스 시작
 agent-devtools trace stop [path]       # 트레이스 중지 + 저장
 agent-devtools profiler start          # CPU 프로파일러 시작
 agent-devtools profiler stop [path]    # 프로파일러 중지 + 저장
+agent-devtools vitals [url]            # Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
 ```
 
 ### Auth Vault (차별화)
@@ -362,6 +378,8 @@ agent-devtools --proxy-bypass=LIST     # 프록시 바이패스 목록
 agent-devtools --extension=PATH        # Chrome 확장 로딩
 agent-devtools --allowed-domains=LIST  # 도메인 제한
 agent-devtools --content-boundaries    # 콘텐츠 경계 마커
+agent-devtools --no-auto-dialog        # alert/beforeunload 자동 dismiss 비활성
+agent-devtools --init-script=PATH      # 페이지 JS 이전 실행 스크립트 등록 (반복 가능)
 agent-devtools find-chrome             # Chrome 경로
 ```
 
