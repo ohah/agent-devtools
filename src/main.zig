@@ -3221,9 +3221,9 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "cookies_clear")) {
         return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Network.clearBrowserCookies");
     } else if (std.mem.eql(u8, req.action, "cookies_set")) {
-        return handleCookieSet(allocator, sender, cmd_id, session_id, req.url, req.pattern);
+        return handleCookieSet(allocator, sender, resp_map, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "cookies_set_bulk")) {
-        return handleCookieSetBulk(allocator, sender, cmd_id, session_id, req.url);
+        return handleCookieSetBulk(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "set_viewport")) {
         return handleSetViewport(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "set_media")) {
@@ -4889,13 +4889,20 @@ fn extractCookieHeaderFromCurl(allocator: Allocator, curl: []const u8) !?[]const
 }
 
 /// Network.setCookies 배열의 단일 쿠키 객체 한 항목을 기록.
-fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8) !void {
+/// 단일 쿠키 객체 기록. domain이 주어지면 포함(없으면 daemon이 현재 URL 주입).
+/// CDP CookieParam은 url 또는 domain 중 하나가 필요 — 여기선 url을 넣지 않고
+/// daemon(handleCookieSetBulk/handleCookieSet)이 현재 페이지 URL을 채운다.
+fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8, domain: ?[]const u8) !void {
     if (!first) try w.writeByte(',');
     try w.writeAll("{\"name\":");
     try cdp.writeJsonString(w, name);
     try w.writeAll(",\"value\":");
     try cdp.writeJsonString(w, value);
-    try w.writeAll(",\"url\":\"*\"}");
+    if (domain) |d| {
+        try w.writeAll(",\"domain\":");
+        try cdp.writeJsonString(w, d);
+    }
+    try w.writeByte('}');
 }
 
 /// "name=value; name2=value2" 헤더를 Network.setCookies cookies 배열 JSON으로.
@@ -4913,7 +4920,7 @@ fn cookieHeaderToJson(allocator: Allocator, header: []const u8) ![]u8 {
         const name = std.mem.trim(u8, piece[0..eq], " \t");
         const value = std.mem.trim(u8, piece[eq + 1 ..], " \t");
         if (name.len == 0) continue;
-        try writeCookieEntry(w, count == 0, name, value);
+        try writeCookieEntry(w, count == 0, name, value, null);
         count += 1;
     }
     try w.writeByte(']');
@@ -4942,7 +4949,7 @@ fn buildCookieSetArrayJson(allocator: Allocator, raw: []const u8) ![]u8 {
         for (parsed.value.array.items) |c| {
             const name = cdp.getString(c, "name") orelse return error.MissingName;
             const value = cdp.getString(c, "value") orelse return error.MissingValue;
-            try writeCookieEntry(w, count == 0, name, value);
+            try writeCookieEntry(w, count == 0, name, value, cdp.getString(c, "domain"));
             count += 1;
         }
         try w.writeByte(']');
@@ -4965,9 +4972,30 @@ fn buildCookieSetArrayJson(allocator: Allocator, raw: []const u8) ![]u8 {
     return cookieHeaderToJson(allocator, trimmed);
 }
 
-fn handleCookieSet(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, name: ?[]const u8, value: ?[]const u8) []u8 {
+/// 현재 페이지 URL을 가져옴 (Network.setCookie의 url 필드용). 호출자가 free.
+fn fetchPageUrl(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8) ?[]u8 {
+    const v = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, "window.location.href") orelse return null;
+    // 쿠키를 설정할 수 없는 비실제 페이지는 친절한 에러로 안내
+    const non_page = v.len == 0 or
+        std.mem.startsWith(u8, v, "about:") or
+        std.mem.startsWith(u8, v, "chrome:") or
+        std.mem.startsWith(u8, v, "chrome-error:") or
+        std.mem.startsWith(u8, v, "data:");
+    if (non_page) {
+        allocator.free(v);
+        return null;
+    }
+    return v;
+}
+
+fn handleCookieSet(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, name: ?[]const u8, value: ?[]const u8) []u8 {
     const n = name orelse return respondErr(allocator, "name required");
     const v = value orelse "";
+    // CDP CookieParam은 url 또는 domain 필수 — 현재 페이지 URL을 사용
+    const page_url = fetchPageUrl(allocator, sender, resp_map, cmd_id, session_id) orelse
+        return respondErr(allocator, "cannot set cookie: open a page first");
+    defer allocator.free(page_url);
+
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     const w = buf.writer(allocator);
@@ -4975,7 +5003,9 @@ fn handleCookieSet(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Command
     cdp.writeJsonString(w, n) catch return respondErr(allocator, "write error");
     w.writeAll(",\"value\":") catch {};
     cdp.writeJsonString(w, v) catch {};
-    w.writeAll(",\"url\":\"*\"}") catch {};
+    w.writeAll(",\"url\":") catch {};
+    cdp.writeJsonString(w, page_url) catch {};
+    w.writeByte('}') catch {};
     const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
     defer allocator.free(params);
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Network.setCookie", params, session_id) catch
@@ -4985,17 +5015,45 @@ fn handleCookieSet(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Command
     return respondOk(allocator);
 }
 
-/// 일괄 쿠키 설정 — req.url에 Network.setCookies cookies 배열 JSON이 담겨옴.
-fn handleCookieSetBulk(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, arr_opt: ?[]const u8) []u8 {
-    const arr = arr_opt orelse return respondErr(allocator, "cookies array required");
+/// Network.setCookies params 생성. url/domain 둘 다 없는 쿠키엔 page_url 주입.
+/// (parsed value를 직접 mutate 후 daemon.writeJsonValue로 재직렬화)
+fn buildCookieSetParams(allocator: Allocator, items: []std.json.Value, page_url: []const u8) !std.ArrayList(u8) {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    w.writeAll("{\"cookies\":") catch return respondErr(allocator, "write error");
-    w.writeAll(arr) catch return respondErr(allocator, "write error");
-    w.writeByte('}') catch return respondErr(allocator, "write error");
-    const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-    defer allocator.free(params);
+    try w.writeAll("{\"cookies\":[");
+    var count: usize = 0;
+    for (items) |*c| {
+        if (c.* != .object) continue;
+        if (c.object.get("url") == null and c.object.get("domain") == null) {
+            try c.object.put("url", .{ .string = page_url });
+        }
+        if (count > 0) try w.writeByte(',');
+        try daemon.writeJsonValue(w, c.*);
+        count += 1;
+    }
+    try w.writeAll("]}");
+    return buf;
+}
+
+/// 일괄 쿠키 설정 — req.url에 cookies 배열 JSON. url/domain 없는 항목엔
+/// 현재 페이지 URL을 주입 (agent-browser 동작과 동일).
+fn handleCookieSetBulk(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, arr_opt: ?[]const u8) []u8 {
+    const arr = arr_opt orelse return respondErr(allocator, "cookies array required");
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, arr, .{}) catch
+        return respondErr(allocator, "cookies parse error");
+    defer parsed.deinit();
+    if (parsed.value != .array) return respondErr(allocator, "cookies: expected array");
+
+    const page_url = fetchPageUrl(allocator, sender, resp_map, cmd_id, session_id) orelse
+        return respondErr(allocator, "cannot set cookies: open a page first");
+    defer allocator.free(page_url);
+
+    var buf = buildCookieSetParams(allocator, parsed.value.array.items, page_url) catch
+        return respondErr(allocator, "cookies build error");
+    defer buf.deinit(allocator);
+    const params = buf.items;
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Network.setCookies", params, session_id) catch
         return respondErr(allocator, "cmd error");
     defer allocator.free(cmd);
@@ -7395,7 +7453,9 @@ fn handleVitals(allocator: Allocator, sender: *WsSender, resp_map: *response_map
         std.Thread.sleep(VITALS_NAV_SETTLE_MS * std.time.ns_per_ms);
     }
 
-    const init_res = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, VITALS_INIT_JS) orelse
+    // VITALS_INIT은 값을 반환하지 않고 handleEvalRaw는 문자열 값만 추출하므로
+    // ";'ok'"를 붙여 정상 실행=문자열 반환, 실제 eval 실패=null로 구분.
+    const init_res = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, VITALS_INIT_JS ++ ";'ok'") orelse
         return respondErr(allocator, "vitals init failed");
     allocator.free(init_res);
 
@@ -9746,12 +9806,42 @@ test "handleDownloadPath: builds correct CDP command params" {
     // handleDownloadPath needs a sender — tested via build compilation
 }
 
+test "buildCookieSetParams: injects page_url only when no url/domain; valid JSON" {
+    const a = std.testing.allocator;
+    // 첫 항목 non-object(스킵), url 있음, domain 있음, 둘 다 없음 → 콤마 버그 회귀 방지
+    const json =
+        \\["skip-me",{"name":"a","value":"1","url":"https://x.com"},{"name":"b","value":"2","domain":"y.com"},{"name":"c","value":"3"}]
+    ;
+    const p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+    defer p.deinit();
+    var buf = try buildCookieSetParams(a, p.value.array.items, "https://page.example/");
+    defer buf.deinit(a);
+
+    // 결과가 유효 JSON이고 쿠키 3개, c만 url 주입
+    const out = try std.json.parseFromSlice(std.json.Value, a, buf.items, .{});
+    defer out.deinit();
+    const cookies = out.value.object.get("cookies").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), cookies.len);
+    try std.testing.expectEqualStrings("https://x.com", cookies[0].object.get("url").?.string);
+    try std.testing.expect(cookies[1].object.get("url") == null); // domain만
+    try std.testing.expectEqualStrings("https://page.example/", cookies[2].object.get("url").?.string);
+}
+
+test "buildCookieSetParams: empty array yields empty cookies" {
+    const a = std.testing.allocator;
+    const p = try std.json.parseFromSlice(std.json.Value, a, "[]", .{});
+    defer p.deinit();
+    var buf = try buildCookieSetParams(a, p.value.array.items, "https://p/");
+    defer buf.deinit(a);
+    try std.testing.expectEqualStrings("{\"cookies\":[]}", buf.items);
+}
+
 test "buildCookieSetArrayJson: bare cookie header" {
     const a = std.testing.allocator;
     const out = try buildCookieSetArrayJson(a, "  sid=abc; theme=dark ; empty= ");
     defer a.free(out);
     try std.testing.expectEqualStrings(
-        "[{\"name\":\"sid\",\"value\":\"abc\",\"url\":\"*\"},{\"name\":\"theme\",\"value\":\"dark\",\"url\":\"*\"},{\"name\":\"empty\",\"value\":\"\",\"url\":\"*\"}]",
+        "[{\"name\":\"sid\",\"value\":\"abc\"},{\"name\":\"theme\",\"value\":\"dark\"},{\"name\":\"empty\",\"value\":\"\"}]",
         out,
     );
 }
@@ -9763,7 +9853,7 @@ test "buildCookieSetArrayJson: JSON array format" {
     );
     defer a.free(out);
     try std.testing.expectEqualStrings(
-        "[{\"name\":\"a\",\"value\":\"1\",\"url\":\"*\"},{\"name\":\"b\",\"value\":\"2\",\"url\":\"*\"}]",
+        "[{\"name\":\"a\",\"value\":\"1\",\"domain\":\"x.com\"},{\"name\":\"b\",\"value\":\"2\"}]",
         out,
     );
 }
@@ -9774,7 +9864,7 @@ test "buildCookieSetArrayJson: cURL dump extracts -H cookie header" {
     const out = try buildCookieSetArrayJson(a, curl);
     defer a.free(out);
     try std.testing.expectEqualStrings(
-        "[{\"name\":\"sid\",\"value\":\"xyz\",\"url\":\"*\"},{\"name\":\"t\",\"value\":\"1\",\"url\":\"*\"}]",
+        "[{\"name\":\"sid\",\"value\":\"xyz\"},{\"name\":\"t\",\"value\":\"1\"}]",
         out,
     );
 }
@@ -9783,7 +9873,7 @@ test "buildCookieSetArrayJson: cURL with -b flag" {
     const a = std.testing.allocator;
     const out = try buildCookieSetArrayJson(a, "curl \"https://x.com\" -b \"k=v\"");
     defer a.free(out);
-    try std.testing.expectEqualStrings("[{\"name\":\"k\",\"value\":\"v\",\"url\":\"*\"}]", out);
+    try std.testing.expectEqualStrings("[{\"name\":\"k\",\"value\":\"v\"}]", out);
 }
 
 test "buildCookieSetArrayJson: empty file errors" {
@@ -9919,6 +10009,10 @@ test "VITALS scripts: observe all core web vitals + emit expected keys" {
     inline for (.{ "lcp", "cls", "fcp", "inp", "ttfb" }) |k| {
         try std.testing.expect(std.mem.indexOf(u8, VITALS_READ_JS, k) != null);
     }
+    // 회귀 방지: VITALS_INIT은 값을 반환하지 않는 IIFE(`})()` 종료)이므로
+    // handleVitals가 ";'ok'" 접미사로 성공/실패를 구분해야 함. (T18 버그)
+    try std.testing.expect(std.mem.endsWith(u8, std.mem.trimRight(u8, VITALS_INIT_JS, " \n\r\t"), "})()"));
+    try std.testing.expect(std.mem.indexOf(u8, VITALS_INIT_JS, "return ") == null);
 }
 
 test "buildPushStateExpr: embeds URL as escaped JSON arg" {
