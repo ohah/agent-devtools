@@ -208,6 +208,7 @@ pub fn main() void {
     var content_boundaries = false;
     var no_auto_dialog = false;
     var enable_react = false;
+    var profile: ?[]const u8 = null;
     // --init-script=PATH (반복 가능) → 쉼표로 join 누적
     var init_scripts_buf: std.ArrayList(u8) = .empty;
 
@@ -242,6 +243,8 @@ pub fn main() void {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
+        } else if (std.mem.startsWith(u8, arg, "--profile=")) {
+            profile = arg["--profile=".len..];
         } else if (std.mem.startsWith(u8, arg, "--enable=")) {
             const feature = arg["--enable=".len..];
             if (std.mem.eql(u8, feature, "react-devtools") or std.mem.eql(u8, feature, "react")) {
@@ -284,6 +287,7 @@ pub fn main() void {
         .no_auto_dialog = no_auto_dialog,
         .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
         .enable_react = enable_react,
+        .profile = profile,
     };
 
     if (interactive) {
@@ -297,7 +301,15 @@ pub fn main() void {
         return;
     };
 
-    if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
+    if (std.mem.eql(u8, cmd, "batch")) {
+        const bail = blk: {
+            while (args_iter.next()) |a| if (std.mem.eql(u8, a, "--bail")) break :blk true;
+            break :blk false;
+        };
+        const exit_code = runBatch(session, daemon_opts, bail);
+        if (exit_code != 0) std.process.exit(exit_code);
+        return;
+    } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
         printUsage();
     } else if (std.mem.eql(u8, cmd, "--version") or std.mem.eql(u8, cmd, "-v")) {
         write("agent-devtools {s}\n", .{version});
@@ -307,6 +319,17 @@ pub fn main() void {
         } else {
             write("Chrome not found.\n", .{});
         }
+    } else if (std.mem.eql(u8, cmd, "doctor")) {
+        const json_out = if (args_iter.next()) |a| std.mem.eql(u8, a, "--json") else false;
+        runDoctor(json_out);
+    } else if (std.mem.eql(u8, cmd, "profiles")) {
+        const pa = std.heap.page_allocator;
+        const profiles = chrome.listChromeProfiles(pa) catch |e| {
+            writeErr("profiles: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
+        defer chrome.freeChromeProfiles(pa, profiles);
+        for (profiles) |p| write("{s}\t{s}\n", .{ p.directory, p.name });
     } else if (std.mem.eql(u8, cmd, "open") or std.mem.eql(u8, cmd, "navigate") or std.mem.eql(u8, cmd, "goto")) {
         const url = args_iter.next() orelse {
             writeErr("Usage: agent-devtools open <url>\n", .{});
@@ -471,9 +494,16 @@ pub fn main() void {
         } else if (std.mem.eql(u8, subcmd, "new")) {
             sendAction(session, "tab_new", args_iter.next(), null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "close")) {
-            sendAction(session, "tab_close", null, null, daemon_opts);
+            sendAction(session, "tab_close", args_iter.next(), null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "count")) {
             sendAction(session, "tab_count", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "switch")) {
+            // `tab switch <ref>` 와 `tab <ref>` 둘 다 지원
+            const tref = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools tab switch <id|index>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "tab_switch", tref, null, daemon_opts);
         } else {
             sendAction(session, "tab_switch", subcmd, null, daemon_opts);
         }
@@ -711,6 +741,33 @@ pub fn main() void {
             std.process.exit(1);
         };
         sendAction(session, "press", key, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "keydown") or std.mem.eql(u8, cmd, "keyup")) {
+        const key = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools {s} <key>\n", .{cmd});
+            std.process.exit(1);
+        };
+        sendAction(session, cmd, key, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "keyboard")) {
+        const sub = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools keyboard <type|inserttext> <text>\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, sub, "type")) {
+            const txt = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools keyboard type <text>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "keyboard_type", txt, null, daemon_opts);
+        } else if (std.mem.eql(u8, sub, "inserttext") or std.mem.eql(u8, sub, "insertText")) {
+            const txt = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools keyboard inserttext <text>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "keyboard_insert", txt, null, daemon_opts);
+        } else {
+            writeErr("Unknown keyboard subcommand: {s}\n", .{sub});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, cmd, "hover")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools hover <@ref>\n", .{});
@@ -1130,6 +1187,12 @@ pub fn main() void {
             std.process.exit(1);
         };
         sendAction(session, "tap", target, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "swipe")) {
+        const dir = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools swipe <up|down|left|right> [distance]\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "swipe", dir, args_iter.next(), daemon_opts);
     } else if (std.mem.eql(u8, cmd, "title")) {
         sendAction(session, "get_title", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "url")) {
@@ -1631,6 +1694,145 @@ fn buildDebugResponse(
     return result.toOwnedSlice(allocator) catch null;
 }
 
+/// batch [--bail]: stdin에서 줄당 한 명령(대화형과 동일 문법)을 읽어
+/// 같은 데몬에 순차 실행, 각 응답을 한 줄씩 출력. --bail은 첫 실패에서 중단.
+/// 하나라도 실패하면 종료코드 1.
+/// 세션 데몬에 사전 직렬화된 요청 1건 송신 후 응답 라인 반환 (호출자 free).
+fn sendOneCommand(allocator: Allocator, session: []const u8, data: []const u8) ![]u8 {
+    var client = try daemon.SocketClient.connect(session);
+    defer client.close();
+    try client.send(data);
+    return client.recvLineAlloc(allocator);
+}
+
+/// daemon 응답이 실패인지 판정. 최상위 success 불리언을 파싱(견고).
+/// 파싱 실패 시에만 substring 폴백 (payload 오탐 방지).
+fn responseFailed(allocator: Allocator, resp: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
+        return std.mem.indexOf(u8, resp, "\"success\":false") != null;
+    defer parsed.deinit();
+    return (cdp.getBool(parsed.value, "success") orelse true) == false;
+}
+
+/// abs_dir 안에서 suffix로 끝나는 파일 개수. 디렉터리 없으면 0.
+fn countDirEntries(abs_dir: []const u8, suffix: []const u8) usize {
+    var dir = std.fs.openDirAbsolute(abs_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close();
+    var n: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, suffix)) n += 1;
+    }
+    return n;
+}
+
+/// 활성 세션 소켓(*.sock) 개수 + 설정파일 절대경로(없으면 null).
+const DoctorInfo = struct { sessions: usize, config_path: ?[]const u8 };
+
+/// config_path는 path_buf를 가리킴 — 호출자가 path_buf를 살아있게 유지해야 함.
+fn collectDoctorInfo(path_buf: []u8) DoctorInfo {
+    var dir_buf: [512]u8 = undefined;
+    const sessions = countDirEntries(daemon.getSocketDir(&dir_buf), ".sock");
+
+    // 진단 가치를 위해 라벨이 아닌 해석된 절대경로를 보고
+    var config_path: ?[]const u8 = null;
+    if (std.fs.cwd().realpath("agent-devtools.json", path_buf)) |abs| {
+        config_path = abs;
+    } else |_| {
+        if (daemon.getenv("HOME")) |home| {
+            const hp = std.fmt.bufPrint(path_buf, "{s}/.agent-devtools/config.json", .{home}) catch return .{ .sessions = sessions, .config_path = null };
+            if (std.fs.accessAbsolute(hp, .{})) |_| config_path = hp else |_| {}
+        }
+    }
+    return .{ .sessions = sessions, .config_path = config_path };
+}
+
+fn writeDoctorJson(w: anytype, ver: []const u8, os: []const u8, arch: []const u8, chrome_path: ?[]const u8, info: DoctorInfo, ok: bool) !void {
+    try w.print("{{\"version\":\"{s}\",\"os\":\"{s}\",\"arch\":\"{s}\",\"chrome\":", .{ ver, os, arch });
+    if (chrome_path) |p| try cdp.writeJsonString(w, p) else try w.writeAll("null");
+    try w.print(",\"sessions\":{d},\"config\":", .{info.sessions});
+    if (info.config_path) |c| try cdp.writeJsonString(w, c) else try w.writeAll("null");
+    try w.print(",\"status\":\"{s}\"}}", .{if (ok) "ok" else "Chrome missing"});
+}
+
+/// doctor [--json] — 데몬 없이 환경/Chrome/세션/설정 진단.
+fn runDoctor(json_out: bool) void {
+    const chrome_path = chrome.findChrome();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const info = collectDoctorInfo(&path_buf);
+    const os = @tagName(builtin.os.tag);
+    const arch = @tagName(builtin.cpu.arch);
+    const ok = chrome_path != null;
+
+    if (json_out) {
+        var buf: std.ArrayList(u8) = .empty;
+        defer buf.deinit(std.heap.page_allocator);
+        // 실패 시 부분 출력 대신 전체 중단 (일관)
+        writeDoctorJson(buf.writer(std.heap.page_allocator), version, os, arch, chrome_path, info, ok) catch return;
+        writeLine(buf.items);
+        return;
+    }
+
+    write("agent-devtools doctor\n", .{});
+    write("  version : {s}\n", .{version});
+    write("  platform: {s}/{s}\n", .{ os, arch });
+    if (chrome_path) |p| {
+        write("  chrome  : {s}\n", .{p});
+    } else {
+        write("  chrome  : NOT FOUND — install Chrome/Chromium\n", .{});
+    }
+    write("  sessions: {d} active\n", .{info.sessions});
+    write("  config  : {s}\n", .{info.config_path orelse "(none)"});
+    write("  status  : {s}\n", .{if (ok) "ok" else "Chrome missing"});
+}
+
+fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) u8 {
+    var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa_impl.deinit();
+    const allocator = gpa_impl.allocator();
+
+    const started = daemon.ensureDaemon(allocator, session, daemon_opts) catch |err| {
+        writeErr("Failed to start daemon: {s}\n", .{@errorName(err)});
+        return 1;
+    };
+    if (started) writeErr("Started daemon (session: {s})\n", .{session});
+
+    const stdin = std.fs.File.stdin();
+    const input = stdin.readToEndAlloc(allocator, 16 * 1024 * 1024) catch {
+        writeErr("batch: failed to read stdin\n", .{});
+        return 1;
+    };
+    defer allocator.free(input);
+
+    var had_failure = false;
+    var counter: usize = 1;
+    var it = std.mem.splitScalar(u8, input, '\n');
+    while (it.next()) |raw_line| {
+        const line = std.mem.trim(u8, raw_line, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+
+        var id_buf: [20]u8 = undefined;
+        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{counter}) catch unreachable; // [20]u8는 usize 10진수 충분
+        counter += 1;
+
+        const resp: []u8 = blk: {
+            const data = parseTextCommand(allocator, line, id_str) orelse
+                break :blk allocator.dupe(u8, "{\"success\":false,\"error\":\"parse error\"}") catch return 1;
+            defer allocator.free(data);
+            break :blk sendOneCommand(allocator, session, data) catch
+                allocator.dupe(u8, "{\"success\":false,\"error\":\"daemon send/recv failed\"}") catch return 1;
+        };
+        defer allocator.free(resp);
+        writeLine(resp);
+
+        if (responseFailed(allocator, resp)) {
+            had_failure = true;
+            if (bail) return 1;
+        }
+    }
+    return if (had_failure) 1 else 0;
+}
+
 /// Interactive/pipe mode: persistent REPL that reads JSON commands from stdin,
 /// sends them to the daemon, and writes responses + events to stdout.
 fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_mode: bool) u8 {
@@ -1848,7 +2050,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_
                         _ = stdout_f.write(debug_resp) catch {};
                         _ = stdout_f.write("\n") catch {};
 
-                        if (std.mem.indexOf(u8, resp_line, "\"success\":false") != null) {
+                        if (responseFailed(allocator, resp_line)) {
                             had_failure = true;
                         }
                         continue;
@@ -1862,7 +2064,7 @@ fn runInteractive(session: []const u8, daemon_opts: daemon.DaemonOptions, debug_
             _ = stdout_f.write("\n") catch {};
 
             // Track failures for exit code
-            if (std.mem.indexOf(u8, resp_line, "\"success\":false") != null) {
+            if (responseFailed(allocator, resp_line)) {
                 had_failure = true;
             }
         }
@@ -1928,15 +2130,31 @@ fn runDaemon() void {
         };
         break :blk discovered_url.?;
     } else blk: {
+        // --profile: 해석된 Chrome 프로필을 임시 user-data-dir로 복사해 로그인 상태 재사용
+        const profile_udd: ?[]u8 = if (daemon.getenv("AGENT_DEVTOOLS_PROFILE")) |pn|
+            (chrome.resolveAndCopyProfile(allocator, pn) catch |e| pblk: {
+                std.debug.print("Daemon: --profile '{s}' 실패: {s} (기본 임시 프로필 사용)\n", .{ pn, @errorName(e) });
+                break :pblk null;
+            })
+        else
+            null;
         chrome_proc = chrome.ChromeProcess.launch(allocator, .{
             .headless = !is_headed,
             .proxy = env_proxy,
             .proxy_bypass = env_proxy_bypass,
             .extensions = env_extensions,
+            .user_data_dir = profile_udd,
         }) catch |err| {
             std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
+            if (profile_udd) |p| {
+                std.fs.deleteTreeAbsolute(p) catch {};
+                allocator.free(p);
+            }
             return;
         };
+        // 복사한 프로필 임시 디렉터리를 ChromeProcess 소유로 넘겨 deinit에서 삭제+free
+        // (user_data_dir 제공 시 launch는 자체 temp_dir를 만들지 않음)
+        if (profile_udd) |p| chrome_proc.?.temp_dir = p;
         break :blk chrome_proc.?.ws_url;
     };
 
@@ -3158,6 +3376,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleFill(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "press")) {
         return handlePress(allocator, sender, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "keydown")) {
+        return handleKeyHalf(allocator, sender, cmd_id, session_id, req.url, "keyDown");
+    } else if (std.mem.eql(u8, req.action, "keyup")) {
+        return handleKeyHalf(allocator, sender, cmd_id, session_id, req.url, "keyUp");
+    } else if (std.mem.eql(u8, req.action, "keyboard_type")) {
+        return handleKeyboardType(allocator, sender, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "keyboard_insert")) {
+        return handleKeyboardInsert(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "scroll")) {
         return handleScroll(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "select_option")) {
@@ -3172,6 +3398,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
         return handleTap(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
+    } else if (std.mem.eql(u8, req.action, "swipe")) {
+        return handleSwipe(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "is_visible") or std.mem.eql(u8, req.action, "is_enabled") or std.mem.eql(u8, req.action, "is_checked")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -3215,7 +3443,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleSimpleCdpWithParams(allocator, sender, cmd_id, session_id, "Target.createTarget", req.url);
         // NOTE: extra closing brace was needed for the if(ctx.allowed_domains) block — but the structure above closes correctly
     } else if (std.mem.eql(u8, req.action, "tab_close")) {
-        return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Target.closeTarget");
+        return handleTabClose(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "cookies_list")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "JSON.stringify(document.cookie)");
     } else if (std.mem.eql(u8, req.action, "cookies_clear")) {
@@ -4109,19 +4337,62 @@ fn handleTap(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mo
     const center = resolveCenter(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse
         return respondErr(allocator, "element not visible");
 
-    // touchStart with touchPoints
-    var start_buf: [256]u8 = undefined;
-    const start_params = std.fmt.bufPrint(&start_buf, "{{\"type\":\"touchStart\",\"touchPoints\":[{{\"x\":{d},\"y\":{d}}}]}}", .{ center.x, center.y }) catch
+    const start_cmd = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchStart", center.x, center.y, session_id) catch
         return respondErr(allocator, "cmd error");
-    const start_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchTouchEvent", start_params, session_id) catch return respondErr(allocator, "cmd error");
     defer allocator.free(start_cmd);
     sender.sendText(start_cmd) catch {};
 
-    // touchEnd with empty touchPoints
-    const end_params = "{\"type\":\"touchEnd\",\"touchPoints\":[]}";
-    const end_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchTouchEvent", end_params, session_id) catch return respondErr(allocator, "cmd error");
+    const end_cmd = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchEnd", 0, 0, session_id) catch
+        return respondErr(allocator, "cmd error");
     defer allocator.free(end_cmd);
     sender.sendText(end_cmd) catch {};
+
+    return respondOk(allocator);
+}
+
+/// swipe <up|down|left|right> [distance] — (200,400)에서 시작해 touchStart →
+/// 10단계 touchMove → touchEnd. agent-browser 동작과 동일.
+fn handleSwipe(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, dir_opt: ?[]const u8, dist_opt: ?[]const u8) []u8 {
+    const dir = dir_opt orelse return respondErr(allocator, "direction required");
+    const distance: f64 = if (dist_opt) |d| (std.fmt.parseFloat(f64, d) catch 300.0) else 300.0;
+    var dx: f64 = 0;
+    var dy: f64 = 0;
+    if (std.mem.eql(u8, dir, "up")) {
+        dy = -distance;
+    } else if (std.mem.eql(u8, dir, "down")) {
+        dy = distance;
+    } else if (std.mem.eql(u8, dir, "left")) {
+        dx = -distance;
+    } else if (std.mem.eql(u8, dir, "right")) {
+        dx = distance;
+    } else {
+        return respondErr(allocator, "direction must be up|down|left|right");
+    }
+
+    // 고정 시작점: 일반적 뷰포트에서 안전한 중앙 근처 (agent-browser와 동일)
+    const cx: f64 = 200;
+    const cy: f64 = 400;
+
+    const sc = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchStart", cx, cy, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(sc);
+    sender.sendText(sc) catch {};
+
+    const steps: usize = 10;
+    var i: usize = 1;
+    while (i <= steps) : (i += 1) {
+        const f = @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
+        // 중간 프레임 1개가 누락돼도 제스처에 무해 — touchStart/End 쌍은 유지됨
+        const mc = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchMove", cx + dx * f, cy + dy * f, session_id) catch continue;
+        defer allocator.free(mc);
+        sender.sendText(mc) catch {};
+        std.Thread.sleep(16 * std.time.ns_per_ms); // ~60fps 간격으로 자연스러운 fling 인식
+    }
+
+    const ec = snapshot_mod.buildTouchCmd(allocator, cmd_id.next(), "touchEnd", 0, 0, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(ec);
+    sender.sendText(ec) catch {};
 
     return respondOk(allocator);
 }
@@ -4242,52 +4513,89 @@ fn getKeyInfo(key_name: []const u8) KeyInfo {
     return .{ .key = key_name, .code = key_name, .key_code = 0, .text = null };
 }
 
+/// Input.dispatchKeyEvent params 빌드. kind = "keyDown"|"keyUp"|"rawKeyDown".
+/// keyDown에만 text 포함 (keyUp은 문자 입력 없음). 호출자가 free.
+fn buildKeyEventParams(allocator: Allocator, kind: []const u8, info: KeyInfo) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"type\":");
+    try cdp.writeJsonString(w, kind);
+    try w.writeAll(",\"key\":");
+    try cdp.writeJsonString(w, info.key);
+    try w.writeAll(",\"code\":");
+    try cdp.writeJsonString(w, info.code);
+    try std.fmt.format(w, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code });
+    if (std.mem.eql(u8, kind, "keyDown")) {
+        if (info.text) |text| {
+            try w.writeAll(",\"text\":");
+            try cdp.writeJsonString(w, text);
+        }
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// 단일 키 이벤트(keyDown 또는 keyUp) 전송 — keydown/keyup 명령용 (모디파이어 홀드).
+fn handleKeyHalf(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8, kind: []const u8) []u8 {
+    const key_name = key orelse return respondErr(allocator, "key required");
+    const params = buildKeyEventParams(allocator, kind, getKeyInfo(key_name)) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
 fn handlePress(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8) []u8 {
     const key_name = key orelse return respondErr(allocator, "key required");
     const info = getKeyInfo(key_name);
 
-    // keyDown
-    var down_buf: std.ArrayList(u8) = .empty;
-    defer down_buf.deinit(allocator);
-    const dw = down_buf.writer(allocator);
-    dw.writeAll("{\"type\":\"keyDown\",\"key\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(dw, info.key) catch return respondErr(allocator, "write error");
-    dw.writeAll(",\"code\":") catch {};
-    cdp.writeJsonString(dw, info.code) catch {};
-    std.fmt.format(dw, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code }) catch {};
-    if (info.text) |text| {
-        dw.writeAll(",\"text\":") catch {};
-        cdp.writeJsonString(dw, text) catch {};
+    inline for (.{ "keyDown", "keyUp" }) |kind| {
+        const params = buildKeyEventParams(allocator, kind, info) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(params);
+        const c = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+            return respondErr(allocator, "cmd error");
+        defer allocator.free(c);
+        sender.sendText(c) catch {};
     }
-    dw.writeByte('}') catch {};
+    return respondOk(allocator);
+}
 
-    const down_params = down_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-    defer allocator.free(down_params);
-
-    const cmd1 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", down_params, session_id) catch
+/// keyboard inserttext <text> — 포커스된 요소에 Input.insertText로 원자 삽입
+/// (키 이벤트 미발생).
+fn handleKeyboardInsert(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, text: ?[]const u8) []u8 {
+    const t = text orelse return respondErr(allocator, "text required");
+    const cmd = snapshot_mod.buildInsertTextCmd(allocator, cmd_id.next(), t, session_id) catch
         return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd1);
-    sender.sendText(cmd1) catch {};
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
 
-    // keyUp
-    var up_buf: std.ArrayList(u8) = .empty;
-    defer up_buf.deinit(allocator);
-    const uw = up_buf.writer(allocator);
-    uw.writeAll("{\"type\":\"keyUp\",\"key\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(uw, info.key) catch {};
-    uw.writeAll(",\"code\":") catch {};
-    cdp.writeJsonString(uw, info.code) catch {};
-    std.fmt.format(uw, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code }) catch {};
-    uw.writeByte('}') catch {};
-
-    const up_params = up_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-    defer allocator.free(up_params);
-
-    const cmd2 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", up_params, session_id) catch
-        return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd2);
-    sender.sendText(cmd2) catch {};
-
+/// keyboard type <text> — 문자별 합성 키스트로크(keyDown+text → keyUp)로
+/// 포커스된 요소에 입력. inserttext와 달리 keydown/input 핸들러가 동작
+/// (agent-browser type 시맨틱). UTF-8 코드포인트 단위.
+fn handleKeyboardType(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, text: ?[]const u8) []u8 {
+    const t = text orelse return respondErr(allocator, "text required");
+    var i: usize = 0;
+    while (i < t.len) {
+        const len = std.unicode.utf8ByteSequenceLength(t[i]) catch 1;
+        const end = @min(i + len, t.len);
+        const ch = t[i..end];
+        const info = KeyInfo{ .key = ch, .code = "", .key_code = 0, .text = ch };
+        inline for (.{ "keyDown", "keyUp" }) |kind| {
+            const params = buildKeyEventParams(allocator, kind, info) catch return respondErr(allocator, "alloc error");
+            defer allocator.free(params);
+            const c = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+                return respondErr(allocator, "cmd error");
+            defer allocator.free(c);
+            sender.sendText(c) catch {};
+        }
+        i = end;
+    }
     return respondOk(allocator);
 }
 
@@ -4595,7 +4903,10 @@ fn handleTabList(allocator: Allocator, sender: *WsSender, resp_map: *response_ma
                         if (!std.mem.eql(u8, t, "page")) continue;
                         if (!first) writer.writeByte(',') catch {};
                         first = false;
-                        writer.writeAll("{\"type\":") catch {};
+                        // id = CDP targetId — 다른 탭이 닫혀도 흔들리지 않는 안정 핸들
+                        writer.writeAll("{\"id\":") catch {};
+                        cdp.writeJsonString(writer, cdp.getString(info, "targetId") orelse "") catch {};
+                        writer.writeAll(",\"type\":") catch {};
                         cdp.writeJsonString(writer, t) catch {};
                         writer.writeAll(",\"title\":") catch {};
                         cdp.writeJsonString(writer, cdp.getString(info, "title") orelse "") catch {};
@@ -6584,60 +6895,68 @@ fn handleClipboardSet(allocator: Allocator, sender: *WsSender, resp_map: *respon
     return respondOk(allocator);
 }
 
-/// tab switch <index> — switch to tab by 0-based index
-fn handleTabSwitch(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, index_opt: ?[]const u8) []u8 {
-    _ = session_id;
-    const index_str = index_opt orelse return respondErr(allocator, "tab index required");
-    const index = std.fmt.parseInt(usize, index_str, 10) catch
-        return respondErr(allocator, "invalid tab index");
+/// 탭 ref(안정 targetId 또는 0-base 인덱스) → targetId 해석 결과.
+/// .ok = 매칭된 targetId(allocator 소유, 호출자 free). .not_found / .err(정적 메시지).
+const TabResolve = union(enum) { ok: []u8, not_found, err: []const u8 };
 
-    // Get all targets
+/// page 타깃 중 ref와 일치하는 targetId를 찾는다. 인덱스는 Target.getTargets
+/// 열거 순서(= `tab list` 순서)이며 탭 개폐 시 흔들리므로 안정 id 사용을 권장.
+fn resolveTabTarget(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, ref_opt: ?[]const u8) TabResolve {
+    const ref = ref_opt orelse return .{ .err = "tab id/index required (see `tab list`)" };
+    const ref_index: ?usize = std.fmt.parseInt(usize, ref, 10) catch null;
+
     const sent_id = cmd_id.next();
-    const targets_cmd = cdp.targetGetTargets(allocator, sent_id) catch return respondErr(allocator, "cmd error");
+    const targets_cmd = cdp.targetGetTargets(allocator, sent_id) catch return .{ .err = "cmd error" };
     defer allocator.free(targets_cmd);
-
-    const raw = sendAndWait(sender, resp_map, targets_cmd, sent_id, 10_000) orelse
-        return respondErr(allocator, "tab switch timeout");
+    const raw = sendAndWait(sender, resp_map, targets_cmd, sent_id, 10_000) orelse return .{ .err = "tab timeout" };
     defer allocator.free(raw);
-
-    const parsed = cdp.parseMessage(allocator, raw) catch
-        return respondErr(allocator, "parse error");
+    const parsed = cdp.parseMessage(allocator, raw) catch return .{ .err = "parse error" };
     defer parsed.parsed.deinit();
 
-    if (parsed.message.isResponse()) {
-        if (parsed.message.result) |result| {
-            if (result.object.get("targetInfos")) |infos| {
-                if (infos == .array) {
-                    // Filter to page targets
-                    var page_idx: usize = 0;
-                    for (infos.array.items) |info| {
-                        const t = cdp.getString(info, "type") orelse continue;
-                        if (!std.mem.eql(u8, t, "page")) continue;
-                        if (page_idx == index) {
-                            const tid = cdp.getString(info, "targetId") orelse return respondErr(allocator, "no targetId");
-                            // Activate target
-                            var activate_buf: std.ArrayList(u8) = .empty;
-                            defer activate_buf.deinit(allocator);
-                            const aw = activate_buf.writer(allocator);
-                            aw.writeAll("{\"targetId\":") catch return respondErr(allocator, "write error");
-                            cdp.writeJsonString(aw, tid) catch return respondErr(allocator, "write error");
-                            aw.writeByte('}') catch {};
-                            const activate_params = activate_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-                            defer allocator.free(activate_params);
-                            const activate_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.activateTarget", activate_params, null) catch
-                                return respondErr(allocator, "cmd error");
-                            defer allocator.free(activate_cmd);
-                            sender.sendText(activate_cmd) catch {};
-                            return respondOk(allocator);
-                        }
-                        page_idx += 1;
-                    }
-                    return respondErr(allocator, "tab index out of range");
-                }
-            }
+    if (!parsed.message.isResponse()) return .{ .err = "tab resolve failed" };
+    const result = parsed.message.result orelse return .{ .err = "tab resolve failed" };
+    const infos = result.object.get("targetInfos") orelse return .{ .err = "tab resolve failed" };
+    if (infos != .array) return .{ .err = "tab resolve failed" };
+
+    var page_idx: usize = 0;
+    for (infos.array.items) |info| {
+        if (!std.mem.eql(u8, cdp.getString(info, "type") orelse "", "page")) continue;
+        const tid = cdp.getString(info, "targetId") orelse "";
+        if (std.mem.eql(u8, tid, ref) or (ref_index != null and ref_index.? == page_idx)) {
+            return .{ .ok = allocator.dupe(u8, tid) catch return .{ .err = "alloc error" } };
         }
+        page_idx += 1;
     }
-    return respondErr(allocator, "tab switch failed");
+    return .not_found;
+}
+
+/// ref로 해석한 page 타깃에 대해 단일 Target 명령(activateTarget/closeTarget) 전송.
+fn tabTargetCommand(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, ref_opt: ?[]const u8, method: []const u8) []u8 {
+    const tid = switch (resolveTabTarget(allocator, sender, resp_map, cmd_id, ref_opt)) {
+        .err => |m| return respondErr(allocator, m),
+        .not_found => return respondErr(allocator, "tab not found (use `tab list` for ids)"),
+        .ok => |t| t,
+    };
+    defer allocator.free(tid);
+    const params = cdp.jsonObject1(allocator, "targetId", tid) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), method, params, null) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
+/// tab switch <id|index> — 안정 targetId 또는 0-base 인덱스(불안정·레거시)로 탭 활성화.
+fn handleTabSwitch(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, index_opt: ?[]const u8) []u8 {
+    _ = session_id;
+    return tabTargetCommand(allocator, sender, resp_map, cmd_id, index_opt, "Target.activateTarget");
+}
+
+/// tab close <id|index> — 안정 targetId 또는 0-base 인덱스(불안정·레거시)로 탭 닫기.
+fn handleTabClose(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_opt: ?[]const u8) []u8 {
+    _ = session_id;
+    return tabTargetCommand(allocator, sender, resp_map, cmd_id, ref_opt, "Target.closeTarget");
 }
 
 /// window new [url] — open new window
@@ -9036,9 +9355,14 @@ fn printUsage() void {
         \\  click <@ref>              Click element
         \\  dblclick <@ref>           Double-click element
         \\  tap <@ref>                Touch tap element
+        \\  swipe <dir> [distance]    Touch swipe (up/down/left/right, default 300px)
         \\  type <@ref> <text>        Type into element
         \\  fill <@ref> <text>        Clear and fill
         \\  press <key>               Press key (Enter, Tab, Control+a)
+        \\  keydown <key>             Key down only (hold modifier)
+        \\  keyup <key>               Key up only (release modifier)
+        \\  keyboard type <text>      Type into focused element (synthetic keystrokes)
+        \\  keyboard inserttext <text>  Atomic insert into focused element (no key events)
         \\  hover <@ref>              Hover element
         \\  focus <@ref>              Focus element
         \\  check <@ref>              Check checkbox
@@ -9127,10 +9451,10 @@ fn printUsage() void {
         \\  state save|load|list          Save/restore cookies + storage
         \\
         \\Tabs:
-        \\  tab list                  List open tabs
+        \\  tab list                  List open tabs (each with stable id)
         \\  tab new [url]             Open new tab
-        \\  tab close                 Close current tab
-        \\  tab switch <n>            Switch to tab by index
+        \\  tab close <id|n>          Close tab by stable id or index
+        \\  tab switch <id|n>         Switch to tab by stable id or index
         \\  tab count                 Count open tabs
         \\  window new [url]          Open new window
         \\
@@ -9177,6 +9501,8 @@ fn printUsage() void {
         \\  pause / resume            Pause/resume JavaScript execution
         \\  status                    Show daemon status
         \\  find-chrome               Find Chrome executable path
+        \\  doctor [--json]           Diagnose install (version/Chrome/sessions/config)
+        \\  profiles                  List Chrome profiles (directory + display name)
         \\
         \\Auth Vault:
         \\  auth save <name> --url <url> --username <user> --password <pass>
@@ -9200,7 +9526,9 @@ fn printUsage() void {
         \\  --no-auto-dialog          Do not auto-dismiss alert/beforeunload dialogs
         \\  --init-script <path>      Register a script file to run before page JS (repeatable)
         \\  --enable=react-devtools   Install React DevTools hook (exposes __REACT_DEVTOOLS_GLOBAL_HOOK__)
+        \\  --profile=<name>          Reuse a Chrome profile's login state (see `profiles`)
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
+        \\  batch [--bail]            Run stdin commands (one per line); --bail stops on first failure
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
         \\
@@ -9825,6 +10153,16 @@ test "buildCookieSetParams: injects page_url only when no url/domain; valid JSON
     try std.testing.expectEqualStrings("https://x.com", cookies[0].object.get("url").?.string);
     try std.testing.expect(cookies[1].object.get("url") == null); // domain만
     try std.testing.expectEqualStrings("https://page.example/", cookies[2].object.get("url").?.string);
+}
+
+test "responseFailed: parses top-level success, ignores payload substring" {
+    const a = std.testing.allocator;
+    try std.testing.expect(responseFailed(a, "{\"success\":false,\"error\":\"x\"}"));
+    try std.testing.expect(!responseFailed(a, "{\"success\":true}"));
+    // payload에 "success":false 가 들어가도 최상위는 true → 실패 아님 (오탐 방지)
+    try std.testing.expect(!responseFailed(a, "{\"success\":true,\"data\":\"{\\\"success\\\":false}\"}"));
+    // 깨진 JSON → substring 폴백
+    try std.testing.expect(responseFailed(a, "garbage \"success\":false tail"));
 }
 
 test "buildCookieSetParams: empty array yields empty cookies" {

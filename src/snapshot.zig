@@ -787,6 +787,18 @@ pub fn buildClickCmd(allocator: Allocator, id: u64, x: f64, y: f64, click_type: 
     return cdp.serializeCommand(allocator, id, "Input.dispatchMouseEvent", params, session_id);
 }
 
+/// Build an Input.dispatchTouchEvent CDP command.
+/// touchStart/touchMove use a single point; touchEnd uses an empty touchPoints array.
+pub fn buildTouchCmd(allocator: Allocator, id: u64, touch_type: []const u8, x: f64, y: f64, session_id: ?[]const u8) ![]u8 {
+    var buf: [160]u8 = undefined;
+    const params = if (std.mem.eql(u8, touch_type, "touchEnd"))
+        "{\"type\":\"touchEnd\",\"touchPoints\":[]}"
+    else
+        std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\",\"touchPoints\":[{{\"x\":{d},\"y\":{d}}}]}}", .{ touch_type, x, y }) catch
+            return error.Overflow;
+    return cdp.serializeCommand(allocator, id, "Input.dispatchTouchEvent", params, session_id);
+}
+
 /// Build CDP command to insert text.
 pub fn buildInsertTextCmd(allocator: Allocator, id: u64, text: []const u8, session_id: ?[]const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
@@ -1014,6 +1026,18 @@ test "buildClickCmd: produces mouse event" {
     defer testing.allocator.free(cmd);
     try testing.expect(std.mem.indexOf(u8, cmd, "mousePressed") != null);
     try testing.expect(std.mem.indexOf(u8, cmd, "Input.dispatchMouseEvent") != null);
+}
+
+test "buildTouchCmd: touchStart/Move carry point, touchEnd empty" {
+    const s = try buildTouchCmd(testing.allocator, 1, "touchStart", 12.0, 34.0, null);
+    defer testing.allocator.free(s);
+    try testing.expect(std.mem.indexOf(u8, s, "Input.dispatchTouchEvent") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"touchStart\"") != null);
+    try testing.expect(std.mem.indexOf(u8, s, "\"x\":12") != null);
+
+    const e = try buildTouchCmd(testing.allocator, 2, "touchEnd", 0, 0, null);
+    defer testing.allocator.free(e);
+    try testing.expect(std.mem.indexOf(u8, e, "\"touchPoints\":[]") != null);
 }
 
 test "buildInsertTextCmd: escapes text" {

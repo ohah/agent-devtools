@@ -504,6 +504,174 @@ pub fn freeUserDataDirs(allocator: Allocator, dirs: [][]u8) void {
     allocator.free(dirs);
 }
 
+// ============================================================================
+// Chrome Profile Reuse (--profile / profiles)
+// ============================================================================
+
+pub const ChromeProfile = struct { directory: []u8, name: []u8 };
+
+pub fn freeChromeProfiles(allocator: Allocator, profiles: []ChromeProfile) void {
+    for (profiles) |p| {
+        allocator.free(p.directory);
+        allocator.free(p.name);
+    }
+    allocator.free(profiles);
+}
+
+/// `Local State`가 존재하는 첫 사용자-데이터 디렉터리 (호출자 free).
+pub fn findUserDataDir(allocator: Allocator) ?[]u8 {
+    const dirs = getUserDataDirs(allocator) catch return null;
+    defer freeUserDataDirs(allocator, dirs);
+    for (dirs) |d| {
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const ls = std.fmt.bufPrint(&pbuf, "{s}/Local State", .{d}) catch continue;
+        if (std.fs.accessAbsolute(ls, .{})) |_| {
+            return allocator.dupe(u8, d) catch null;
+        } else |_| {}
+    }
+    return null;
+}
+
+/// `Local State`의 profile.info_cache를 파싱해 프로필 목록 반환 (호출자 freeChromeProfiles).
+fn listProfilesIn(allocator: Allocator, udd: []const u8) ![]ChromeProfile {
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const ls_path = try std.fmt.bufPrint(&pbuf, "{s}/Local State", .{udd});
+    const content = std.fs.cwd().readFileAlloc(allocator, ls_path, 16 * 1024 * 1024) catch
+        return error.LocalStateUnreadable;
+    defer allocator.free(content);
+
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch
+        return error.LocalStateInvalid;
+    defer parsed.deinit();
+
+    const prof = cdp.getObject(parsed.value, "profile") orelse return error.NoProfiles;
+    const info_cache = cdp.getObject(prof, "info_cache") orelse return error.NoProfiles;
+
+    var list: std.ArrayList(ChromeProfile) = .empty;
+    errdefer {
+        for (list.items) |p| {
+            allocator.free(p.directory);
+            allocator.free(p.name);
+        }
+        list.deinit(allocator);
+    }
+    var it = info_cache.object.iterator();
+    while (it.next()) |e| {
+        const dir_name = e.key_ptr.*;
+        const display = cdp.getString(e.value_ptr.*, "name") orelse dir_name;
+        try list.append(allocator, .{
+            .directory = try allocator.dupe(u8, dir_name),
+            .name = try allocator.dupe(u8, display),
+        });
+    }
+    return list.toOwnedSlice(allocator);
+}
+
+pub fn listChromeProfiles(allocator: Allocator) ![]ChromeProfile {
+    const udd = findUserDataDir(allocator) orelse return error.NoUserDataDir;
+    defer allocator.free(udd);
+    return listProfilesIn(allocator, udd);
+}
+
+// 로그인/세션 상태 재사용에 불필요한 대용량 캐시/모델/스토리지 디렉터리 제외
+// (Chrome 프로필은 수 GB일 수 있으므로 시작 시 동기 복사를 가볍게 유지).
+const PROFILE_COPY_EXCLUDE = [_][]const u8{
+    "Cache",                       "Code Cache",
+    "GPUCache",                    "DawnCache",
+    "GrShaderCache",               "ShaderCache",
+    "Service Worker",              "Application Cache",
+    "IndexedDB",                   "blob_storage",
+    "File System",                 "File System Access",
+    "Storage",                     "optimization_guide_model_store",
+    "component_crx_cache",         "Safe Browsing",
+    "Sync Data",                   "OnDeviceHeadSuggestModel",
+    "Crashpad",                    "Crash Reports",
+    "BrowserMetrics",              "VideoDecodeStats",
+    "PnaclTranslationCache",       "AutofillStates",
+};
+
+fn copyDirRecursive(allocator: Allocator, src: []const u8, dst: []const u8) !void {
+    std.fs.makeDirAbsolute(dst) catch |e| if (e != error.PathAlreadyExists) return e;
+    var sdir = std.fs.openDirAbsolute(src, .{ .iterate = true }) catch |e| {
+        std.debug.print("Warning: --profile: skip dir {s}: {s}\n", .{ src, @errorName(e) });
+        return;
+    };
+    defer sdir.close();
+    var it = sdir.iterate();
+    while (it.next() catch |e| {
+        std.debug.print("Warning: --profile: readdir {s}: {s} (부분 복사)\n", .{ src, @errorName(e) });
+        return;
+    }) |entry| {
+        // 경로는 힙에 빌드 — 재귀 깊이에 비례한 스택 사용 방지
+        const sp = std.fmt.allocPrint(allocator, "{s}/{s}", .{ src, entry.name }) catch continue;
+        defer allocator.free(sp);
+        const dp = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dst, entry.name }) catch continue;
+        defer allocator.free(dp);
+        if (entry.kind == .directory) {
+            var skip = false;
+            for (PROFILE_COPY_EXCLUDE) |ex| {
+                if (std.mem.eql(u8, entry.name, ex)) {
+                    skip = true;
+                    break;
+                }
+            }
+            if (skip) continue;
+            copyDirRecursive(allocator, sp, dp) catch {};
+        } else if (entry.kind == .file) {
+            std.fs.copyFileAbsolute(sp, dp, .{}) catch {}; // SingletonLock 등 best-effort
+        }
+    }
+}
+
+/// 프로필 이름을 해석해 임시 user-data-dir로 복사, 그 경로 반환 (호출자 free).
+/// 해석 우선순위(각 tier 첫 일치): 정확 디렉터리명 → 표시이름(대소문자무시)
+/// → 디렉터리명(대소문자무시). 표시이름 tier가 모호하면 error.AmbiguousProfile.
+pub fn resolveAndCopyProfile(allocator: Allocator, name: []const u8) !?[]u8 {
+    const udd = findUserDataDir(allocator) orelse return error.NoUserDataDir;
+    defer allocator.free(udd);
+    const profiles = try listProfilesIn(allocator, udd);
+    defer freeChromeProfiles(allocator, profiles);
+
+    var dir: ?[]const u8 = null;
+    for (profiles) |p| if (std.mem.eql(u8, p.directory, name)) {
+        dir = p.directory;
+        break;
+    };
+    if (dir == null) {
+        var match: ?[]const u8 = null;
+        for (profiles) |p| if (std.ascii.eqlIgnoreCase(p.name, name)) {
+            if (match != null) return error.AmbiguousProfile; // agent-browser와 동일
+            match = p.directory;
+        };
+        dir = match;
+    }
+    if (dir == null) for (profiles) |p| if (std.ascii.eqlIgnoreCase(p.directory, name)) {
+        dir = p.directory;
+        break;
+    };
+    const profile_dir = dir orelse return error.ProfileNotFound;
+
+    const temp = try createTempDir(allocator);
+    errdefer {
+        std.fs.deleteTreeAbsolute(temp) catch {};
+        allocator.free(temp);
+    }
+
+    var b1: [std.fs.max_path_bytes]u8 = undefined;
+    var b2: [std.fs.max_path_bytes]u8 = undefined;
+    const ls_src = std.fmt.bufPrint(&b1, "{s}/Local State", .{udd}) catch return error.PathTooLong;
+    const ls_dst = std.fmt.bufPrint(&b2, "{s}/Local State", .{temp}) catch return error.PathTooLong;
+    std.fs.copyFileAbsolute(ls_src, ls_dst, .{}) catch {};
+
+    var b3: [std.fs.max_path_bytes]u8 = undefined;
+    var b4: [std.fs.max_path_bytes]u8 = undefined;
+    const prof_src = std.fmt.bufPrint(&b3, "{s}/{s}", .{ udd, profile_dir }) catch return error.PathTooLong;
+    const prof_dst = std.fmt.bufPrint(&b4, "{s}/{s}", .{ temp, profile_dir }) catch return error.PathTooLong;
+    try copyDirRecursive(allocator, prof_src, prof_dst);
+
+    return temp;
+}
+
 /// Try to discover a running Chrome instance's WebSocket URL.
 /// 1. Search Chrome user data directories for DevToolsActivePort file
 /// 2. Try connecting via /json/version with the discovered port

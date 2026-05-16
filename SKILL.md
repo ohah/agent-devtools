@@ -53,11 +53,15 @@ dblclick @e1        Double-click
 tap @e1             Touch tap
 fill @e1 "text"     Clear + type
 type @e1 "text"     Type (no clear)
-press Enter         Press key
+press Enter         Press key (down+up)
+keydown/keyup Shift Single key event (hold/release modifier)
+keyboard type "t"   Type into focused element (synthetic keystrokes)
+keyboard inserttext "t"  Atomic insert into focused element
 hover / focus @e1   Hover or focus
 select @e1 "val"    Select dropdown
 check / uncheck @e1 Checkbox
 scroll down 500     Scroll (up/down/left/right)
+swipe down 300      Touch swipe (up/down/left/right [distance])
 drag @e1 @e2        Drag and drop
 ```
 
@@ -155,10 +159,15 @@ credentials <user> <pass>      HTTP basic auth
 
 ### Tabs & Console
 ```
-tab list / new / close / switch <n>
+tab list                    List tabs (each has stable id)
+tab new [url]               Open tab
+tab switch/close <id|n>     By stable id (preferred) or index
 console list / clear
 errors [clear]
 dialog accept/dismiss/info  (alert/beforeunload auto-dismissed by default)
+batch [--bail]              Run stdin commands (one per line), --bail stops on first fail
+doctor [--json]             Diagnose install (version/Chrome/sessions/config)
+profiles                    List Chrome profiles (for --profile)
 ```
 
 ### Recording
@@ -185,6 +194,7 @@ auth list / show / delete <name>
 --no-auto-dialog            Disable alert/beforeunload auto-dismiss
 --init-script=<path>        Run a script before page JS (repeatable)
 --enable=react-devtools     Install React DevTools hook (enables `react` cmds)
+--profile=<name>            Reuse a Chrome profile's login state (see `profiles`)
 --auto-connect              Auto-discover running Chrome/Electron
 agent-devtools.json         Config file (project or ~/.agent-devtools/config.json)
 ```

@@ -9,7 +9,7 @@ Browser DevTools CLI for AI agents, built with Zig.
 - **CLI 실행 명령**: agent-devtools
 - **언어**: Zig 0.15.2
 - **라이선스**: MIT
-- **테스트**: 529개 (`zig build test`)
+- **테스트**: 533개 (`zig build test`)
 - **CLI 명령**: 90+개
 
 ## Architecture
@@ -119,8 +119,17 @@ agent-browser의 모든 핵심 기능을 포함하면서, 추가로:
   - `react inspect <fiberId>` — fiber props/hooks/state
   - `react renders start|stop` — 렌더 프로파일링 (fps/mount/re-render)
   - `react suspense [--only-dynamic]` — Suspense 경계 분석
-- 범위 외 제외: AI chat, 대시보드, 클라우드 프로바이더, skills 시스템
-  (Zig CDP CLI 성격과 무관)
+
+### ✅ agent-browser 패리티 갭 보강
+- `swipe <dir> [distance]` — 터치 스와이프
+- `keydown`/`keyup <key>` — 단일 키 이벤트 (모디파이어 홀드)
+- `keyboard type|inserttext <text>` — 포커스 요소 입력 (합성 키스트로크 vs 원자 삽입)
+- `batch [--bail]` — stdin 명령 일괄 실행
+- `doctor [--json]` — 설치/환경 진단
+- `profiles` + `--profile=<name>` — Chrome 프로필 로그인 상태 재사용
+- 안정적 탭 id — `tab list`가 id 출력, `tab switch/close <id|index>`
+- 범위 외 제외(의도적): AI chat, 대시보드, 클라우드 프로바이더, skills,
+  `stream`(대시보드 라이브뷰 서버 — `video`로 기록 커버), iOS/Appium
 
 ## Project Structure
 
@@ -155,7 +164,7 @@ reference/            # 참조 코드 (gitignored)
 ## Testing
 
 - Zig 내장 테스트 (`test` 블록, 소스 파일 내)
-- `zig build test` → 529개
+- `zig build test` → 533개
 - 유닛 + 통합 (실제 Chrome E2E 확인)
 
 ### 테스트 분포
@@ -189,7 +198,7 @@ reference/            # 참조 코드 (gitignored)
 
 ```bash
 zig build              # 빌드
-zig build test         # 테스트 (529개)
+zig build test         # 테스트 (533개)
 ./zig-out/bin/agent-devtools --help
 ```
 
