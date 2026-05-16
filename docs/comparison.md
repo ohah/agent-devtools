@@ -9,7 +9,17 @@
 | **스레딩** | 멀티스레드 (워커 풀) | tokio async |
 | **통신** | Unix Socket / TCP (Windows) | Unix Socket / TCP (Windows) |
 | **AX Tree** | 100% 동일 (diff 0줄 검증) | 기준 구현 |
-| **테스트** | 495개 유닛 | 44 E2E |
+| **테스트** | 533개 유닛 + 실제 Chrome E2E | 44 E2E |
+| **버전 기준** | agent-browser 0.27 동기화 완료 | 0.27 |
+
+## agent-browser 0.27 동기화 (구현 완료)
+
+pushstate · 다이얼로그 자동 dismiss(`--no-auto-dialog`) · `snapshot -u/--urls` ·
+`cookies set --curl` · `intercept --resource-type` · `vitals` ·
+`--init-script`/`removeinitscript` · **React 인트로스펙션**
+(`--enable=react-devtools` + `react tree/inspect/renders/suspense`) ·
+`swipe` · `keydown/keyup/keyboard` · `batch` · `doctor` · `profiles` ·
+`--profile` · 안정적 탭 id(`tab list` id, `tab switch/close <id|index>`)
 
 ## 동일한 기능
 
@@ -60,9 +70,9 @@
 
 | 기능 | 설명 |
 |---|---|
-| iOS 시뮬레이터 | `-p ios` (Appium) |
-| 스트리밍 | `stream enable` (WebSocket 서버) |
-| 배치 실행 | `batch` (JSON 배열 일괄 실행) |
+| iOS 시뮬레이터 | `-p ios` (Appium) — 범위 외 |
+| `stream enable` | 대시보드 라이브뷰용 WebSocket 스크린캐스트 서버 — 대시보드 인프라 범주라 의도적 제외 (기록은 `video start/stop`로 커버) |
+| AI chat / 대시보드 / 클라우드 프로바이더 / skills | agent-browser 전용 인프라 — Zig CDP CLI 성격과 무관, 의도적 제외 |
 
 ## 스냅샷 동일성 검증
 
@@ -79,5 +89,6 @@
 
 - **일반 자동화**: 동일 (같은 CDP, 같은 AX tree)
 - **웹앱 디버깅/역공학**: agent-devtools가 우위 (analyze, intercept, waitfor, --debug)
+- **React 인트로스펙션 / Web Vitals / batch / doctor / 프로필 재사용**: 0.27 동기화로 동등
 - **설치/배포**: agent-devtools가 간편 (단일 바이너리, 의존성 없음)
-- **iOS/배치/스트리밍**: agent-browser가 우위
+- **iOS(Appium) / 대시보드·stream / AI chat / 클라우드 프로바이더**: agent-browser 전용 (의도적 범위 외)

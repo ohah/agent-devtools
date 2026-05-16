@@ -21,6 +21,9 @@
 | `fill @ref "text"` | Clear + type |
 | `type @ref "text"` | Type without clearing |
 | `press <key>` | Press key (Enter, Tab, Escape) |
+| `keydown` / `keyup <key>` | Single key event (hold/release modifier) |
+| `keyboard type\|inserttext <text>` | Type into / insert into focused element |
+| `swipe <dir> [distance]` | Touch swipe (up/down/left/right) |
 | `hover` / `focus @ref` | Hover / focus |
 | `check` / `uncheck @ref` | Checkbox |
 | `select @ref "val"` | Dropdown |
@@ -107,7 +110,11 @@
 ## Other
 | Command | Description |
 |---|---|
-| `tab list/new/close/switch/count` | Tab management |
+| `tab list` | List tabs (each has stable id) |
+| `tab new [url]` / `tab close <id\|n>` / `tab switch <id\|n>` / `tab count` | Tab mgmt (stable id preferred over index) |
+| `batch [--bail]` | Run stdin commands (one per line); --bail stops on first failure |
+| `doctor [--json]` | Diagnose install (version/Chrome/sessions/config) |
+| `profiles` | List Chrome profiles (for `--profile=<name>`) |
 | `console list/clear` | Console messages |
 | `errors [clear]` | Page errors |
 | `dialog accept/dismiss/info` | Dialog handling (alert/beforeunload auto-dismissed by default) |
@@ -122,6 +129,7 @@
 | Flag | Description |
 |---|---|
 | `--enable=react-devtools` | Install React DevTools hook → enables `react …` |
+| `--profile=<name>` | Reuse a Chrome profile's login state (see `profiles`) |
 | `--init-script=<path>` | Run a script before page JS (repeatable) |
 | `--no-auto-dialog` | Disable alert/beforeunload auto-dismiss |
 | `--proxy/--proxy-bypass/--extension` | Chrome launch options |
