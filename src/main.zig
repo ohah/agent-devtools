@@ -197,6 +197,9 @@ pub fn main() void {
     var headed = false;
     var cdp_port: ?[]const u8 = null;
     var cdp_url: ?[]const u8 = null;
+    var executable_path: ?[]const u8 = null;
+    var chrome_args: ?[]const u8 = null;
+    var ignore_https_errors = false;
     var auto_connect = false;
     var user_agent: ?[]const u8 = null;
     var interactive = false;
@@ -222,44 +225,51 @@ pub fn main() void {
     loadConfigFile(&config_headed, &config_proxy, &config_proxy_bypass, &config_user_agent, &config_extensions);
 
     while (args_iter.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--session=")) {
-            session = arg["--session=".len..];
+        if (flagIs(arg, "--session")) {
+            session = flagValue(arg, "--session", &args_iter) orelse session;
         } else if (std.mem.eql(u8, arg, "--headed")) {
             headed = true;
-        } else if (std.mem.startsWith(u8, arg, "--port=")) {
-            cdp_port = arg["--port=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--cdp=")) {
-            cdp_url = arg["--cdp=".len..];
+        } else if (flagIs(arg, "--port")) {
+            cdp_port = flagValue(arg, "--port", &args_iter);
+        } else if (flagIs(arg, "--cdp")) {
+            cdp_url = flagValue(arg, "--cdp", &args_iter);
+        } else if (flagIs(arg, "--executable-path")) {
+            executable_path = flagValue(arg, "--executable-path", &args_iter);
+        } else if (flagIs(arg, "--args")) {
+            chrome_args = flagValue(arg, "--args", &args_iter);
+        } else if (std.mem.eql(u8, arg, "--ignore-https-errors")) {
+            ignore_https_errors = true;
         } else if (std.mem.eql(u8, arg, "--auto-connect")) {
             auto_connect = true;
-        } else if (std.mem.startsWith(u8, arg, "--user-agent=")) {
-            user_agent = arg["--user-agent=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--proxy=")) {
-            proxy = arg["--proxy=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--proxy-bypass=")) {
-            proxy_bypass = arg["--proxy-bypass=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--extension=")) {
-            extensions = arg["--extension=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--allowed-domains=")) {
-            allowed_domains = arg["--allowed-domains=".len..];
+        } else if (flagIs(arg, "--user-agent")) {
+            user_agent = flagValue(arg, "--user-agent", &args_iter);
+        } else if (flagIs(arg, "--proxy")) {
+            proxy = flagValue(arg, "--proxy", &args_iter);
+        } else if (flagIs(arg, "--proxy-bypass")) {
+            proxy_bypass = flagValue(arg, "--proxy-bypass", &args_iter);
+        } else if (flagIs(arg, "--extension")) {
+            extensions = flagValue(arg, "--extension", &args_iter);
+        } else if (flagIs(arg, "--allowed-domains")) {
+            allowed_domains = flagValue(arg, "--allowed-domains", &args_iter);
         } else if (std.mem.eql(u8, arg, "--content-boundaries")) {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
-        } else if (std.mem.startsWith(u8, arg, "--profile=")) {
-            profile = arg["--profile=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--enable=")) {
-            const feature = arg["--enable=".len..];
+        } else if (flagIs(arg, "--profile")) {
+            profile = flagValue(arg, "--profile", &args_iter);
+        } else if (flagIs(arg, "--enable")) {
+            const feature = flagValue(arg, "--enable", &args_iter) orelse "";
             if (std.mem.eql(u8, feature, "react-devtools") or std.mem.eql(u8, feature, "react")) {
                 enable_react = true;
             } else {
                 writeErr("Unknown --enable feature '{s}' (supported: react-devtools)\n", .{feature});
                 std.process.exit(1);
             }
-        } else if (std.mem.startsWith(u8, arg, "--init-script=")) {
-            const path = arg["--init-script=".len..];
-            if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
-            init_scripts_buf.appendSlice(std.heap.page_allocator, path) catch {};
+        } else if (flagIs(arg, "--init-script")) {
+            if (flagValue(arg, "--init-script", &args_iter)) |path| {
+                if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
+                init_scripts_buf.appendSlice(std.heap.page_allocator, path) catch {};
+            }
         } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "--pipe")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -310,6 +320,9 @@ pub fn main() void {
         .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
         .enable_react = enable_react,
         .profile = profile,
+        .executable_path = executable_path,
+        .chrome_args = chrome_args,
+        .ignore_https_errors = ignore_https_errors,
     };
 
     if (interactive) {
@@ -1674,6 +1687,19 @@ pub fn main() void {
 // ============================================================================
 
 /// 남은 인자에서 `--resource-type|--resource-types <csv>`를 찾아 CSV 반환. 없으면 null.
+/// `arg`가 value 플래그 `name`인가 (`--name` 또는 `--name=...` 둘 다).
+fn flagIs(arg: []const u8, name: []const u8) bool {
+    if (std.mem.eql(u8, arg, name)) return true;
+    return arg.len > name.len and std.mem.startsWith(u8, arg, name) and arg[name.len] == '=';
+}
+
+/// value 플래그의 값 추출: `--name=val`이면 val, `--name`이면 다음 인자(space form).
+/// 값 누락(`--name` 마지막 인자) 시 null — 빈 문자열 오염 방지.
+fn flagValue(arg: []const u8, name: []const u8, it: anytype) ?[]const u8 {
+    if (arg.len > name.len and arg[name.len] == '=') return arg[name.len + 1 ..];
+    return it.next();
+}
+
 fn parseResourceTypeFlag(it: anytype) ?[]const u8 {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--resource-type") or std.mem.eql(u8, arg, "--resource-types")) {
@@ -2644,6 +2670,9 @@ fn runDaemon() void {
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
     const env_init_scripts = daemon.getenv("AGENT_DEVTOOLS_INIT_SCRIPTS");
     const env_enable_react = daemon.getenv("AGENT_DEVTOOLS_ENABLE_REACT") != null;
+    const env_executable = daemon.getenv("AGENT_DEVTOOLS_EXECUTABLE");
+    const env_chrome_args = daemon.getenv("AGENT_DEVTOOLS_CHROME_ARGS");
+    const env_ignore_https = daemon.getenv("AGENT_DEVTOOLS_IGNORE_HTTPS") != null;
     const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
     const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
     const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
@@ -2701,8 +2730,18 @@ fn runDaemon() void {
             })
         else
             null;
+        // --args "<공백 구분>" + --ignore-https-errors → extra_args 슬라이스
+        var extra_args_list: std.ArrayList([]const u8) = .empty;
+        defer extra_args_list.deinit(allocator);
+        if (env_chrome_args) |ca| {
+            var it = std.mem.tokenizeScalar(u8, ca, ' ');
+            while (it.next()) |tok| extra_args_list.append(allocator, tok) catch {};
+        }
+        if (env_ignore_https) extra_args_list.append(allocator, "--ignore-certificate-errors") catch {};
         chrome_proc = chrome.ChromeProcess.launch(allocator, .{
             .headless = !is_headed,
+            .executable_path = env_executable,
+            .extra_args = extra_args_list.items,
             .proxy = env_proxy,
             .proxy_bypass = env_proxy_bypass,
             .extensions = env_extensions,
@@ -10869,6 +10908,10 @@ fn printUsage() void {
         \\  --port <port>             Connect to existing Chrome via CDP port
         \\  --cdp <url>               Attach to a CDP endpoint (ws://|wss://|http(s)://)
         \\                            Sugar: 'connect <port|url>' (e.g. connect 9222)
+        \\  --executable-path <path>  Use a specific Chrome/Chromium binary
+        \\  --args "<a> <b>"          Extra space-separated Chrome launch args
+        \\  --ignore-https-errors     Ignore TLS cert errors on launch
+        \\  (모든 값 플래그는 '--flag value'와 '--flag=value' 둘 다 허용)
         \\  --auto-connect            Connect to running Chrome to reuse its auth state
         \\                            Tip: agent-devtools --auto-connect state save ./auth.json
         \\  --user-agent <ua>         Set user agent on launch
@@ -12293,6 +12336,31 @@ test "buildEmulatedMediaParams: scheme + optional reduced-motion" {
     const p2 = try buildEmulatedMediaParams(a, "light", true);
     defer a.free(p2);
     try std.testing.expectEqualStrings("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"light\"},{\"name\":\"prefers-reduced-motion\",\"value\":\"reduce\"}]}", p2);
+}
+
+test "flagIs: matches --name and --name=" {
+    try std.testing.expect(flagIs("--port", "--port"));
+    try std.testing.expect(flagIs("--port=9222", "--port"));
+    try std.testing.expect(!flagIs("--portx", "--port"));
+    try std.testing.expect(!flagIs("--proxy", "--port"));
+}
+
+test "flagValue: equals form and space form" {
+    const FakeIt = struct {
+        items: []const []const u8,
+        i: usize = 0,
+        fn next(self: *@This()) ?[]const u8 {
+            if (self.i >= self.items.len) return null;
+            defer self.i += 1;
+            return self.items[self.i];
+        }
+    };
+    var it1 = FakeIt{ .items = &.{} };
+    try std.testing.expectEqualStrings("9222", flagValue("--port=9222", "--port", &it1).?);
+    var it2 = FakeIt{ .items = &.{"9333"} };
+    try std.testing.expectEqualStrings("9333", flagValue("--port", "--port", &it2).?);
+    var it3 = FakeIt{ .items = &.{} }; // space form, missing value → null
+    try std.testing.expect(flagValue("--port", "--port", &it3) == null);
 }
 
 test "buildDebugResponse: merges debug into response" {

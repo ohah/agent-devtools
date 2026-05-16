@@ -501,6 +501,9 @@ pub const DaemonOptions = struct {
     init_scripts: ?[]const u8 = null, // 쉼표 구분 스크립트 파일 경로 목록
     enable_react: bool = false, // --enable=react-devtools
     profile: ?[]const u8 = null, // --profile=<name> (Chrome 프로필 재사용)
+    executable_path: ?[]const u8 = null, // --executable-path <chrome 바이너리>
+    chrome_args: ?[]const u8 = null, // --args "<공백 구분 추가 Chrome 인자>"
+    ignore_https_errors: bool = false, // --ignore-https-errors
 };
 
 /// Ensure a daemon is running for the given session.
@@ -552,6 +555,9 @@ pub fn ensureDaemon(allocator: Allocator, session: []const u8, opts: DaemonOptio
     if (opts.init_scripts) |s| try env_map.put("AGENT_DEVTOOLS_INIT_SCRIPTS", s);
     if (opts.enable_react) try env_map.put("AGENT_DEVTOOLS_ENABLE_REACT", "1");
     if (opts.profile) |p| try env_map.put("AGENT_DEVTOOLS_PROFILE", p);
+    if (opts.executable_path) |e| try env_map.put("AGENT_DEVTOOLS_EXECUTABLE", e);
+    if (opts.chrome_args) |c| try env_map.put("AGENT_DEVTOOLS_CHROME_ARGS", c);
+    if (opts.ignore_https_errors) try env_map.put("AGENT_DEVTOOLS_IGNORE_HTTPS", "1");
     child.env_map = &env_map;
 
     // Ensure socket directory exists before spawning
