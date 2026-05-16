@@ -21,6 +21,19 @@ pushstate · 다이얼로그 자동 dismiss(`--no-auto-dialog`) · `snapshot -u/
 `swipe` · `keydown/keyup/keyboard` · `batch` · `doctor` · `profiles` ·
 `--profile` · 안정적 탭 id(`tab list` id, `tab switch/close <id|index>`)
 
+## agent-browser 패리티 갭 추가 보강 (구현 완료)
+
+`find` 로케이터 액션 엔진 · `connect <port|url>` + `--cdp` · `eval --stdin/-b` ·
+`get count/cdp-url` · `cookies set` 속성(`--domain/--path/--httpOnly/--secure/
+--sameSite/--expires`) · `screenshot [selector] --full --format --quality` ·
+`state clear|show|clean|rename` · `network requests --type/--method/--status` +
+`network har start|stop` + `network unroute` · `snapshot -c/-C/-d/-s` ·
+`diff snapshot` / `diff url` · `tab new --label` + 라벨 참조 ·
+`mouse wheel`/`mouse down|up [button]` · `set viewport <w> <h> [scale]` ·
+`set media <scheme> [reduced-motion]` · `clipboard copy/paste` 별칭 ·
+`--executable-path`/`--args`/`--ignore-https-errors` + 모든 값 플래그
+space-separated(`--flag value`) 파싱 · `batch` 인라인 인자 · `vitals --json`
+
 ## 동일한 기능
 
 두 도구 모두 지원하는 기능:

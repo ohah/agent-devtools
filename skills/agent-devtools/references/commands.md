@@ -16,7 +16,12 @@
 |---|---|
 | `snapshot -i` | Interactive elements only (recommended) |
 | `snapshot -u` | Include link href URLs (combine: `-i -u`) |
+| `snapshot -d <n>` | Limit output tree depth |
+| `snapshot -s <sel>` | Only the subtree under a CSS selector |
+| `snapshot -c / -C` | Compact / cursor (accepted; output already compact+cursor) |
 | `snapshot` | Full accessibility tree |
+| `find role/text/label/placeholder/alt/title/testid <v> [action]` | Locator query (+ optional click/fill/… action) |
+| `find first/last/nth <role> <v> [--name N] [--exact]` | Ordinal locator |
 | `click` / `dblclick` / `tap @ref` | Click / double-click / touch tap |
 | `fill @ref "text"` | Clear + type |
 | `type @ref "text"` | Type without clearing |
@@ -41,22 +46,22 @@
 |---|---|
 | `get text/html/value @ref` | Element content |
 | `get attr @ref <name>` | Attribute value |
+| `get count <css>` | Number of elements matching a CSS selector |
+| `get cdp-url` | Connected CDP WebSocket URL |
 | `is visible/enabled/checked @ref` | State check |
 | `boundingbox @ref` | Bounding box |
 | `styles @ref <prop>` | Computed CSS |
 
-## Find Elements
-| Command | Description |
-|---|---|
-| `find role/text/label/placeholder/testid <value>` | Semantic query |
-
 ## Capture
 | Command | Description |
 |---|---|
-| `screenshot [path]` | PNG screenshot |
+| `screenshot [selector] [path]` | PNG; selector (@ref/CSS/plain) → element clip |
+| `screenshot --full / --format png\|jpeg\|webp / --quality <n>` | Full page / format / JPEG quality |
 | `pdf [path]` | PDF export |
-| `eval <js>` | Run JavaScript |
-| `vitals [url]` | Core Web Vitals (LCP/CLS/FCP/INP) + TTFB |
+| `eval <js>` / `eval --stdin` / `eval -b <base64>` | Run JS (inline / stdin / base64) |
+| `vitals [url] [--json]` | Core Web Vitals (LCP/CLS/FCP/INP) + TTFB |
+| `diff snapshot [-b file] [-s sel] [-d n]` | AX snapshot diff vs baseline file / last snapshot |
+| `diff url <u1> <u2> [-s/-d]` | Snapshot diff of two URLs |
 | `video/trace/profiler start/stop [path]` | Recording/profiling |
 
 ## React Introspection (requires `--enable=react-devtools` at launch)
@@ -70,14 +75,16 @@
 ## Network
 | Command | Description |
 |---|---|
-| `network list [pattern]` | List requests |
+| `network requests [--filter p] [--type t] [--method m] [--status s]` | List/filter (status `404` or `4xx`) |
 | `network get <id>` | Full request/response with body |
 | `network clear` | Clear |
+| `network har start` / `har stop [path]` | HAR capture session start / stop+export |
+| `network unroute [pattern]` | Remove intercept rule(s) |
 | `analyze` | API reverse engineering + schema |
 | `intercept mock/fail/delay <pattern>` | Mock/block/delay |
 | `intercept ... --resource-type <csv>` | Limit to CDP resourceType (Document/XHR/Script/…) |
 | `intercept remove/list/clear` | Manage rules |
-| `har [file]` | Export HAR 1.2 |
+| `har [file]` | Export HAR 1.2 (one-shot) |
 
 ## Wait
 | Command | Description |
@@ -102,17 +109,22 @@
 | Command | Description |
 |---|---|
 | `cookies list/set/get/clear` | Cookies |
+| `cookies set <n> <v> [--domain --path --httpOnly --secure --sameSite --expires]` | Cookie attributes |
 | `cookies set --curl <file>` | Bulk import (JSON / cURL dump / Cookie header) |
 | `storage local/session [key]` | Web storage |
 | `state save/load/list` | Full state persistence |
+| `state clear [name\|--all] / show <n> / clean --older-than <days> / rename <a> <b>` | State mgmt |
 | `credentials <user> <pass>` | HTTP auth |
 
 ## Other
 | Command | Description |
 |---|---|
 | `tab list` | List tabs (each has stable id) |
-| `tab new [url]` / `tab close <id\|n>` / `tab switch <id\|n>` / `tab count` | Tab mgmt (stable id preferred over index) |
-| `batch [--bail]` | Run stdin commands (one per line); --bail stops on first failure |
+| `tab new [--label <name>] [url]` | New tab; optional label for later reference |
+| `tab close/switch <id\|index\|label>` / `tab count` | Tab mgmt (id/label preferred over index) |
+| `connect <port\|ws-url\|http-url>` | Attach to existing Chrome (sugar for --port/--cdp) |
+| `mouse move/down/up [button] / wheel <dx> <dy>` | Mouse events (button: left/right/middle) |
+| `batch [--bail] [cmd...]` | Run inline args (or stdin lines if none); --bail stops on first failure |
 | `doctor [--json]` | Diagnose install (version/Chrome/sessions/config) |
 | `profiles` | List Chrome profiles (for `--profile=<name>`) |
 | `console list/clear` | Console messages |
@@ -122,12 +134,19 @@
 | `addscript <js>` / `addstyle <css>` | Page injection |
 | `removeinitscript <id>` | Remove script added by addscript/--init-script |
 | `pause` / `resume` | JS debugging |
-| `clipboard get/set` | Clipboard |
+| `clipboard get/set` (aliases: paste/copy, read/write) | Clipboard |
+| `set viewport <w> <h> [scale]` | Viewport + deviceScaleFactor |
+| `set media <scheme> [reduced-motion]` | prefers-color-scheme + prefers-reduced-motion |
 | `status` | Daemon status |
 
 ## Launch Flags (set on the command that starts the daemon)
+모든 값 플래그는 `--flag value`와 `--flag=value` 둘 다 허용.
 | Flag | Description |
 |---|---|
+| `--port <p>` / `--cdp <url>` | Attach to existing Chrome (CDP port / ws\|http endpoint) |
+| `--executable-path <bin>` | Specific Chrome/Chromium binary |
+| `--args "<a> <b>"` | Extra space-separated Chrome launch args |
+| `--ignore-https-errors` | Ignore TLS cert errors on launch |
 | `--enable=react-devtools` | Install React DevTools hook → enables `react …` |
 | `--profile=<name>` | Reuse a Chrome profile's login state (see `profiles`) |
 | `--init-script=<path>` | Run a script before page JS (repeatable) |
