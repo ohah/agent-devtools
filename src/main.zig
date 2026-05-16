@@ -208,6 +208,7 @@ pub fn main() void {
     var content_boundaries = false;
     var no_auto_dialog = false;
     var enable_react = false;
+    var profile: ?[]const u8 = null;
     // --init-script=PATH (반복 가능) → 쉼표로 join 누적
     var init_scripts_buf: std.ArrayList(u8) = .empty;
 
@@ -242,6 +243,8 @@ pub fn main() void {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
+        } else if (std.mem.startsWith(u8, arg, "--profile=")) {
+            profile = arg["--profile=".len..];
         } else if (std.mem.startsWith(u8, arg, "--enable=")) {
             const feature = arg["--enable=".len..];
             if (std.mem.eql(u8, feature, "react-devtools") or std.mem.eql(u8, feature, "react")) {
@@ -284,6 +287,7 @@ pub fn main() void {
         .no_auto_dialog = no_auto_dialog,
         .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
         .enable_react = enable_react,
+        .profile = profile,
     };
 
     if (interactive) {
@@ -318,6 +322,14 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "doctor")) {
         const json_out = if (args_iter.next()) |a| std.mem.eql(u8, a, "--json") else false;
         runDoctor(json_out);
+    } else if (std.mem.eql(u8, cmd, "profiles")) {
+        const pa = std.heap.page_allocator;
+        const profiles = chrome.listChromeProfiles(pa) catch |e| {
+            writeErr("profiles: {s}\n", .{@errorName(e)});
+            std.process.exit(1);
+        };
+        defer chrome.freeChromeProfiles(pa, profiles);
+        for (profiles) |p| write("{s}\t{s}\n", .{ p.directory, p.name });
     } else if (std.mem.eql(u8, cmd, "open") or std.mem.eql(u8, cmd, "navigate") or std.mem.eql(u8, cmd, "goto")) {
         const url = args_iter.next() orelse {
             writeErr("Usage: agent-devtools open <url>\n", .{});
@@ -2111,15 +2123,31 @@ fn runDaemon() void {
         };
         break :blk discovered_url.?;
     } else blk: {
+        // --profile: 해석된 Chrome 프로필을 임시 user-data-dir로 복사해 로그인 상태 재사용
+        const profile_udd: ?[]u8 = if (daemon.getenv("AGENT_DEVTOOLS_PROFILE")) |pn|
+            (chrome.resolveAndCopyProfile(allocator, pn) catch |e| pblk: {
+                std.debug.print("Daemon: --profile '{s}' 실패: {s} (기본 임시 프로필 사용)\n", .{ pn, @errorName(e) });
+                break :pblk null;
+            })
+        else
+            null;
         chrome_proc = chrome.ChromeProcess.launch(allocator, .{
             .headless = !is_headed,
             .proxy = env_proxy,
             .proxy_bypass = env_proxy_bypass,
             .extensions = env_extensions,
+            .user_data_dir = profile_udd,
         }) catch |err| {
             std.debug.print("Daemon: Chrome launch failed: {s}\n", .{@errorName(err)});
+            if (profile_udd) |p| {
+                std.fs.deleteTreeAbsolute(p) catch {};
+                allocator.free(p);
+            }
             return;
         };
+        // 복사한 프로필 임시 디렉터리를 ChromeProcess 소유로 넘겨 deinit에서 삭제+free
+        // (user_data_dir 제공 시 launch는 자체 temp_dir를 만들지 않음)
+        if (profile_udd) |p| chrome_proc.?.temp_dir = p;
         break :blk chrome_proc.?.ws_url;
     };
 
@@ -9456,6 +9484,7 @@ fn printUsage() void {
         \\  status                    Show daemon status
         \\  find-chrome               Find Chrome executable path
         \\  doctor [--json]           Diagnose install (version/Chrome/sessions/config)
+        \\  profiles                  List Chrome profiles (directory + display name)
         \\
         \\Auth Vault:
         \\  auth save <name> --url <url> --username <user> --password <pass>
@@ -9479,6 +9508,7 @@ fn printUsage() void {
         \\  --no-auto-dialog          Do not auto-dismiss alert/beforeunload dialogs
         \\  --init-script <path>      Register a script file to run before page JS (repeatable)
         \\  --enable=react-devtools   Install React DevTools hook (exposes __REACT_DEVTOOLS_GLOBAL_HOOK__)
+        \\  --profile=<name>          Reuse a Chrome profile's login state (see `profiles`)
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
         \\  batch [--bail]            Run stdin commands (one per line); --bail stops on first failure
         \\  -h, --help                Show this help
