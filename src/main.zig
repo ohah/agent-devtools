@@ -494,9 +494,16 @@ pub fn main() void {
         } else if (std.mem.eql(u8, subcmd, "new")) {
             sendAction(session, "tab_new", args_iter.next(), null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "close")) {
-            sendAction(session, "tab_close", null, null, daemon_opts);
+            sendAction(session, "tab_close", args_iter.next(), null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "count")) {
             sendAction(session, "tab_count", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "switch")) {
+            // `tab switch <ref>` 와 `tab <ref>` 둘 다 지원
+            const tref = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools tab switch <id|index>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "tab_switch", tref, null, daemon_opts);
         } else {
             sendAction(session, "tab_switch", subcmd, null, daemon_opts);
         }
@@ -3436,7 +3443,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleSimpleCdpWithParams(allocator, sender, cmd_id, session_id, "Target.createTarget", req.url);
         // NOTE: extra closing brace was needed for the if(ctx.allowed_domains) block — but the structure above closes correctly
     } else if (std.mem.eql(u8, req.action, "tab_close")) {
-        return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Target.closeTarget");
+        return handleTabClose(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "cookies_list")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "JSON.stringify(document.cookie)");
     } else if (std.mem.eql(u8, req.action, "cookies_clear")) {
@@ -4896,7 +4903,10 @@ fn handleTabList(allocator: Allocator, sender: *WsSender, resp_map: *response_ma
                         if (!std.mem.eql(u8, t, "page")) continue;
                         if (!first) writer.writeByte(',') catch {};
                         first = false;
-                        writer.writeAll("{\"type\":") catch {};
+                        // id = CDP targetId — 다른 탭이 닫혀도 흔들리지 않는 안정 핸들
+                        writer.writeAll("{\"id\":") catch {};
+                        cdp.writeJsonString(writer, cdp.getString(info, "targetId") orelse "") catch {};
+                        writer.writeAll(",\"type\":") catch {};
                         cdp.writeJsonString(writer, t) catch {};
                         writer.writeAll(",\"title\":") catch {};
                         cdp.writeJsonString(writer, cdp.getString(info, "title") orelse "") catch {};
@@ -6885,60 +6895,68 @@ fn handleClipboardSet(allocator: Allocator, sender: *WsSender, resp_map: *respon
     return respondOk(allocator);
 }
 
-/// tab switch <index> — switch to tab by 0-based index
-fn handleTabSwitch(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, index_opt: ?[]const u8) []u8 {
-    _ = session_id;
-    const index_str = index_opt orelse return respondErr(allocator, "tab index required");
-    const index = std.fmt.parseInt(usize, index_str, 10) catch
-        return respondErr(allocator, "invalid tab index");
+/// 탭 ref(안정 targetId 또는 0-base 인덱스) → targetId 해석 결과.
+/// .ok = 매칭된 targetId(allocator 소유, 호출자 free). .not_found / .err(정적 메시지).
+const TabResolve = union(enum) { ok: []u8, not_found, err: []const u8 };
 
-    // Get all targets
+/// page 타깃 중 ref와 일치하는 targetId를 찾는다. 인덱스는 Target.getTargets
+/// 열거 순서(= `tab list` 순서)이며 탭 개폐 시 흔들리므로 안정 id 사용을 권장.
+fn resolveTabTarget(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, ref_opt: ?[]const u8) TabResolve {
+    const ref = ref_opt orelse return .{ .err = "tab id/index required (see `tab list`)" };
+    const ref_index: ?usize = std.fmt.parseInt(usize, ref, 10) catch null;
+
     const sent_id = cmd_id.next();
-    const targets_cmd = cdp.targetGetTargets(allocator, sent_id) catch return respondErr(allocator, "cmd error");
+    const targets_cmd = cdp.targetGetTargets(allocator, sent_id) catch return .{ .err = "cmd error" };
     defer allocator.free(targets_cmd);
-
-    const raw = sendAndWait(sender, resp_map, targets_cmd, sent_id, 10_000) orelse
-        return respondErr(allocator, "tab switch timeout");
+    const raw = sendAndWait(sender, resp_map, targets_cmd, sent_id, 10_000) orelse return .{ .err = "tab timeout" };
     defer allocator.free(raw);
-
-    const parsed = cdp.parseMessage(allocator, raw) catch
-        return respondErr(allocator, "parse error");
+    const parsed = cdp.parseMessage(allocator, raw) catch return .{ .err = "parse error" };
     defer parsed.parsed.deinit();
 
-    if (parsed.message.isResponse()) {
-        if (parsed.message.result) |result| {
-            if (result.object.get("targetInfos")) |infos| {
-                if (infos == .array) {
-                    // Filter to page targets
-                    var page_idx: usize = 0;
-                    for (infos.array.items) |info| {
-                        const t = cdp.getString(info, "type") orelse continue;
-                        if (!std.mem.eql(u8, t, "page")) continue;
-                        if (page_idx == index) {
-                            const tid = cdp.getString(info, "targetId") orelse return respondErr(allocator, "no targetId");
-                            // Activate target
-                            var activate_buf: std.ArrayList(u8) = .empty;
-                            defer activate_buf.deinit(allocator);
-                            const aw = activate_buf.writer(allocator);
-                            aw.writeAll("{\"targetId\":") catch return respondErr(allocator, "write error");
-                            cdp.writeJsonString(aw, tid) catch return respondErr(allocator, "write error");
-                            aw.writeByte('}') catch {};
-                            const activate_params = activate_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-                            defer allocator.free(activate_params);
-                            const activate_cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.activateTarget", activate_params, null) catch
-                                return respondErr(allocator, "cmd error");
-                            defer allocator.free(activate_cmd);
-                            sender.sendText(activate_cmd) catch {};
-                            return respondOk(allocator);
-                        }
-                        page_idx += 1;
-                    }
-                    return respondErr(allocator, "tab index out of range");
-                }
-            }
+    if (!parsed.message.isResponse()) return .{ .err = "tab resolve failed" };
+    const result = parsed.message.result orelse return .{ .err = "tab resolve failed" };
+    const infos = result.object.get("targetInfos") orelse return .{ .err = "tab resolve failed" };
+    if (infos != .array) return .{ .err = "tab resolve failed" };
+
+    var page_idx: usize = 0;
+    for (infos.array.items) |info| {
+        if (!std.mem.eql(u8, cdp.getString(info, "type") orelse "", "page")) continue;
+        const tid = cdp.getString(info, "targetId") orelse "";
+        if (std.mem.eql(u8, tid, ref) or (ref_index != null and ref_index.? == page_idx)) {
+            return .{ .ok = allocator.dupe(u8, tid) catch return .{ .err = "alloc error" } };
         }
+        page_idx += 1;
     }
-    return respondErr(allocator, "tab switch failed");
+    return .not_found;
+}
+
+/// ref로 해석한 page 타깃에 대해 단일 Target 명령(activateTarget/closeTarget) 전송.
+fn tabTargetCommand(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, ref_opt: ?[]const u8, method: []const u8) []u8 {
+    const tid = switch (resolveTabTarget(allocator, sender, resp_map, cmd_id, ref_opt)) {
+        .err => |m| return respondErr(allocator, m),
+        .not_found => return respondErr(allocator, "tab not found (use `tab list` for ids)"),
+        .ok => |t| t,
+    };
+    defer allocator.free(tid);
+    const params = cdp.jsonObject1(allocator, "targetId", tid) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), method, params, null) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
+/// tab switch <id|index> — 안정 targetId 또는 0-base 인덱스(불안정·레거시)로 탭 활성화.
+fn handleTabSwitch(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, index_opt: ?[]const u8) []u8 {
+    _ = session_id;
+    return tabTargetCommand(allocator, sender, resp_map, cmd_id, index_opt, "Target.activateTarget");
+}
+
+/// tab close <id|index> — 안정 targetId 또는 0-base 인덱스(불안정·레거시)로 탭 닫기.
+fn handleTabClose(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_opt: ?[]const u8) []u8 {
+    _ = session_id;
+    return tabTargetCommand(allocator, sender, resp_map, cmd_id, ref_opt, "Target.closeTarget");
 }
 
 /// window new [url] — open new window
@@ -9433,10 +9451,10 @@ fn printUsage() void {
         \\  state save|load|list          Save/restore cookies + storage
         \\
         \\Tabs:
-        \\  tab list                  List open tabs
+        \\  tab list                  List open tabs (each with stable id)
         \\  tab new [url]             Open new tab
-        \\  tab close                 Close current tab
-        \\  tab switch <n>            Switch to tab by index
+        \\  tab close <id|n>          Close tab by stable id or index
+        \\  tab switch <id|n>         Switch to tab by stable id or index
         \\  tab count                 Count open tabs
         \\  window new [url]          Open new window
         \\
