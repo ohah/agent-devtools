@@ -710,6 +710,8 @@ pub fn main() void {
             std.process.exit(1);
         };
         sendAction(session, "pushstate", url, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "vitals")) {
+        sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "dblclick")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools dblclick <@ref>\n", .{});
@@ -3180,6 +3182,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleSimpleCdp(allocator, sender, cmd_id, session_id, "Page.reload");
     } else if (std.mem.eql(u8, req.action, "pushstate")) {
         return handlePushState(allocator, sender, resp_map, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "vitals")) {
+        return handleVitals(allocator, sender, resp_map, cmd_id, session_id, req.url, ctx.allowed_domains);
     } else if (std.mem.eql(u8, req.action, "get_url")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
@@ -7067,6 +7071,47 @@ fn handlePushState(allocator: Allocator, sender: *WsSender, resp_map: *response_
     return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
 }
 
+// Core Web Vitals 관측자 설치 (멱등). buffered:true 로 설치 이전 엔트리도 포착.
+const VITALS_INIT_JS =
+    \\(()=>{if(window.__AB_VITALS_INSTALLED__)return;window.__AB_VITALS_INSTALLED__=true;var cwv={lcp:null,cls:0,fcp:null,inp:null};window.__AB_VITALS__=cwv;try{new PerformanceObserver(function(l){var es=l.getEntries();if(es.length>0)cwv.lcp=Math.round(es[es.length-1].startTime*100)/100;}).observe({type:"largest-contentful-paint",buffered:true});}catch(e){}try{new PerformanceObserver(function(l){for(var e of l.getEntries())if(!e.hadRecentInput)cwv.cls+=e.value;}).observe({type:"layout-shift",buffered:true});}catch(e){}try{new PerformanceObserver(function(l){for(var e of l.getEntries())if(e.name==="first-contentful-paint")cwv.fcp=Math.round(e.startTime*100)/100;}).observe({type:"paint",buffered:true});}catch(e){}try{new PerformanceObserver(function(l){var w=cwv.inp||0;for(var e of l.getEntries())if(e.duration>w)w=e.duration;if(w>0)cwv.inp=Math.round(w*100)/100;}).observe({type:"event",buffered:true,durationThreshold:40});}catch(e){}})()
+;
+
+const VITALS_READ_JS =
+    \\(()=>{var c=window.__AB_VITALS__||{};var n=performance.getEntriesByType("navigation")[0];var t=n?Math.round((n.responseStart-n.requestStart)*100)/100:null;return JSON.stringify({lcp:c.lcp,cls:Math.round((c.cls||0)*10000)/10000,fcp:c.fcp,inp:c.inp,ttfb:t})})()
+;
+
+// settle 시간↑ = 마지막 LCP 후보·누적 CLS 안정화로 정확도↑, 응답 지연↑ 트레이드오프.
+const VITALS_NAV_SETTLE_MS = 1500; // 네비게이션 후 초기 로드 대기
+const VITALS_OBSERVE_MS = 2500; // 관측자 설치 후 CLS 누적/LCP 확정 대기
+
+/// Core Web Vitals (LCP/CLS/FCP/INP) + TTFB 측정.
+/// url 지정 시 해당 페이지로 이동 후 측정, 미지정 시 현재 페이지 측정.
+fn handleVitals(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, url_opt: ?[]const u8, allowed_domains: ?[]const u8) []u8 {
+    if (url_opt) |url| {
+        if (allowed_domains) |domains| {
+            if (!isDomainAllowed(url, domains)) return respondErr(allocator, "domain not allowed by --allowed-domains");
+        }
+        const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), url, session_id) catch
+            return respondErr(allocator, "navigate cmd error");
+        defer allocator.free(nav_cmd);
+        sender.sendText(nav_cmd) catch return respondErr(allocator, "navigate send error");
+        std.Thread.sleep(VITALS_NAV_SETTLE_MS * std.time.ns_per_ms);
+    }
+
+    const init_res = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, VITALS_INIT_JS) orelse
+        return respondErr(allocator, "vitals init failed");
+    allocator.free(init_res);
+
+    std.Thread.sleep(VITALS_OBSERVE_MS * std.time.ns_per_ms);
+
+    const json = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, VITALS_READ_JS) orelse
+        return respondErr(allocator, "vitals read failed");
+    defer allocator.free(json);
+
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = json }) catch
+        respondErr(allocator, "serialize error");
+}
+
 fn jsonToF64(val: std.json.Value) ?f64 {
     return switch (val) {
         .float => |f| f,
@@ -8647,6 +8692,7 @@ fn printUsage() void {
         \\  forward                   Go forward
         \\  reload                    Reload page
         \\  pushstate <url>           SPA client-side navigation (history.pushState)
+        \\  vitals [url]              Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
         \\  url                       Get current URL
         \\  title                     Get page title
         \\  content                   Get page HTML
@@ -9469,6 +9515,17 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "VITALS scripts: observe all core web vitals + emit expected keys" {
+    // 회귀 방지: 4개 관측자 타입과 READ가 내보내는 키 존재 확인
+    try std.testing.expect(std.mem.indexOf(u8, VITALS_INIT_JS, "largest-contentful-paint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, VITALS_INIT_JS, "layout-shift") != null);
+    try std.testing.expect(std.mem.indexOf(u8, VITALS_INIT_JS, "first-contentful-paint") != null);
+    try std.testing.expect(std.mem.indexOf(u8, VITALS_INIT_JS, "durationThreshold") != null);
+    inline for (.{ "lcp", "cls", "fcp", "inp", "ttfb" }) |k| {
+        try std.testing.expect(std.mem.indexOf(u8, VITALS_READ_JS, k) != null);
+    }
 }
 
 test "buildPushStateExpr: embeds URL as escaped JSON arg" {
