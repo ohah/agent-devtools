@@ -221,6 +221,19 @@ fn stripInvisibleChars(allocator: Allocator, input: []const u8) ![]u8 {
 
 /// Parse the AX tree response and build a text snapshot with @refs.
 /// Uses a TreeNode intermediate representation matching agent-browser's model.
+/// snapshot 출력 옵션 (agent-browser -d/--depth, -s/--selector).
+pub const SnapOpts = struct {
+    max_depth: ?usize = null, // 출력 트리 최대 깊이 (실제 렌더되는 노드 기준)
+    root_backend_id: ?i64 = null, // 이 backendNodeId 서브트리만 출력 (--selector)
+};
+
+/// renderTree 재귀 설정 (파라미터 분산 억제).
+const RenderCfg = struct {
+    interactive_only: bool,
+    link_urls: ?*const std.AutoHashMap(i64, []const u8),
+    max_depth: ?usize,
+};
+
 pub fn buildSnapshot(
     allocator: Allocator,
     ax_tree_json: std.json.Value,
@@ -228,6 +241,18 @@ pub fn buildSnapshot(
     interactive_only: bool,
     cursor_elements: ?*const CursorElementMap,
     link_urls: ?*const std.AutoHashMap(i64, []const u8),
+) ![]u8 {
+    return buildSnapshotWithOpts(allocator, ax_tree_json, ref_map, interactive_only, cursor_elements, link_urls, .{});
+}
+
+pub fn buildSnapshotWithOpts(
+    allocator: Allocator,
+    ax_tree_json: std.json.Value,
+    ref_map: *RefMap,
+    interactive_only: bool,
+    cursor_elements: ?*const CursorElementMap,
+    link_urls: ?*const std.AutoHashMap(i64, []const u8),
+    opts: SnapOpts,
 ) ![]u8 {
     if (ax_tree_json != .object) return error.InvalidCharacter;
     const nodes_val = ax_tree_json.object.get("nodes") orelse return error.InvalidCharacter;
@@ -485,8 +510,33 @@ pub fn buildSnapshot(
         owned_names.deinit(allocator);
     }
 
-    for (root_indices.items) |root_idx| {
-        try renderTree(allocator, tree_nodes.items, root_idx, 0, writer, interactive_only, &owned_names, link_urls);
+    const cfg = RenderCfg{
+        .interactive_only = interactive_only,
+        .link_urls = link_urls,
+        .max_depth = opts.max_depth,
+    };
+
+    if (opts.root_backend_id) |rbid| {
+        // --selector: 해당 backendNodeId 노드 서브트리만 렌더
+        var found = false;
+        for (tree_nodes.items, 0..) |tn, i| {
+            if (tn.cleared) continue;
+            if (tn.backend_node_id) |bid| {
+                if (bid == rbid) {
+                    try renderTree(allocator, tree_nodes.items, i, 0, writer, cfg, &owned_names, 1);
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if (!found) {
+            buf.deinit(allocator);
+            return allocator.dupe(u8, "(selector not found in accessibility tree)");
+        }
+    } else {
+        for (root_indices.items) |root_idx| {
+            try renderTree(allocator, tree_nodes.items, root_idx, 0, writer, cfg, &owned_names, 1);
+        }
     }
 
     const result = try buf.toOwnedSlice(allocator);
@@ -515,16 +565,18 @@ fn renderTree(
     idx: usize,
     indent: usize,
     writer: anytype,
-    interactive_only: bool,
+    cfg: RenderCfg,
     owned_names: *std.ArrayList([]u8),
-    link_urls: ?*const std.AutoHashMap(i64, []const u8),
+    depth: usize, // 실제 렌더된 노드 기준 깊이 (1-base). 컨테이너 스킵 시 불변.
 ) !void {
     const node = &nodes[idx];
+    const interactive_only = cfg.interactive_only;
+    const link_urls = cfg.link_urls;
 
     // Skip cleared/empty nodes but render children
     if (node.cleared or node.role.len == 0) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
+            try renderTree(allocator, nodes, child_idx, indent, writer, cfg, owned_names, depth);
         }
         return;
     }
@@ -532,7 +584,7 @@ fn renderTree(
     // Skip generic nodes with <=1 child and no ref (reduce noise)
     if (std.mem.eql(u8, node.role, "generic") and !node.has_ref and node.children.items.len <= 1) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
+            try renderTree(allocator, nodes, child_idx, indent, writer, cfg, owned_names, depth);
         }
         return;
     }
@@ -540,7 +592,7 @@ fn renderTree(
     // Skip RootWebArea / WebArea — structural containers
     if (std.mem.eql(u8, node.role, "RootWebArea") or std.mem.eql(u8, node.role, "WebArea")) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
+            try renderTree(allocator, nodes, child_idx, indent, writer, cfg, owned_names, depth);
         }
         return;
     }
@@ -552,7 +604,7 @@ fn renderTree(
         defer if (did_alloc) allocator.free(cleaned);
         if (cleaned.len == 0) {
             for (node.children.items) |child_idx| {
-                try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
+                try renderTree(allocator, nodes, child_idx, indent, writer, cfg, owned_names, depth);
             }
             return;
         }
@@ -561,9 +613,14 @@ fn renderTree(
     // Interactive-only mode: skip non-ref nodes, but recurse children
     if (interactive_only and !node.has_ref) {
         for (node.children.items) |child_idx| {
-            try renderTree(allocator, nodes, child_idx, indent, writer, interactive_only, owned_names, link_urls);
+            try renderTree(allocator, nodes, child_idx, indent, writer, cfg, owned_names, depth);
         }
         return;
+    }
+
+    // --depth: 이 노드가 실제 출력되는 시점에서 깊이 초과면 서브트리 통째 가지치기
+    if (cfg.max_depth) |md| {
+        if (depth > md) return;
     }
 
     // Render this node
@@ -677,7 +734,7 @@ fn renderTree(
 
     // Render children
     for (node.children.items) |child_idx| {
-        try renderTree(allocator, nodes, child_idx, indent + 1, writer, interactive_only, owned_names, link_urls);
+        try renderTree(allocator, nodes, child_idx, indent + 1, writer, cfg, owned_names, depth + 1);
     }
 }
 
@@ -1063,6 +1120,41 @@ test "buildSnapshot: tree depth preserved" {
 
     // RootWebArea is skipped, so button is at depth 0
     try testing.expect(std.mem.indexOf(u8, snap, "- button \"Click\" [ref=e1]") != null);
+}
+
+test "buildSnapshotWithOpts: max_depth prunes deeper nodes" {
+    // RootWebArea(skip) → navigation(d1) → list(d2) → button(d3)
+    const json =
+        \\{"nodes":[{"nodeId":"r","ignored":false,"role":{"type":"role","value":"RootWebArea"},"name":{"type":"computedString","value":"P"},"childIds":["a"]},{"nodeId":"a","parentId":"r","ignored":false,"role":{"type":"role","value":"navigation"},"name":{"type":"computedString","value":"Nav"},"backendDOMNodeId":1,"childIds":["b"]},{"nodeId":"b","parentId":"a","ignored":false,"role":{"type":"role","value":"list"},"name":{"type":"computedString","value":"L"},"backendDOMNodeId":2,"childIds":["c"]},{"nodeId":"c","parentId":"b","ignored":false,"role":{"type":"role","value":"button"},"name":{"type":"computedString","value":"Go"},"backendDOMNodeId":3}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var ref_map = RefMap.init(testing.allocator);
+    defer ref_map.deinit();
+    const snap = try buildSnapshotWithOpts(testing.allocator, parsed.value, &ref_map, false, null, null, .{ .max_depth = 2 });
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "navigation") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "list") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "button") == null); // depth 3 pruned
+}
+
+test "buildSnapshotWithOpts: root_backend_id renders only subtree" {
+    const json =
+        \\{"nodes":[{"nodeId":"r","ignored":false,"role":{"type":"role","value":"RootWebArea"},"name":{"type":"computedString","value":"P"},"childIds":["a"]},{"nodeId":"a","parentId":"r","ignored":false,"role":{"type":"role","value":"navigation"},"name":{"type":"computedString","value":"Nav"},"backendDOMNodeId":1,"childIds":["b"]},{"nodeId":"b","parentId":"a","ignored":false,"role":{"type":"role","value":"list"},"name":{"type":"computedString","value":"L"},"backendDOMNodeId":2,"childIds":["c"]},{"nodeId":"c","parentId":"b","ignored":false,"role":{"type":"role","value":"button"},"name":{"type":"computedString","value":"Go"},"backendDOMNodeId":3}]}
+    ;
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    var ref_map = RefMap.init(testing.allocator);
+    defer ref_map.deinit();
+    const snap = try buildSnapshotWithOpts(testing.allocator, parsed.value, &ref_map, false, null, null, .{ .root_backend_id = 2 });
+    defer testing.allocator.free(snap);
+    try testing.expect(std.mem.indexOf(u8, snap, "navigation") == null); // above subtree
+    try testing.expect(std.mem.indexOf(u8, snap, "list") != null);
+    try testing.expect(std.mem.indexOf(u8, snap, "button") != null);
+    // missing selector → sentinel
+    const snap2 = try buildSnapshotWithOpts(testing.allocator, parsed.value, &ref_map, false, null, null, .{ .root_backend_id = 999 });
+    defer testing.allocator.free(snap2);
+    try testing.expect(std.mem.indexOf(u8, snap2, "not found") != null);
 }
 
 test "extractBoxCenter: missing content returns null" {

@@ -304,7 +304,9 @@ pub const ChromeProcess = struct {
 
     /// Launch Chrome and wait for the CDP WebSocket URL.
     pub fn launch(allocator: Allocator, options: LaunchOptions) LaunchError!ChromeProcess {
-        const chrome_path = options.executable_path orelse findChrome() orelse
+        // 빈 문자열 executable_path는 미지정으로 취급 (findChrome 폴백)
+        const exe: ?[]const u8 = if (options.executable_path) |p| (if (p.len > 0) p else null) else null;
+        const chrome_path = exe orelse findChrome() orelse
             return error.ChromeNotFound;
 
         // Create temp user-data-dir if none provided

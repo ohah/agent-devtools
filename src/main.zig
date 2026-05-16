@@ -196,6 +196,10 @@ pub fn main() void {
     var session: []const u8 = "default";
     var headed = false;
     var cdp_port: ?[]const u8 = null;
+    var cdp_url: ?[]const u8 = null;
+    var executable_path: ?[]const u8 = null;
+    var chrome_args: ?[]const u8 = null;
+    var ignore_https_errors = false;
     var auto_connect = false;
     var user_agent: ?[]const u8 = null;
     var interactive = false;
@@ -221,42 +225,51 @@ pub fn main() void {
     loadConfigFile(&config_headed, &config_proxy, &config_proxy_bypass, &config_user_agent, &config_extensions);
 
     while (args_iter.next()) |arg| {
-        if (std.mem.startsWith(u8, arg, "--session=")) {
-            session = arg["--session=".len..];
+        if (flagIs(arg, "--session")) {
+            session = flagValue(arg, "--session", &args_iter) orelse session;
         } else if (std.mem.eql(u8, arg, "--headed")) {
             headed = true;
-        } else if (std.mem.startsWith(u8, arg, "--port=")) {
-            cdp_port = arg["--port=".len..];
+        } else if (flagIs(arg, "--port")) {
+            cdp_port = flagValue(arg, "--port", &args_iter);
+        } else if (flagIs(arg, "--cdp")) {
+            cdp_url = flagValue(arg, "--cdp", &args_iter);
+        } else if (flagIs(arg, "--executable-path")) {
+            executable_path = flagValue(arg, "--executable-path", &args_iter);
+        } else if (flagIs(arg, "--args")) {
+            chrome_args = flagValue(arg, "--args", &args_iter);
+        } else if (std.mem.eql(u8, arg, "--ignore-https-errors")) {
+            ignore_https_errors = true;
         } else if (std.mem.eql(u8, arg, "--auto-connect")) {
             auto_connect = true;
-        } else if (std.mem.startsWith(u8, arg, "--user-agent=")) {
-            user_agent = arg["--user-agent=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--proxy=")) {
-            proxy = arg["--proxy=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--proxy-bypass=")) {
-            proxy_bypass = arg["--proxy-bypass=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--extension=")) {
-            extensions = arg["--extension=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--allowed-domains=")) {
-            allowed_domains = arg["--allowed-domains=".len..];
+        } else if (flagIs(arg, "--user-agent")) {
+            user_agent = flagValue(arg, "--user-agent", &args_iter);
+        } else if (flagIs(arg, "--proxy")) {
+            proxy = flagValue(arg, "--proxy", &args_iter);
+        } else if (flagIs(arg, "--proxy-bypass")) {
+            proxy_bypass = flagValue(arg, "--proxy-bypass", &args_iter);
+        } else if (flagIs(arg, "--extension")) {
+            extensions = flagValue(arg, "--extension", &args_iter);
+        } else if (flagIs(arg, "--allowed-domains")) {
+            allowed_domains = flagValue(arg, "--allowed-domains", &args_iter);
         } else if (std.mem.eql(u8, arg, "--content-boundaries")) {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
-        } else if (std.mem.startsWith(u8, arg, "--profile=")) {
-            profile = arg["--profile=".len..];
-        } else if (std.mem.startsWith(u8, arg, "--enable=")) {
-            const feature = arg["--enable=".len..];
+        } else if (flagIs(arg, "--profile")) {
+            profile = flagValue(arg, "--profile", &args_iter);
+        } else if (flagIs(arg, "--enable")) {
+            const feature = flagValue(arg, "--enable", &args_iter) orelse "";
             if (std.mem.eql(u8, feature, "react-devtools") or std.mem.eql(u8, feature, "react")) {
                 enable_react = true;
             } else {
                 writeErr("Unknown --enable feature '{s}' (supported: react-devtools)\n", .{feature});
                 std.process.exit(1);
             }
-        } else if (std.mem.startsWith(u8, arg, "--init-script=")) {
-            const path = arg["--init-script=".len..];
-            if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
-            init_scripts_buf.appendSlice(std.heap.page_allocator, path) catch {};
+        } else if (flagIs(arg, "--init-script")) {
+            if (flagValue(arg, "--init-script", &args_iter)) |path| {
+                if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
+                init_scripts_buf.appendSlice(std.heap.page_allocator, path) catch {};
+            }
         } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "--pipe")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -264,6 +277,24 @@ pub fn main() void {
         } else if (command == null) {
             command = arg;
             break;
+        }
+    }
+
+    // `connect <port|url>`: 위치 인자 endpoint를 cdp_url/cdp_port로 디슈가 (agent-browser 동일)
+    if (command) |c| {
+        if (std.mem.eql(u8, c, "connect")) {
+            const endpoint = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools connect <port|ws-url|http-url>\n", .{});
+                std.process.exit(1);
+            };
+            switch (classifyCdpEndpoint(endpoint)) {
+                .url => |u| cdp_url = u,
+                .port => |p| cdp_port = p,
+                .invalid => {
+                    writeErr("connect: invalid endpoint '{s}' (expect port number or ws://|wss://|http(s):// URL)\n", .{endpoint});
+                    std.process.exit(1);
+                },
+            }
         }
     }
 
@@ -277,6 +308,7 @@ pub fn main() void {
     const daemon_opts = daemon.DaemonOptions{
         .headed = headed,
         .cdp_port = cdp_port,
+        .cdp_url = cdp_url,
         .auto_connect = auto_connect,
         .user_agent = user_agent,
         .proxy = proxy,
@@ -288,6 +320,9 @@ pub fn main() void {
         .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
         .enable_react = enable_react,
         .profile = profile,
+        .executable_path = executable_path,
+        .chrome_args = chrome_args,
+        .ignore_https_errors = ignore_https_errors,
     };
 
     if (interactive) {
@@ -302,11 +337,19 @@ pub fn main() void {
     };
 
     if (std.mem.eql(u8, cmd, "batch")) {
-        const bail = blk: {
-            while (args_iter.next()) |a| if (std.mem.eql(u8, a, "--bail")) break :blk true;
-            break :blk false;
-        };
-        const exit_code = runBatch(session, daemon_opts, bail);
+        // batch [--bail] [cmd1 cmd2 ...]  — 인라인 명령 있으면 stdin 대신 그것 실행
+        var bail = false;
+        var inline_cmds: std.ArrayList([]const u8) = .empty;
+        defer inline_cmds.deinit(std.heap.page_allocator);
+        while (args_iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--bail")) {
+                bail = true;
+            } else {
+                inline_cmds.append(std.heap.page_allocator, a) catch {};
+            }
+        }
+        const inline_slice: ?[]const []const u8 = if (inline_cmds.items.len > 0) inline_cmds.items else null;
+        const exit_code = runBatch(session, daemon_opts, bail, inline_slice);
         if (exit_code != 0) std.process.exit(exit_code);
         return;
     } else if (std.mem.eql(u8, cmd, "--help") or std.mem.eql(u8, cmd, "-h")) {
@@ -339,12 +382,21 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "network")) {
         const subcmd = args_iter.next() orelse "requests";
         if (std.mem.eql(u8, subcmd, "requests") or std.mem.eql(u8, subcmd, "list")) {
-            // network requests [--filter pattern] [--clear] [pattern]
+            // network requests [--filter pat] [--clear] [--type t] [--method m] [--status s] [pat]
             var filter_pattern: ?[]const u8 = null;
+            var rtype: ?[]const u8 = null;
+            var method: ?[]const u8 = null;
+            var status: ?[]const u8 = null;
             var do_clear = false;
             while (args_iter.next()) |narg| {
                 if (std.mem.eql(u8, narg, "--filter")) {
                     filter_pattern = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--type")) {
+                    rtype = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--method")) {
+                    method = args_iter.next();
+                } else if (std.mem.eql(u8, narg, "--status")) {
+                    status = args_iter.next();
                 } else if (std.mem.eql(u8, narg, "--clear")) {
                     do_clear = true;
                 } else if (filter_pattern == null) {
@@ -353,8 +405,36 @@ pub fn main() void {
             }
             if (do_clear) {
                 sendAction(session, "network_clear", null, null, daemon_opts);
-            } else {
+            } else if (rtype == null and method == null and status == null) {
                 sendAction(session, "network_list", null, filter_pattern, daemon_opts);
+            } else {
+                const pa = std.heap.page_allocator;
+                const extra = buildNetFilterExtraJson(pa, rtype, method, status) catch {
+                    writeErr("network requests: build error\n", .{});
+                    std.process.exit(1);
+                };
+                defer pa.free(extra);
+                sendActionEx(session, "network_list", null, filter_pattern, extra, daemon_opts);
+            }
+        } else if (std.mem.eql(u8, subcmd, "har")) {
+            const har_sub = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools network har <start|stop> [path]\n", .{});
+                std.process.exit(1);
+            };
+            if (std.mem.eql(u8, har_sub, "start")) {
+                sendAction(session, "har_start", null, null, daemon_opts);
+            } else if (std.mem.eql(u8, har_sub, "stop")) {
+                sendAction(session, "har", args_iter.next(), null, daemon_opts);
+            } else {
+                writeErr("network har: expected start|stop\n", .{});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, subcmd, "unroute")) {
+            // unroute [pattern]: 패턴 있으면 해당 룰 제거, 없으면 전체 해제
+            if (args_iter.next()) |pat| {
+                sendAction(session, "intercept_remove", pat, null, daemon_opts);
+            } else {
+                sendAction(session, "intercept_clear", null, null, daemon_opts);
             }
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const req_id = args_iter.next() orelse {
@@ -369,9 +449,11 @@ pub fn main() void {
                 \\Usage: agent-devtools network <subcommand>
                 \\
                 \\Subcommands:
-                \\  requests [--filter pattern] [--clear]  List or clear network requests
+                \\  requests [--filter p] [--type t] [--method m] [--status s] [--clear]
                 \\  get <requestId>   Get request details (headers, body)
                 \\  clear             Clear collected requests (alias)
+                \\  har <start|stop> [path]   HAR capture start / stop+export
+                \\  unroute [pattern]         Remove intercept rule(s)
                 \\  help              Show this help
                 \\
                 \\Aliases: 'list' works as alias for 'requests'
@@ -492,7 +574,17 @@ pub fn main() void {
         if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "tab")) {
             sendAction(session, "tab_list", null, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "new")) {
-            sendAction(session, "tab_new", args_iter.next(), null, daemon_opts);
+            // tab new [--label <name>] [url] (순서 무관)
+            var tab_url: ?[]const u8 = null;
+            var tab_label: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--label")) {
+                    tab_label = args_iter.next();
+                } else if (tab_url == null) {
+                    tab_url = a;
+                }
+            }
+            sendActionEx(session, "tab_new", tab_url, tab_label, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "close")) {
             sendAction(session, "tab_close", args_iter.next(), null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "count")) {
@@ -536,8 +628,48 @@ pub fn main() void {
                 defer cli_alloc.free(arr);
                 sendAction(session, "cookies_set_bulk", arr, null, daemon_opts);
             } else {
-                const value = args_iter.next() orelse "";
-                sendAction(session, "cookies_set", first, value, daemon_opts);
+                const name = first;
+                const value = args_iter.next() orelse {
+                    writeErr("Usage: agent-devtools cookies set <name> <value> [--url <u>] [--domain <d>] [--path <p>] [--httpOnly] [--secure] [--sameSite <Strict|Lax|None>] [--expires <ts>]\n", .{});
+                    std.process.exit(1);
+                };
+                var attrs = CookieAttrs{};
+                while (args_iter.next()) |fl| {
+                    if (std.mem.eql(u8, fl, "--url")) {
+                        attrs.url = args_iter.next() orelse missingCookieFlag("--url");
+                    } else if (std.mem.eql(u8, fl, "--domain")) {
+                        attrs.domain = args_iter.next() orelse missingCookieFlag("--domain");
+                    } else if (std.mem.eql(u8, fl, "--path")) {
+                        attrs.path = args_iter.next() orelse missingCookieFlag("--path");
+                    } else if (std.mem.eql(u8, fl, "--httpOnly")) {
+                        attrs.http_only = true;
+                    } else if (std.mem.eql(u8, fl, "--secure")) {
+                        attrs.secure = true;
+                    } else if (std.mem.eql(u8, fl, "--sameSite")) {
+                        const sv = args_iter.next() orelse missingCookieFlag("--sameSite");
+                        if (!std.mem.eql(u8, sv, "Strict") and !std.mem.eql(u8, sv, "Lax") and !std.mem.eql(u8, sv, "None")) {
+                            writeErr("cookies set --sameSite: expected Strict|Lax|None\n", .{});
+                            std.process.exit(1);
+                        }
+                        attrs.same_site = sv;
+                    } else if (std.mem.eql(u8, fl, "--expires")) {
+                        const ev = args_iter.next() orelse missingCookieFlag("--expires");
+                        attrs.expires = std.fmt.parseInt(i64, ev, 10) catch {
+                            writeErr("cookies set --expires: expected integer timestamp\n", .{});
+                            std.process.exit(1);
+                        };
+                    } else {
+                        writeErr("cookies set: unknown flag '{s}'\n", .{fl});
+                        std.process.exit(1);
+                    }
+                }
+                const cli_alloc = std.heap.page_allocator;
+                const arr = buildSingleCookieArrayJson(cli_alloc, name, value, attrs) catch {
+                    writeErr("cookies set: build error\n", .{});
+                    std.process.exit(1);
+                };
+                defer cli_alloc.free(arr);
+                sendAction(session, "cookies_set_bulk", arr, null, daemon_opts);
             }
         } else if (std.mem.eql(u8, subcmd, "get")) {
             const name = args_iter.next() orelse {
@@ -586,9 +718,12 @@ pub fn main() void {
         const v1 = args_iter.next() orelse "";
         const v2 = args_iter.next();
         if (std.mem.eql(u8, what, "viewport")) {
-            sendAction(session, "set_viewport", v1, v2, daemon_opts);
+            // set viewport <w> <h> [scale] — scale는 viewport에서만 소비
+            // (다른 set 하위명령의 가변 인자 소비를 깨지 않도록 선소비 금지)
+            sendActionEx(session, "set_viewport", v1, v2, args_iter.next(), daemon_opts);
         } else if (std.mem.eql(u8, what, "media")) {
-            sendAction(session, "set_media", v1, null, daemon_opts);
+            // set media <scheme> [reduced-motion]
+            sendAction(session, "set_media", v1, v2, daemon_opts);
         } else if (std.mem.eql(u8, what, "offline")) {
             sendAction(session, "set_offline", v1, null, daemon_opts);
         } else if (std.mem.eql(u8, what, "timezone")) {
@@ -683,38 +818,97 @@ pub fn main() void {
         }
     } else if (std.mem.eql(u8, cmd, "mouse")) {
         const action = args_iter.next() orelse "move";
-        const x = args_iter.next() orelse "0";
-        const y = args_iter.next() orelse "0";
-        // Pack "x:y" into pattern field since Request only has url+pattern
-        var coords_buf: [32]u8 = undefined;
-        const coords = std.fmt.bufPrint(&coords_buf, "{s}:{s}", .{ x, y }) catch "0:0";
+        var coords_buf: [48]u8 = undefined;
+        var coords: []const u8 = "0:0";
+        if (std.mem.eql(u8, action, "down") or std.mem.eql(u8, action, "up")) {
+            // mouse down|up [button]  (좌표 없이 버튼만 — 0:0:button)
+            const btn = args_iter.next() orelse "left";
+            coords = std.fmt.bufPrint(&coords_buf, "0:0:{s}", .{btn}) catch "0:0:left";
+        } else {
+            // mouse move|wheel <a> <b>  (move=x:y, wheel=dx:dy)
+            const a = args_iter.next() orelse "0";
+            const b = args_iter.next() orelse "0";
+            coords = std.fmt.bufPrint(&coords_buf, "{s}:{s}", .{ a, b }) catch "0:0";
+        }
         sendAction(session, "mouse", action, coords, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "screenshot")) {
-        const first_arg = args_iter.next();
-        if (first_arg) |fa| {
-            if (std.mem.eql(u8, fa, "--annotate") or std.mem.eql(u8, fa, "-a")) {
-                const path = args_iter.next();
-                sendAction(session, "screenshot_annotate", path, null, daemon_opts);
-            } else if (std.mem.eql(u8, fa, "--full")) {
-                const path = args_iter.next();
-                sendAction(session, "screenshot_full", path, null, daemon_opts);
-            } else {
-                sendAction(session, "screenshot", fa, null, daemon_opts);
+        var annotate = false;
+        var full = false;
+        var fmt: ?[]const u8 = null;
+        var quality: ?[]const u8 = null;
+        var positionals: [2]?[]const u8 = .{ null, null };
+        var np: usize = 0;
+        while (args_iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--annotate") or std.mem.eql(u8, a, "-a")) {
+                annotate = true;
+            } else if (std.mem.eql(u8, a, "--full") or std.mem.eql(u8, a, "-f")) {
+                full = true;
+            } else if (std.mem.eql(u8, a, "--format")) {
+                fmt = args_iter.next();
+            } else if (std.mem.eql(u8, a, "--quality")) {
+                quality = args_iter.next();
+            } else if (np < 2) {
+                positionals[np] = a;
+                np += 1;
             }
+        }
+        // [selector] [path] 구분: agent-browser 규칙 (@/./# 접두 & 경로 아님 → selector)
+        var selector: ?[]const u8 = null;
+        var path: ?[]const u8 = null;
+        if (np == 2) {
+            selector = positionals[0];
+            path = positionals[1];
+        } else if (np == 1) {
+            const f = positionals[0].?;
+            if (isScreenshotSelector(f)) selector = f else path = f;
+        }
+        if (annotate) {
+            sendAction(session, "screenshot_annotate", path, null, daemon_opts);
+        } else if (selector == null and fmt == null and quality == null) {
+            sendAction(session, if (full) "screenshot_full" else "screenshot", path, null, daemon_opts);
         } else {
-            sendAction(session, "screenshot", null, null, daemon_opts);
+            const pa = std.heap.page_allocator;
+            const extra = buildScreenshotExtraJson(pa, selector, fmt, quality, full) catch {
+                writeErr("screenshot: build error\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(extra);
+            sendActionEx(session, "screenshot", path, null, extra, daemon_opts);
         }
     } else if (std.mem.eql(u8, cmd, "snapshot")) {
         var interactive_snap = false;
         var with_urls = false;
+        var depth: ?[]const u8 = null;
+        var selector: ?[]const u8 = null;
+        // -c/--compact, -C/--cursor: agent-devtools 기본 출력이 이미 compact +
+        // cursor 힌트 포함 → 플래그 수용(파서 호환), 동작 변화 없음.
         while (args_iter.next()) |f| {
-            if (std.mem.eql(u8, f, "-i")) {
+            if (std.mem.eql(u8, f, "-i") or std.mem.eql(u8, f, "--interactive")) {
                 interactive_snap = true;
             } else if (std.mem.eql(u8, f, "-u") or std.mem.eql(u8, f, "--urls")) {
                 with_urls = true;
+            } else if (std.mem.eql(u8, f, "-d") or std.mem.eql(u8, f, "--depth")) {
+                depth = args_iter.next();
+            } else if (std.mem.eql(u8, f, "-s") or std.mem.eql(u8, f, "--selector")) {
+                selector = args_iter.next();
+            } else if (std.mem.eql(u8, f, "-c") or std.mem.eql(u8, f, "--compact") or
+                std.mem.eql(u8, f, "-C") or std.mem.eql(u8, f, "--cursor"))
+            {
+                // accepted no-op (already default behavior)
             }
         }
-        sendAction(session, if (interactive_snap) "snapshot_interactive" else "snapshot", null, if (with_urls) SNAPSHOT_URLS_FLAG else null, daemon_opts);
+        const action = if (interactive_snap) "snapshot_interactive" else "snapshot";
+        if (depth == null and selector == null) {
+            sendAction(session, action, null, if (with_urls) SNAPSHOT_URLS_FLAG else null, daemon_opts);
+        } else {
+            const pa = std.heap.page_allocator;
+            const extra = buildSnapshotExtraJson(pa, depth, selector) catch {
+                writeErr("snapshot: build error (depth must be an integer)\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(extra);
+            sendActionEx(session, action, null, if (with_urls) SNAPSHOT_URLS_FLAG else null, extra, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "click")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools click <@ref or selector>\n", .{});
@@ -775,10 +969,34 @@ pub fn main() void {
         };
         sendAction(session, "hover", target, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "eval")) {
-        const expr = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools eval <expression>\n", .{});
+        const first = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools eval <expression> | eval --stdin | eval -b <base64>\n", .{});
             std.process.exit(1);
         };
+        const pa = std.heap.page_allocator;
+        const expr: []const u8 = if (std.mem.eql(u8, first, "--stdin")) blk: {
+            const data = std.fs.File.stdin().readToEndAlloc(pa, 16 * 1024 * 1024) catch {
+                writeErr("eval: failed to read stdin\n", .{});
+                std.process.exit(1);
+            };
+            break :blk std.mem.trimRight(u8, data, "\r\n");
+        } else if (std.mem.eql(u8, first, "-b") or std.mem.eql(u8, first, "--base64")) blk: {
+            const b64 = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools eval -b <base64-encoded-script>\n", .{});
+                std.process.exit(1);
+            };
+            const dec = std.base64.standard.Decoder;
+            const n = dec.calcSizeForSlice(b64) catch {
+                writeErr("eval: invalid base64\n", .{});
+                std.process.exit(1);
+            };
+            const out = pa.alloc(u8, n) catch std.process.exit(1);
+            dec.decode(out, b64) catch {
+                writeErr("eval: invalid base64\n", .{});
+                std.process.exit(1);
+            };
+            break :blk out;
+        } else first;
         sendAction(session, "eval", expr, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "back")) {
         sendAction(session, "back", null, null, daemon_opts);
@@ -793,7 +1011,13 @@ pub fn main() void {
         };
         sendAction(session, "pushstate", url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "vitals")) {
-        sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
+        // vitals [url] [--json] — url은 첫 비플래그 인자. vitals 출력은 이미
+        // JSON이므로 --json은 호환을 위해 수용(동작 동일).
+        var vitals_url: ?[]const u8 = null;
+        while (args_iter.next()) |a| {
+            if (!std.mem.startsWith(u8, a, "--") and vitals_url == null) vitals_url = a;
+        }
+        sendAction(session, "vitals", vitals_url, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "react")) {
         const sub = args_iter.next() orelse {
             writeErr("Usage: agent-devtools react <tree|inspect|renders|suspense>\n", .{});
@@ -914,11 +1138,11 @@ pub fn main() void {
             writeErr("Usage: agent-devtools clipboard <get|set> [text]\n", .{});
             std.process.exit(1);
         };
-        if (std.mem.eql(u8, subcmd, "get")) {
+        if (std.mem.eql(u8, subcmd, "get") or std.mem.eql(u8, subcmd, "paste") or std.mem.eql(u8, subcmd, "read")) {
             sendAction(session, "clipboard_get", null, null, daemon_opts);
-        } else if (std.mem.eql(u8, subcmd, "set")) {
+        } else if (std.mem.eql(u8, subcmd, "set") or std.mem.eql(u8, subcmd, "copy") or std.mem.eql(u8, subcmd, "write")) {
             const text = args_iter.next() orelse {
-                writeErr("Usage: agent-devtools clipboard set <text>\n", .{});
+                writeErr("Usage: agent-devtools clipboard <set|copy> <text>\n", .{});
                 std.process.exit(1);
             };
             sendAction(session, "clipboard_set", text, null, daemon_opts);
@@ -963,7 +1187,7 @@ pub fn main() void {
         sendAction(session, "select_option", target, value, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "get")) {
         const what = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools get <url|title|text|html|value> [@ref]\n", .{});
+            writeErr("Usage: agent-devtools get <url|title|text|html|value|attr|count|cdp-url> [args]\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, what, "url")) {
@@ -998,6 +1222,14 @@ pub fn main() void {
                 std.process.exit(1);
             };
             sendAction(session, "get_attr", target, attr_name, daemon_opts);
+        } else if (std.mem.eql(u8, what, "cdp-url")) {
+            sendAction(session, "cdp_url", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, what, "count")) {
+            const sel = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools get count <css-selector>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "count", sel, null, daemon_opts);
         } else {
             writeErr("Unknown: get {s}\n", .{what});
             std.process.exit(1);
@@ -1005,6 +1237,9 @@ pub fn main() void {
     } else if (std.mem.eql(u8, cmd, "wait")) {
         const ms = args_iter.next() orelse "1000";
         sendAction(session, "wait", ms, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "connect")) {
+        // endpoint는 이미 cdp_url/cdp_port로 디슈가됨 → 데몬 기동 + 상태 보고
+        sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "status")) {
         sendAction(session, "status", null, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "close")) {
@@ -1016,21 +1251,100 @@ pub fn main() void {
         };
         sendAction(session, "record", name, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "diff")) {
-        const name = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools diff <recording-name>\n", .{});
+        const first = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools diff <snapshot|url|recording-name>\n", .{});
             std.process.exit(1);
         };
-        sendAction(session, "diff", name, null, daemon_opts);
+        if (std.mem.eql(u8, first, "snapshot") or std.mem.eql(u8, first, "url")) {
+            const is_url = std.mem.eql(u8, first, "url");
+            var url1: ?[]const u8 = null;
+            var url2: ?[]const u8 = null;
+            if (is_url) {
+                url1 = args_iter.next();
+                url2 = args_iter.next();
+                if (url1 == null or url2 == null) {
+                    writeErr("Usage: agent-devtools diff url <url1> <url2> [-s sel] [-c] [-d n] [--wait-until w]\n", .{});
+                    std.process.exit(1);
+                }
+            }
+            var baseline: ?[]const u8 = null;
+            var selector: ?[]const u8 = null;
+            var depth: ?[]const u8 = null;
+            var interactive_d = false;
+            var wait_until: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "-b") or std.mem.eql(u8, a, "--baseline")) {
+                    baseline = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-s") or std.mem.eql(u8, a, "--selector")) {
+                    selector = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-d") or std.mem.eql(u8, a, "--depth")) {
+                    depth = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-i") or std.mem.eql(u8, a, "--interactive")) {
+                    interactive_d = true;
+                } else if (std.mem.eql(u8, a, "--wait-until")) {
+                    wait_until = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--compact")) {
+                    // accepted no-op (출력 기본 compact)
+                }
+            }
+            const pa = std.heap.page_allocator;
+            const extra = buildDiffExtraJson(pa, baseline, selector, depth, interactive_d, wait_until) catch {
+                writeErr("diff: build error (depth must be an integer)\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(extra);
+            sendActionEx(session, if (is_url) "diff_url" else "diff_snapshot", url1, url2, extra, daemon_opts);
+        } else {
+            sendAction(session, "diff", first, null, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "find")) {
         const strategy = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools find <role|text|label|placeholder|testid> <value>\n", .{});
+            writeErr("Usage: agent-devtools find <role|text|label|placeholder|alt|title|testid|first|last|nth> <value> [action] [text] [--name N] [--exact]\n", .{});
             std.process.exit(1);
         };
-        const value = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools find {s} <value>\n", .{strategy});
+        var value = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools find {s} <value> [action] [text]\n", .{strategy});
             std.process.exit(1);
         };
-        sendAction(session, "find", strategy, value, daemon_opts);
+        // nth는 `find nth <index> <selector>` 순서 — value(=index) 다음이 selector
+        var nth_idx: i64 = 0;
+        if (std.mem.eql(u8, strategy, "nth")) {
+            nth_idx = std.fmt.parseInt(i64, value, 10) catch {
+                writeErr("find nth <index> <selector>: index must be numeric\n", .{});
+                std.process.exit(1);
+            };
+            value = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools find nth <index> <selector> [action]\n", .{});
+                std.process.exit(1);
+            };
+        }
+        // 남은 토큰: [action] [text...] [--name <n>] [--exact] → extra(JSON)로 전달
+        var act: ?[]const u8 = null;
+        var name: ?[]const u8 = null;
+        var exact = false;
+        var txt_buf: std.ArrayList(u8) = .empty;
+        while (args_iter.next()) |tok| {
+            if (std.mem.eql(u8, tok, "--exact")) {
+                exact = true;
+            } else if (std.mem.eql(u8, tok, "--name")) {
+                name = args_iter.next();
+            } else if (act == null) {
+                act = tok;
+            } else {
+                if (txt_buf.items.len > 0) txt_buf.append(std.heap.page_allocator, ' ') catch {};
+                txt_buf.appendSlice(std.heap.page_allocator, tok) catch {};
+            }
+        }
+        var ebuf: std.ArrayList(u8) = .empty;
+        const ew = ebuf.writer(std.heap.page_allocator);
+        ew.writeAll("{\"act\":") catch {};
+        cdp.writeJsonString(ew, act orelse "") catch {};
+        ew.writeAll(",\"txt\":") catch {};
+        cdp.writeJsonString(ew, txt_buf.items) catch {};
+        ew.writeAll(",\"name\":") catch {};
+        cdp.writeJsonString(ew, name orelse "") catch {};
+        ew.print(",\"exact\":{s},\"idx\":{d}}}", .{ if (exact) "true" else "false", nth_idx }) catch {};
+        sendActionEx(session, "find", strategy, value, ebuf.items, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "dialog")) {
         const subcmd = args_iter.next() orelse {
             writeErr("Usage: agent-devtools dialog <accept|dismiss|info> [text]\n", .{});
@@ -1119,7 +1433,7 @@ pub fn main() void {
         sendAction(session, "har", filename, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "state")) {
         const subcmd = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools state <save|load|list> [name]\n", .{});
+            writeErr("Usage: agent-devtools state <save|load|list|clear|show|clean|rename> [args]\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, subcmd, "save")) {
@@ -1136,6 +1450,39 @@ pub fn main() void {
             sendAction(session, "state_load", name, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "list")) {
             sendAction(session, "state_list", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "clear")) {
+            var nm: ?[]const u8 = null;
+            var all = false;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--all") or std.mem.eql(u8, a, "-a")) all = true else if (!std.mem.startsWith(u8, a, "-")) nm = a;
+            }
+            sendActionEx(session, "state_clear", nm, if (all) "all" else null, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "show")) {
+            const name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools state show <name>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "state_show", name, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "clean")) {
+            var days: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--older-than")) days = args_iter.next();
+            }
+            const d = days orelse {
+                writeErr("Usage: agent-devtools state clean --older-than <days>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "state_clean", d, null, daemon_opts);
+        } else if (std.mem.eql(u8, subcmd, "rename")) {
+            const old_name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools state rename <old> <new>\n", .{});
+                std.process.exit(1);
+            };
+            const new_name = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools state rename <old> <new>\n", .{});
+                std.process.exit(1);
+            };
+            sendActionEx(session, "state_rename", old_name, new_name, null, daemon_opts);
         } else {
             writeErr("Unknown state subcommand: {s}\n", .{subcmd});
             std.process.exit(1);
@@ -1354,6 +1701,19 @@ pub fn main() void {
 // ============================================================================
 
 /// 남은 인자에서 `--resource-type|--resource-types <csv>`를 찾아 CSV 반환. 없으면 null.
+/// `arg`가 value 플래그 `name`인가 (`--name` 또는 `--name=...` 둘 다).
+fn flagIs(arg: []const u8, name: []const u8) bool {
+    if (std.mem.eql(u8, arg, name)) return true;
+    return arg.len > name.len and std.mem.startsWith(u8, arg, name) and arg[name.len] == '=';
+}
+
+/// value 플래그의 값 추출: `--name=val`이면 val, `--name`이면 다음 인자(space form).
+/// 값 누락(`--name` 마지막 인자) 시 null — 빈 문자열 오염 방지.
+fn flagValue(arg: []const u8, name: []const u8, it: anytype) ?[]const u8 {
+    if (arg.len > name.len and arg[name.len] == '=') return arg[name.len + 1 ..];
+    return it.next();
+}
+
 fn parseResourceTypeFlag(it: anytype) ?[]const u8 {
     while (it.next()) |arg| {
         if (std.mem.eql(u8, arg, "--resource-type") or std.mem.eql(u8, arg, "--resource-types")) {
@@ -1361,6 +1721,235 @@ fn parseResourceTypeFlag(it: anytype) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// `connect <endpoint>` 인자 분류 (agent-browser commands.rs와 동일 규칙):
+/// ws://|wss://|http://|https:// → cdp_url, 그 외 숫자 → cdp_port.
+const CdpEndpoint = union(enum) {
+    url: []const u8, // ws:// wss:// http:// https://
+    port: []const u8, // 숫자 포트
+    invalid,
+};
+
+fn classifyCdpEndpoint(s: []const u8) CdpEndpoint {
+    if (std.mem.startsWith(u8, s, "ws://") or std.mem.startsWith(u8, s, "wss://") or
+        std.mem.startsWith(u8, s, "http://") or std.mem.startsWith(u8, s, "https://"))
+        return .{ .url = s };
+    if (s.len == 0) return .invalid;
+    for (s) |c| if (c < '0' or c > '9') return .invalid;
+    return .{ .port = s };
+}
+
+const HostPort = struct { host: []const u8, port: u16 };
+
+/// http(s):// CDP URL → host/port (discoverWsUrl 입력용). 비-http 스킴은 null.
+fn parseHttpHostPort(url: []const u8) ?HostPort {
+    const is_https = std.mem.startsWith(u8, url, "https://");
+    const after_scheme: []const u8 = if (is_https)
+        url["https://".len..]
+    else if (std.mem.startsWith(u8, url, "http://"))
+        url["http://".len..]
+    else
+        return null;
+    const default_port: u16 = if (is_https) 443 else 80;
+    const authority_end = std.mem.indexOfAny(u8, after_scheme, "/?#") orelse after_scheme.len;
+    const authority = after_scheme[0..authority_end];
+    if (authority.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, authority, ':')) |ci| {
+        const host = authority[0..ci];
+        const port = std.fmt.parseInt(u16, authority[ci + 1 ..], 10) catch return null;
+        if (host.len == 0) return null;
+        return .{ .host = host, .port = port };
+    }
+    return .{ .host = authority, .port = default_port };
+}
+
+/// `get count <selector>` → querySelectorAll 길이를 문자열로 반환하는 JS 표현식.
+/// selector는 JSON 문자열로 인코딩해 인젝션/특수문자 안전.
+fn buildCountExpr(allocator: Allocator, selector: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("String(document.querySelectorAll(");
+    try cdp.writeJsonString(w, selector);
+    try w.writeAll(").length)");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `cookies set <name> <value>`의 선택적 CDP CookieParam 속성.
+const CookieAttrs = struct {
+    url: ?[]const u8 = null,
+    domain: ?[]const u8 = null,
+    path: ?[]const u8 = null,
+    http_only: bool = false,
+    secure: bool = false,
+    same_site: ?[]const u8 = null, // Strict|Lax|None
+    expires: ?i64 = null,
+};
+
+/// 단일 위치 인자가 selector인지 path인지 판별 (agent-browser 규칙과 동일):
+/// 상대경로(./ ../)·`/` 포함·이미지 확장자면 path, 그 외(@/./# 접두 및
+/// 접두 없는 평문 selector 포함)는 모두 selector. (`is_selector || !is_path`)
+fn isScreenshotSelector(s: []const u8) bool {
+    if (s.len == 0) return false;
+    if (std.mem.startsWith(u8, s, "./") or std.mem.startsWith(u8, s, "../")) return false;
+    if (std.mem.indexOfScalar(u8, s, '/') != null) return false;
+    if (std.mem.endsWith(u8, s, ".png") or std.mem.endsWith(u8, s, ".jpg") or
+        std.mem.endsWith(u8, s, ".jpeg") or std.mem.endsWith(u8, s, ".webp")) return false;
+    return true;
+}
+
+/// screenshot opts → 데몬 전달용 JSON `{"sel":..,"fmt":..,"q":..,"full":..}`.
+fn buildScreenshotExtraJson(allocator: Allocator, selector: ?[]const u8, fmt: ?[]const u8, quality: ?[]const u8, full: bool) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    if (selector) |s| {
+        try w.writeAll("\"sel\":");
+        try cdp.writeJsonString(w, s);
+        first = false;
+    }
+    if (fmt) |f| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"fmt\":");
+        try cdp.writeJsonString(w, f);
+        first = false;
+    }
+    if (quality) |q| {
+        const qn = std.fmt.parseInt(u32, q, 10) catch return error.InvalidQuality;
+        if (qn == 0 or qn > 100) return error.InvalidQuality;
+        if (!first) try w.writeByte(',');
+        try w.print("\"q\":{d}", .{qn});
+        first = false;
+    }
+    if (full) {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"full\":true");
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// network requests 필터 → 데몬 전달 JSON `{"type":..,"method":..,"status":..}`.
+fn buildNetFilterExtraJson(allocator: Allocator, rtype: ?[]const u8, method: ?[]const u8, status: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    const fields = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "type", .v = rtype },
+        .{ .k = "method", .v = method },
+        .{ .k = "status", .v = status },
+    };
+    for (fields) |fld| {
+        if (fld.v) |val| {
+            if (!first) try w.writeByte(',');
+            try cdp.writeJsonString(w, fld.k);
+            try w.writeByte(':');
+            try cdp.writeJsonString(w, val);
+            first = false;
+        }
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// snapshot -d/-s → 데몬 전달 JSON `{"depth":N,"selector":".."}`. depth는 정수 검증.
+fn buildSnapshotExtraJson(allocator: Allocator, depth: ?[]const u8, selector: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    if (depth) |d| {
+        const n = std.fmt.parseInt(u32, d, 10) catch return error.InvalidDepth;
+        try w.print("\"depth\":{d}", .{n});
+        first = false;
+    }
+    if (selector) |s| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"selector\":");
+        try cdp.writeJsonString(w, s);
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// diff snapshot/url → 데몬 전달 JSON. depth는 정수 검증, 나머지는 선택.
+fn buildDiffExtraJson(allocator: Allocator, baseline: ?[]const u8, selector: ?[]const u8, depth: ?[]const u8, interactive: bool, wait_until: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    if (baseline) |b| {
+        try w.writeAll("\"baseline\":");
+        try cdp.writeJsonString(w, b);
+        first = false;
+    }
+    if (selector) |s| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"selector\":");
+        try cdp.writeJsonString(w, s);
+        first = false;
+    }
+    if (depth) |d| {
+        const n = std.fmt.parseInt(u32, d, 10) catch return error.InvalidDepth;
+        if (!first) try w.writeByte(',');
+        try w.print("\"depth\":{d}", .{n});
+        first = false;
+    }
+    if (wait_until) |wu| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"waitUntil\":");
+        try cdp.writeJsonString(w, wu);
+        first = false;
+    }
+    if (interactive) {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"interactive\":true");
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+fn missingCookieFlag(flag: []const u8) noreturn {
+    writeErr("cookies set {s}: missing value\n", .{flag});
+    std.process.exit(1);
+}
+
+/// name/value + 속성을 CDP Network.setCookies가 받는 단일 쿠키 배열 JSON `[{...}]`
+/// 으로 직렬화 (bulk 경로 재사용). 문자열은 JSON 인코딩.
+fn buildSingleCookieArrayJson(allocator: Allocator, name: []const u8, value: []const u8, attrs: CookieAttrs) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('[');
+    try writeCookieNameValue(w, name, value);
+    if (attrs.url) |v| {
+        try w.writeAll(",\"url\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.domain) |v| {
+        try w.writeAll(",\"domain\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.path) |v| {
+        try w.writeAll(",\"path\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.http_only) try w.writeAll(",\"httpOnly\":true");
+    if (attrs.secure) try w.writeAll(",\"secure\":true");
+    if (attrs.same_site) |v| {
+        try w.writeAll(",\"sameSite\":");
+        try cdp.writeJsonString(w, v);
+    }
+    if (attrs.expires) |e| try w.print(",\"expires\":{d}", .{e});
+    try w.writeAll("}]");
+    return buf.toOwnedSlice(allocator);
 }
 
 fn sendAction(session: []const u8, action: []const u8, url: ?[]const u8, pattern: ?[]const u8, daemon_opts: daemon.DaemonOptions) void {
@@ -1378,8 +1967,8 @@ fn sendActionEx(session: []const u8, action: []const u8, url: ?[]const u8, patte
     };
     if (started) {
         writeErr("Started daemon (session: {s})\n", .{session});
-    } else if (daemon_opts.headed or daemon_opts.cdp_port != null or daemon_opts.auto_connect) {
-        writeErr("Daemon already running — --headed/--port/--auto-connect options ignored. Use 'close' first.\n", .{});
+    } else if (daemon_opts.headed or daemon_opts.cdp_port != null or daemon_opts.cdp_url != null or daemon_opts.auto_connect) {
+        writeErr("Daemon already running — --headed/--port/--cdp/--auto-connect options ignored. Use 'close' first.\n", .{});
     }
 
     // Connect and send command
@@ -1786,7 +2375,23 @@ fn runDoctor(json_out: bool) void {
     write("  status  : {s}\n", .{if (ok) "ok" else "Chrome missing"});
 }
 
-fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) u8 {
+/// 한 batch 명령 줄 처리: parse→send→출력. 실패면 true.
+fn runBatchLine(allocator: Allocator, session: []const u8, line: []const u8, counter: usize) u8 {
+    var id_buf: [20]u8 = undefined;
+    const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{counter}) catch unreachable;
+    const resp: []u8 = blk: {
+        const data = parseTextCommand(allocator, line, id_str) orelse
+            break :blk allocator.dupe(u8, "{\"success\":false,\"error\":\"parse error\"}") catch return 2;
+        defer allocator.free(data);
+        break :blk sendOneCommand(allocator, session, data) catch
+            allocator.dupe(u8, "{\"success\":false,\"error\":\"daemon send/recv failed\"}") catch return 2;
+    };
+    defer allocator.free(resp);
+    writeLine(resp);
+    return if (responseFailed(allocator, resp)) 1 else 0;
+}
+
+fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool, inline_cmds: ?[]const []const u8) u8 {
     var gpa_impl: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa_impl.deinit();
     const allocator = gpa_impl.allocator();
@@ -1797,6 +2402,24 @@ fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) 
     };
     if (started) writeErr("Started daemon (session: {s})\n", .{session});
 
+    var had_failure = false;
+    var counter: usize = 1;
+
+    if (inline_cmds) |cmds| {
+        for (cmds) |raw| {
+            const line = std.mem.trim(u8, raw, " \t\r");
+            if (line.len == 0 or line[0] == '#') continue;
+            const r = runBatchLine(allocator, session, line, counter);
+            counter += 1;
+            if (r == 2) return 1;
+            if (r == 1) {
+                had_failure = true;
+                if (bail) return 1;
+            }
+        }
+        return if (had_failure) 1 else 0;
+    }
+
     const stdin = std.fs.File.stdin();
     const input = stdin.readToEndAlloc(allocator, 16 * 1024 * 1024) catch {
         writeErr("batch: failed to read stdin\n", .{});
@@ -1804,28 +2427,14 @@ fn runBatch(session: []const u8, daemon_opts: daemon.DaemonOptions, bail: bool) 
     };
     defer allocator.free(input);
 
-    var had_failure = false;
-    var counter: usize = 1;
     var it = std.mem.splitScalar(u8, input, '\n');
     while (it.next()) |raw_line| {
         const line = std.mem.trim(u8, raw_line, " \t\r");
         if (line.len == 0 or line[0] == '#') continue;
-
-        var id_buf: [20]u8 = undefined;
-        const id_str = std.fmt.bufPrint(&id_buf, "{d}", .{counter}) catch unreachable; // [20]u8는 usize 10진수 충분
+        const r = runBatchLine(allocator, session, line, counter);
         counter += 1;
-
-        const resp: []u8 = blk: {
-            const data = parseTextCommand(allocator, line, id_str) orelse
-                break :blk allocator.dupe(u8, "{\"success\":false,\"error\":\"parse error\"}") catch return 1;
-            defer allocator.free(data);
-            break :blk sendOneCommand(allocator, session, data) catch
-                allocator.dupe(u8, "{\"success\":false,\"error\":\"daemon send/recv failed\"}") catch return 1;
-        };
-        defer allocator.free(resp);
-        writeLine(resp);
-
-        if (responseFailed(allocator, resp)) {
+        if (r == 2) return 1;
+        if (r == 1) {
             had_failure = true;
             if (bail) return 1;
         }
@@ -2090,10 +2699,14 @@ fn runDaemon() void {
     const session = daemon.getenv("AGENT_DEVTOOLS_SESSION") orelse "default";
     const is_headed = daemon.getenv("AGENT_DEVTOOLS_HEADED") != null;
     const ext_port = daemon.getenv("AGENT_DEVTOOLS_PORT");
+    const env_cdp_url = daemon.getenv("AGENT_DEVTOOLS_CDP_URL");
     const env_auto_connect = daemon.getenv("AGENT_DEVTOOLS_AUTO_CONNECT") != null;
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
     const env_init_scripts = daemon.getenv("AGENT_DEVTOOLS_INIT_SCRIPTS");
     const env_enable_react = daemon.getenv("AGENT_DEVTOOLS_ENABLE_REACT") != null;
+    const env_executable = daemon.getenv("AGENT_DEVTOOLS_EXECUTABLE");
+    const env_chrome_args = daemon.getenv("AGENT_DEVTOOLS_CHROME_ARGS");
+    const env_ignore_https = daemon.getenv("AGENT_DEVTOOLS_IGNORE_HTTPS") != null;
     const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
     const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
     const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
@@ -2112,7 +2725,20 @@ fn runDaemon() void {
     var discovered_url: ?[]u8 = null;
     defer if (discovered_url) |u| allocator.free(u);
 
-    const ws_url: []const u8 = if (ext_port) |port_str| blk: {
+    const ws_url: []const u8 = if (env_cdp_url) |cdp_url| blk: {
+        // ws(s):// 는 CDP endpoint 직결, http(s):// 는 /json/version discovery 필요
+        if (std.mem.startsWith(u8, cdp_url, "ws://") or std.mem.startsWith(u8, cdp_url, "wss://"))
+            break :blk cdp_url;
+        const hp = parseHttpHostPort(cdp_url) orelse {
+            std.debug.print("Daemon: Invalid --cdp URL: {s}\n", .{cdp_url});
+            return;
+        };
+        discovered_url = chrome.discoverWsUrl(allocator, hp.host, hp.port) catch |err| {
+            std.debug.print("Daemon: Failed to discover CDP URL at {s}: {s}\n", .{ cdp_url, @errorName(err) });
+            return;
+        };
+        break :blk discovered_url.?;
+    } else if (ext_port) |port_str| blk: {
         const port = std.fmt.parseInt(u16, port_str, 10) catch {
             std.debug.print("Daemon: Invalid port: {s}\n", .{port_str});
             return;
@@ -2138,8 +2764,18 @@ fn runDaemon() void {
             })
         else
             null;
+        // --args "<공백 구분>" + --ignore-https-errors → extra_args 슬라이스
+        var extra_args_list: std.ArrayList([]const u8) = .empty;
+        defer extra_args_list.deinit(allocator);
+        if (env_chrome_args) |ca| {
+            var it = std.mem.tokenizeScalar(u8, ca, ' ');
+            while (it.next()) |tok| extra_args_list.append(allocator, tok) catch {};
+        }
+        if (env_ignore_https) extra_args_list.append(allocator, "--ignore-certificate-errors") catch {};
         chrome_proc = chrome.ChromeProcess.launch(allocator, .{
             .headless = !is_headed,
+            .executable_path = env_executable,
+            .extra_args = extra_args_list.items,
             .proxy = env_proxy,
             .proxy_bypass = env_proxy_bypass,
             .extensions = env_extensions,
@@ -2170,7 +2806,7 @@ fn runDaemon() void {
     var session_id: ?[]u8 = null;
     defer if (session_id) |s| allocator.free(s);
 
-    const is_external = ext_port != null or env_auto_connect;
+    const is_external = ext_port != null or env_cdp_url != null or env_auto_connect;
 
     if (is_external) {
         // External Chrome/Electron: find existing page target and attach to it
@@ -2466,7 +3102,17 @@ fn runDaemon() void {
         .trace_active = &trace_active,
         .trace_mutex = &trace_mutex,
         .video_recorder = &video_recorder,
+        .cdp_url = ws_url,
+        .tab_labels = std.StringHashMap([]u8).init(allocator),
     };
+    defer {
+        var lit = shared_ctx.tab_labels.iterator();
+        while (lit.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        shared_ctx.tab_labels.deinit();
+    }
 
     const MAX_WORKERS = 8;
     var worker_slots: [MAX_WORKERS]WorkerSlot = .{WorkerSlot{}} ** MAX_WORKERS;
@@ -2961,6 +3607,10 @@ const DaemonContext = struct {
     trace_active: *std.atomic.Value(bool),
     trace_mutex: *std.Thread.Mutex,
     video_recorder: *VideoRecorder,
+    cdp_url: []const u8 = "", // 연결된 CDP WebSocket URL (get cdp-url)
+    last_snapshot: ?[]u8 = null, // diff snapshot 세션 베이스라인 (allocator 소유)
+    tab_labels: std.StringHashMap([]u8), // tab new --label: label→targetId (키·값 allocator 소유)
+    tab_labels_mutex: std.Thread.Mutex = .{}, // tab_labels 동시 접근 보호 (워커 풀)
 };
 
 /// Send a CDP command and wait for the response. Returns raw message bytes (caller must free).
@@ -3337,10 +3987,11 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "network_list")) {
         collector_mutex.lock();
         defer collector_mutex.unlock();
-        return handleNetworkList(allocator, collector, req.pattern);
+        return handleNetworkList(allocator, collector, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "network_get")) {
         return handleNetworkGet(allocator, sender, resp_map, cmd_id, session_id, collector, collector_mutex, req.url);
-    } else if (std.mem.eql(u8, req.action, "network_clear")) {
+    } else if (std.mem.eql(u8, req.action, "network_clear") or std.mem.eql(u8, req.action, "har_start")) {
+        // har_start: 새 캡처 시작 = 수집기 초기화 (network은 상시 활성)
         collector_mutex.lock();
         defer collector_mutex.unlock();
         collector.deinit();
@@ -3365,7 +4016,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lock();
         defer ctx.ref_map_rwlock.unlock();
         const with_urls = if (req.pattern) |p| std.mem.eql(u8, p, SNAPSHOT_URLS_FLAG) else false;
-        return handleSnapshot(allocator, sender, resp_map, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"), with_urls);
+        return handleSnapshot(allocator, sender, resp_map, cmd_id, session_id, ref_map, std.mem.eql(u8, req.action, "snapshot_interactive"), with_urls, req.extra);
     } else if (std.mem.eql(u8, req.action, "click") or std.mem.eql(u8, req.action, "hover")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -3440,10 +4091,12 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
                 }
             }
         }
-        return handleSimpleCdpWithParams(allocator, sender, cmd_id, session_id, "Target.createTarget", req.url);
-        // NOTE: extra closing brace was needed for the if(ctx.allowed_domains) block — but the structure above closes correctly
+        // req.url = url, req.pattern = --label 이름
+        return handleTabNew(ctx, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "tab_close")) {
-        return handleTabClose(allocator, sender, resp_map, cmd_id, session_id, req.url);
+        const tref = resolveTabLabelRefDup(ctx, req.url);
+        defer if (tref) |t| allocator.free(t);
+        return handleTabClose(allocator, sender, resp_map, cmd_id, session_id, tref);
     } else if (std.mem.eql(u8, req.action, "cookies_list")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "JSON.stringify(document.cookie)");
     } else if (std.mem.eql(u8, req.action, "cookies_clear")) {
@@ -3453,9 +4106,9 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "cookies_set_bulk")) {
         return handleCookieSetBulk(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "set_viewport")) {
-        return handleSetViewport(allocator, sender, cmd_id, session_id, req.url, req.pattern);
+        return handleSetViewport(allocator, sender, cmd_id, session_id, req.url, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "set_media")) {
-        return handleSetMedia(allocator, sender, cmd_id, session_id, req.url);
+        return handleSetMedia(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "set_offline")) {
         return handleSetOffline(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "set_user_agent")) {
@@ -3477,7 +4130,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "mouse")) {
         return handleMouse(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "screenshot")) {
-        return handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, req.url);
+        return handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, req.url, req.extra);
     } else if (std.mem.eql(u8, req.action, "screenshot_full")) {
         return handleScreenshotFull(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "eval")) {
@@ -3507,6 +4160,16 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "document.title");
+    } else if (std.mem.eql(u8, req.action, "cdp_url")) {
+        var resp: std.ArrayList(u8) = .empty;
+        defer resp.deinit(allocator);
+        cdp.writeJsonString(resp.writer(allocator), ctx.cdp_url) catch return respondErr(allocator, "write error");
+        return daemon.serializeResponse(allocator, .{ .success = true, .data = resp.items }) catch respondErr(allocator, "resp error");
+    } else if (std.mem.eql(u8, req.action, "count")) {
+        const sel = req.url orelse return respondErr(allocator, "selector required");
+        const expr = buildCountExpr(allocator, sel) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(expr);
+        return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
     } else if (std.mem.eql(u8, req.action, "wait")) {
         const ms_str = req.url orelse "1000";
         const ms = std.fmt.parseInt(u32, ms_str, 10) catch 1000;
@@ -3520,6 +4183,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         collector_mutex.lock();
         defer collector_mutex.unlock();
         return handleDiff(allocator, collector, req.url);
+    } else if (std.mem.eql(u8, req.action, "diff_snapshot")) {
+        ctx.ref_map_rwlock.lock();
+        defer ctx.ref_map_rwlock.unlock();
+        return handleDiffSnapshot(ctx, req);
+    } else if (std.mem.eql(u8, req.action, "diff_url")) {
+        ctx.ref_map_rwlock.lock();
+        defer ctx.ref_map_rwlock.unlock();
+        return handleDiffUrl(ctx, req);
     } else if (std.mem.eql(u8, req.action, "intercept_mock")) {
         ctx.intercept_mutex.lock();
         defer ctx.intercept_mutex.unlock();
@@ -3563,7 +4234,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "find")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
-        return handleFind(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url, req.pattern);
+        return handleFind(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url, req.pattern, req.extra);
     } else if (std.mem.eql(u8, req.action, "dialog_accept")) {
         return handleDialogAccept(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "dialog_dismiss")) {
@@ -3604,6 +4275,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleStateLoad(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "state_list")) {
         return handleStateList(allocator);
+    } else if (std.mem.eql(u8, req.action, "state_clear")) {
+        return handleStateClear(allocator, req.url, req.pattern);
+    } else if (std.mem.eql(u8, req.action, "state_show")) {
+        return handleStateShow(allocator, req.url);
+    } else if (std.mem.eql(u8, req.action, "state_clean")) {
+        return handleStateClean(allocator, req.url);
+    } else if (std.mem.eql(u8, req.action, "state_rename")) {
+        return handleStateRename(allocator, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "addstyle")) {
         return handleAddStyle(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "check")) {
@@ -3635,7 +4314,9 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "clipboard_set")) {
         return handleClipboardSet(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "tab_switch")) {
-        return handleTabSwitch(allocator, sender, resp_map, cmd_id, session_id, req.url);
+        const tref = resolveTabLabelRefDup(ctx, req.url);
+        defer if (tref) |t| allocator.free(t);
+        return handleTabSwitch(allocator, sender, resp_map, cmd_id, session_id, tref);
     } else if (std.mem.eql(u8, req.action, "window_new")) {
         return handleWindowNew(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "pause")) {
@@ -3728,7 +4409,61 @@ fn handleOpen(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, s
     return respondOk(allocator);
 }
 
-fn handleNetworkList(allocator: Allocator, collector: *network.Collector, pattern: ?[]const u8) []u8 {
+const NetFilter = struct {
+    url: ?[]const u8 = null, // URL 부분 문자열
+    rtype: ?[]const u8 = null, // resourceType (대소문자 무시)
+    method: ?[]const u8 = null, // HTTP 메서드 (대소문자 무시)
+    status: ?[]const u8 = null, // "404" 정확히 또는 "4xx" 클래스
+};
+
+/// status 필터: "404" 정확 매치, "4xx"/"4XX" 백 자리 클래스 매치.
+fn netStatusMatches(s: ?i64, want: []const u8) bool {
+    const code = s orelse return false;
+    if (want.len == 3 and (want[1] == 'x' or want[1] == 'X') and (want[2] == 'x' or want[2] == 'X')) {
+        const cls = std.fmt.charToDigit(want[0], 10) catch return false;
+        return @divTrunc(code, 100) == cls;
+    }
+    const n = std.fmt.parseInt(i64, want, 10) catch return false;
+    return code == n;
+}
+
+fn netMatches(info: network.RequestInfo, f: NetFilter) bool {
+    if (f.url) |u| if (std.mem.indexOf(u8, info.url, u) == null) return false;
+    if (f.rtype) |t| if (!std.ascii.eqlIgnoreCase(info.resource_type, t)) return false;
+    if (f.method) |m| if (!std.ascii.eqlIgnoreCase(info.method, m)) return false;
+    if (f.status) |st| if (!netStatusMatches(info.status, st)) return false;
+    return true;
+}
+
+/// network requests 필터 JSON `{"type":..,"method":..,"status":..}` 파싱.
+/// url(부분 문자열)은 별도 pattern 파라미터로 전달됨.
+fn parseNetFilterExtra(parsed: std.json.Value, url: ?[]const u8) NetFilter {
+    var f = NetFilter{ .url = url };
+    if (parsed != .object) return f;
+    if (parsed.object.get("type")) |v| {
+        if (v == .string and v.string.len > 0) f.rtype = v.string;
+    }
+    if (parsed.object.get("method")) |v| {
+        if (v == .string and v.string.len > 0) f.method = v.string;
+    }
+    if (parsed.object.get("status")) |v| {
+        if (v == .string and v.string.len > 0) f.status = v.string;
+    }
+    return f;
+}
+
+fn handleNetworkList(allocator: Allocator, collector: *network.Collector, pattern: ?[]const u8, extra_opt: ?[]const u8) []u8 {
+    var filter = NetFilter{ .url = pattern };
+    var parsed_extra: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_extra) |p| p.deinit();
+    if (extra_opt) |ex| {
+        parsed_extra = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch null;
+        if (parsed_extra) |p| filter = parseNetFilterExtra(p.value, pattern);
+    }
+    return handleNetworkListFiltered(allocator, collector, filter);
+}
+
+fn handleNetworkListFiltered(allocator: Allocator, collector: *network.Collector, filter: NetFilter) []u8 {
     var buf: std.ArrayList(u8) = .empty;
     defer buf.deinit(allocator);
     const writer = buf.writer(allocator);
@@ -3739,9 +4474,7 @@ fn handleNetworkList(allocator: Allocator, collector: *network.Collector, patter
     while (it.next()) |entry| {
         const info = entry.value_ptr.info;
 
-        if (pattern) |p| {
-            if (std.mem.indexOf(u8, info.url, p) == null) continue;
-        }
+        if (!netMatches(info, filter)) continue;
 
         if (!first) writer.writeByte(',') catch {};
         first = false;
@@ -3973,15 +4706,123 @@ fn resolveElementHref(allocator: Allocator, sender: *WsSender, resp_map: *respon
     return null;
 }
 
-fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool) []u8 {
-    // Clear old refs
+/// 두 텍스트의 라인 단위 diff (LCS). `- `/`+ `/`  ` 접두 + 끝에 요약 1줄.
+/// 스냅샷은 수십~수백 줄이라 O(n*m) DP 허용. 호출자가 free.
+fn diffLines(allocator: Allocator, old_text: []const u8, new_text: []const u8) ![]u8 {
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    defer old_lines.deinit(allocator);
+    var new_lines: std.ArrayList([]const u8) = .empty;
+    defer new_lines.deinit(allocator);
+    {
+        var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, old_text, "\n"), '\n');
+        while (it.next()) |l| try old_lines.append(allocator, l);
+    }
+    {
+        var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, new_text, "\n"), '\n');
+        while (it.next()) |l| try new_lines.append(allocator, l);
+    }
+    const a = old_lines.items;
+    const b = new_lines.items;
+    const n = a.len;
+    const m = b.len;
+
+    // LCS DP 테이블 (n+1)*(m+1)
+    const lcs = try allocator.alloc(usize, (n + 1) * (m + 1));
+    defer allocator.free(lcs);
+    @memset(lcs, 0);
+    const idx = struct {
+        fn at(i: usize, j: usize, w: usize) usize {
+            return i * (w + 1) + j;
+        }
+    }.at;
+    var i: usize = n;
+    while (i > 0) : (i -= 1) {
+        var j: usize = m;
+        while (j > 0) : (j -= 1) {
+            if (std.mem.eql(u8, a[i - 1], b[j - 1])) {
+                lcs[idx(i - 1, j - 1, m)] = lcs[idx(i, j, m)] + 1;
+            } else {
+                lcs[idx(i - 1, j - 1, m)] = @max(lcs[idx(i, j - 1, m)], lcs[idx(i - 1, j, m)]);
+            }
+        }
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    var added: usize = 0;
+    var removed: usize = 0;
+    var same: usize = 0;
+    var x: usize = 0;
+    var y: usize = 0;
+    while (x < n and y < m) {
+        if (std.mem.eql(u8, a[x], b[y])) {
+            try w.print("  {s}\n", .{a[x]});
+            same += 1;
+            x += 1;
+            y += 1;
+        } else if (lcs[idx(x + 1, y, m)] >= lcs[idx(x, y + 1, m)]) {
+            try w.print("- {s}\n", .{a[x]});
+            removed += 1;
+            x += 1;
+        } else {
+            try w.print("+ {s}\n", .{b[y]});
+            added += 1;
+            y += 1;
+        }
+    }
+    while (x < n) : (x += 1) {
+        try w.print("- {s}\n", .{a[x]});
+        removed += 1;
+    }
+    while (y < m) : (y += 1) {
+        try w.print("+ {s}\n", .{b[y]});
+        added += 1;
+    }
+    try w.print("({d} added, {d} removed, {d} unchanged)", .{ added, removed, same });
+    return out.toOwnedSlice(allocator);
+}
+
+/// extra JSON을 한 번만 파싱해 snapshot/diff 옵션 전부 해석.
+/// selector가 주어졌으나 DOM에서 못 찾으면 sel_missing=true.
+/// baseline은 owned 복사 — 호출자가 free.
+const SnapOptsResult = struct {
+    opts: snapshot_mod.SnapOpts,
+    sel_missing: bool = false,
+    interactive: bool = false,
+    baseline: ?[]u8 = null,
+};
+fn resolveSnapOpts(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, extra_opt: ?[]const u8) SnapOptsResult {
+    var opts = snapshot_mod.SnapOpts{};
+    const ex = extra_opt orelse return .{ .opts = opts };
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch return .{ .opts = opts };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .opts = opts };
+    const obj = parsed.value.object;
+    if (obj.get("depth")) |dv| {
+        if (dv == .integer and dv.integer > 0) opts.max_depth = @intCast(dv.integer);
+    }
+    const interactive = if (obj.get("interactive")) |iv| (iv == .bool and iv.bool) else false;
+    const baseline: ?[]u8 = if (obj.get("baseline")) |bv|
+        (if (bv == .string and bv.string.len > 0) (allocator.dupe(u8, bv.string) catch null) else null)
+    else
+        null;
+    if (obj.get("selector")) |sv| {
+        if (sv == .string and sv.string.len > 0) {
+            opts.root_backend_id = resolveSelectorBackendId(allocator, sender, resp_map, cmd_id, session_id, sv.string);
+            if (opts.root_backend_id == null) return .{ .opts = opts, .sel_missing = true, .interactive = interactive, .baseline = baseline };
+        }
+    }
+    return .{ .opts = opts, .interactive = interactive, .baseline = baseline };
+}
+
+/// 현재 페이지의 스냅샷 텍스트(원문)를 캡처. 실패 시 null. 호출자가 free.
+fn captureSnapshotText(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool, snap_opts: snapshot_mod.SnapOpts) ?[]u8 {
     ref_map.deinit();
     ref_map.* = snapshot_mod.RefMap.init(allocator);
 
-    // Step 1: Detect cursor-interactive elements (best-effort)
     var cursor_map = findCursorInteractiveElements(allocator, sender, resp_map, cmd_id, session_id);
     defer if (cursor_map) |*cm| {
-        // Free allocated strings in the map
         var it = cm.iterator();
         while (it.next()) |entry| {
             allocator.free(@constCast(entry.value_ptr.kind));
@@ -3991,62 +4832,136 @@ fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_m
         cm.deinit();
     };
 
-    // Get AX tree
     const snap_sent_id = cmd_id.next();
-    const cmd = cdp.serializeCommand(allocator, snap_sent_id, "Accessibility.getFullAXTree", null, session_id) catch
-        return respondErr(allocator, "cmd error");
+    const cmd = cdp.serializeCommand(allocator, snap_sent_id, "Accessibility.getFullAXTree", null, session_id) catch return null;
     defer allocator.free(cmd);
-
-    const raw = sendAndWait(sender, resp_map, cmd, snap_sent_id, 15_000) orelse
-        return respondErr(allocator, "snapshot timeout");
+    const raw = sendAndWait(sender, resp_map, cmd, snap_sent_id, 15_000) orelse return null;
     defer allocator.free(raw);
-
-    const parsed = cdp.parseMessage(allocator, raw) catch
-        return respondErr(allocator, "parse error");
+    const parsed = cdp.parseMessage(allocator, raw) catch return null;
     defer parsed.parsed.deinit();
+    if (!parsed.message.isResponse()) return null;
+    const result = parsed.message.result orelse return null;
 
-    if (parsed.message.isResponse()) {
-        if (parsed.message.result) |result| {
-            const cursor_ptr: ?*const snapshot_mod.CursorElementMap = if (cursor_map) |*cm| cm else null;
-
-            // --urls: link 요소의 href를 backendNodeId 기준으로 미리 해석
-            var link_url_map = std.AutoHashMap(i64, []const u8).init(allocator);
-            defer {
-                var uit = link_url_map.iterator();
-                while (uit.next()) |e| allocator.free(@constCast(e.value_ptr.*));
-                link_url_map.deinit();
-            }
-            if (with_urls) {
-                if (collectLinkBackendIds(allocator, result)) |ids| {
-                    defer allocator.free(ids);
-                    for (ids) |bid| {
-                        if (link_url_map.contains(bid)) continue;
-                        if (resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, bid)) |href| {
-                            link_url_map.put(bid, href) catch allocator.free(href);
-                        }
-                    }
-                } else |_| {}
-            }
-            const url_ptr: ?*const std.AutoHashMap(i64, []const u8) = if (with_urls) &link_url_map else null;
-
-            const snap = snapshot_mod.buildSnapshot(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr) catch
-                return respondErr(allocator, "snapshot build error");
-            defer allocator.free(snap);
-
-            // Return snapshot text as JSON string
-            var resp_buf: std.ArrayList(u8) = .empty;
-            defer resp_buf.deinit(allocator);
-            cdp.writeJsonString(resp_buf.writer(allocator), snap) catch
-                return respondErr(allocator, "serialize error");
-
-            const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-            defer allocator.free(data);
-
-            return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
-                respondErr(allocator, "resp error");
-        }
+    const cursor_ptr: ?*const snapshot_mod.CursorElementMap = if (cursor_map) |*cm| cm else null;
+    var link_url_map = std.AutoHashMap(i64, []const u8).init(allocator);
+    defer {
+        var uit = link_url_map.iterator();
+        while (uit.next()) |e| allocator.free(@constCast(e.value_ptr.*));
+        link_url_map.deinit();
     }
-    return respondErr(allocator, "snapshot failed");
+    if (with_urls) {
+        if (collectLinkBackendIds(allocator, result)) |ids| {
+            defer allocator.free(ids);
+            for (ids) |bid| {
+                if (link_url_map.contains(bid)) continue;
+                if (resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, bid)) |href| {
+                    link_url_map.put(bid, href) catch allocator.free(href);
+                }
+            }
+        } else |_| {}
+    }
+    const url_ptr: ?*const std.AutoHashMap(i64, []const u8) = if (with_urls) &link_url_map else null;
+    return snapshot_mod.buildSnapshotWithOpts(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr, snap_opts) catch null;
+}
+
+fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool, extra_opt: ?[]const u8) []u8 {
+    const so = resolveSnapOpts(allocator, sender, resp_map, cmd_id, session_id, extra_opt);
+    defer if (so.baseline) |b| allocator.free(b);
+    if (so.sel_missing) return respondErr(allocator, "snapshot --selector: element not found");
+
+    const snap = captureSnapshotText(allocator, sender, resp_map, cmd_id, session_id, ref_map, interactive_only, with_urls, so.opts) orelse
+        return respondErr(allocator, "snapshot failed");
+    defer allocator.free(snap);
+
+    var resp_buf: std.ArrayList(u8) = .empty;
+    defer resp_buf.deinit(allocator);
+    cdp.writeJsonString(resp_buf.writer(allocator), snap) catch
+        return respondErr(allocator, "serialize error");
+    const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "resp error");
+}
+
+/// diff 결과 텍스트를 JSON 문자열 data로 응답.
+fn respondDiffText(allocator: Allocator, diff_text: []const u8) []u8 {
+    var rb: std.ArrayList(u8) = .empty;
+    defer rb.deinit(allocator);
+    cdp.writeJsonString(rb.writer(allocator), diff_text) catch return respondErr(allocator, "serialize error");
+    const data = rb.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+}
+
+/// diff snapshot: 현재 스냅샷 vs (--baseline 파일 | 세션 직전 스냅샷).
+fn handleDiffSnapshot(ctx: *DaemonContext, req: daemon.Request) []u8 {
+    const a = ctx.allocator;
+    const so = resolveSnapOpts(a, ctx.sender, ctx.response_map, ctx.cmd_id, ctx.session_id, req.extra);
+    defer if (so.baseline) |b| a.free(b);
+    if (so.sel_missing) return respondErr(a, "diff snapshot --selector: element not found");
+
+    const cur = captureSnapshotText(a, ctx.sender, ctx.response_map, ctx.cmd_id, ctx.session_id, ctx.ref_map, so.interactive, false, so.opts) orelse
+        return respondErr(a, "diff snapshot: capture failed");
+    defer a.free(cur);
+
+    // baseline: --baseline 파일 우선, 없으면 세션 직전 스냅샷
+    var baseline_owned: ?[]u8 = null;
+    defer if (baseline_owned) |b| a.free(b);
+    const baseline: []const u8 = blk: {
+        if (so.baseline) |path| {
+            baseline_owned = std.fs.cwd().readFileAlloc(a, path, 16 * 1024 * 1024) catch
+                return respondErr(a, "diff snapshot: cannot read baseline file");
+            break :blk baseline_owned.?;
+        }
+        break :blk ctx.last_snapshot orelse {
+            // 베이스라인 없음 → 현재를 베이스라인으로 저장하고 안내
+            if (ctx.last_snapshot) |old| a.free(old);
+            ctx.last_snapshot = a.dupe(u8, cur) catch null;
+            return respondDiffText(a, "(no baseline yet — current snapshot saved as baseline)");
+        };
+    };
+
+    const diff_text = diffLines(a, baseline, cur) catch return respondErr(a, "diff error");
+    defer a.free(diff_text);
+
+    // 세션 베이스라인 갱신 (다음 diff는 이번 스냅샷 기준)
+    if (ctx.last_snapshot) |old| a.free(old);
+    ctx.last_snapshot = a.dupe(u8, cur) catch null;
+
+    return respondDiffText(a, diff_text);
+}
+
+/// diff url <u1> <u2>: 두 URL의 스냅샷을 순차 캡처해 비교.
+fn handleDiffUrl(ctx: *DaemonContext, req: daemon.Request) []u8 {
+    const a = ctx.allocator;
+    const url1 = req.url orelse return respondErr(a, "diff url: url1 required");
+    const url2 = req.pattern orelse return respondErr(a, "diff url: url2 required");
+    const so = resolveSnapOpts(a, ctx.sender, ctx.response_map, ctx.cmd_id, ctx.session_id, req.extra);
+    defer if (so.baseline) |b| a.free(b);
+    const interactive = so.interactive;
+    // selector는 페이지마다 별도 해석돼야 하므로 여기선 depth만 사용 (selector는
+    // u1에서 해석된 backendId가 u2엔 무의미) → root_backend_id 무시
+    var opts = so.opts;
+    opts.root_backend_id = null;
+
+    const cap = struct {
+        fn go(c: *DaemonContext, url: []const u8, o: snapshot_mod.SnapOpts, intr: bool) ?[]u8 {
+            const r1 = handleOpen(c.allocator, c.sender, c.cmd_id, c.session_id, url, c.allowed_domains);
+            c.allocator.free(r1);
+            const r2 = handleWaitLoad(c.allocator, c.sender, c.response_map, c.cmd_id, c.session_id, "15000");
+            c.allocator.free(r2);
+            return captureSnapshotText(c.allocator, c.sender, c.response_map, c.cmd_id, c.session_id, c.ref_map, intr, false, o);
+        }
+    }.go;
+
+    const s1 = cap(ctx, url1, opts, interactive) orelse return respondErr(a, "diff url: capture of url1 failed");
+    defer a.free(s1);
+    const s2 = cap(ctx, url2, opts, interactive) orelse return respondErr(a, "diff url: capture of url2 failed");
+    defer a.free(s2);
+
+    const diff_text = diffLines(a, s1, s2) catch return respondErr(a, "diff error");
+    defer a.free(diff_text);
+    return respondDiffText(a, diff_text);
 }
 
 /// JS script to detect non-ARIA interactive elements (cursor:pointer, onclick, tabindex, contenteditable).
@@ -4730,6 +5645,62 @@ fn handleDrag(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
 }
 
 /// DOM.resolveNode → objectId. Caller must free the returned slice.
+/// CSS selector → backendNodeId. DOM.getDocument → DOM.querySelector →
+/// describeNode. 미발견/오류 시 null. (snapshot --selector)
+fn resolveSelectorBackendId(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, selector: []const u8) ?i64 {
+    // 1. DOM.getDocument → root nodeId
+    const doc_id = cmd_id.next();
+    const doc_cmd = cdp.serializeCommand(allocator, doc_id, "DOM.getDocument", "{\"depth\":0}", session_id) catch return null;
+    defer allocator.free(doc_cmd);
+    const doc_raw = sendAndWait(sender, resp_map, doc_cmd, doc_id, 5_000) orelse return null;
+    defer allocator.free(doc_raw);
+    const doc_parsed = cdp.parseMessage(allocator, doc_raw) catch return null;
+    defer doc_parsed.parsed.deinit();
+    const root_nid: i64 = blk: {
+        if (doc_parsed.message.isResponse()) if (doc_parsed.message.result) |r|
+            if (cdp.getObject(r, "root")) |root|
+                if (cdp.getInt(root, "nodeId")) |nid| break :blk nid;
+        return null;
+    };
+
+    // 2. DOM.querySelector(root, selector) → nodeId
+    var qp: std.ArrayList(u8) = .empty;
+    defer qp.deinit(allocator);
+    const qw = qp.writer(allocator);
+    qw.print("{{\"nodeId\":{d},\"selector\":", .{root_nid}) catch return null;
+    cdp.writeJsonString(qw, selector) catch return null;
+    qw.writeByte('}') catch return null;
+    const qs_id = cmd_id.next();
+    const qs_cmd = cdp.serializeCommand(allocator, qs_id, "DOM.querySelector", qp.items, session_id) catch return null;
+    defer allocator.free(qs_cmd);
+    const qs_raw = sendAndWait(sender, resp_map, qs_cmd, qs_id, 5_000) orelse return null;
+    defer allocator.free(qs_raw);
+    const qs_parsed = cdp.parseMessage(allocator, qs_raw) catch return null;
+    defer qs_parsed.parsed.deinit();
+    const node_nid: i64 = blk: {
+        if (qs_parsed.message.isResponse()) if (qs_parsed.message.result) |r|
+            if (cdp.getInt(r, "nodeId")) |nid| {
+                if (nid != 0) break :blk nid;
+            };
+        return null; // 미발견 시 nodeId 0
+    };
+
+    // 3. DOM.describeNode → backendNodeId
+    var dp_buf: [64]u8 = undefined;
+    const dp = std.fmt.bufPrint(&dp_buf, "{{\"nodeId\":{d}}}", .{node_nid}) catch return null;
+    const d_id = cmd_id.next();
+    const d_cmd = cdp.serializeCommand(allocator, d_id, "DOM.describeNode", dp, session_id) catch return null;
+    defer allocator.free(d_cmd);
+    const d_raw = sendAndWait(sender, resp_map, d_cmd, d_id, 5_000) orelse return null;
+    defer allocator.free(d_raw);
+    const d_parsed = cdp.parseMessage(allocator, d_raw) catch return null;
+    defer d_parsed.parsed.deinit();
+    if (d_parsed.message.isResponse()) if (d_parsed.message.result) |r|
+        if (cdp.getObject(r, "node")) |n|
+            if (cdp.getInt(n, "backendNodeId")) |bid| return bid;
+    return null;
+}
+
 fn resolveNodeObjectId(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, backend_id: i64) ?[]u8 {
     var resolve_buf: [128]u8 = undefined;
     const resolve_params = std.fmt.bufPrint(&resolve_buf, "{{\"backendNodeId\":{d}}}", .{backend_id}) catch return null;
@@ -5203,12 +6174,17 @@ fn extractCookieHeaderFromCurl(allocator: Allocator, curl: []const u8) !?[]const
 /// 단일 쿠키 객체 기록. domain이 주어지면 포함(없으면 daemon이 현재 URL 주입).
 /// CDP CookieParam은 url 또는 domain 중 하나가 필요 — 여기선 url을 넣지 않고
 /// daemon(handleCookieSetBulk/handleCookieSet)이 현재 페이지 URL을 채운다.
-fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8, domain: ?[]const u8) !void {
-    if (!first) try w.writeByte(',');
+/// `{"name":<json>,"value":<json>` (객체 시작 + 닫는 `}` 없음) — 쿠키 JSON 공통 머리.
+fn writeCookieNameValue(w: anytype, name: []const u8, value: []const u8) !void {
     try w.writeAll("{\"name\":");
     try cdp.writeJsonString(w, name);
     try w.writeAll(",\"value\":");
     try cdp.writeJsonString(w, value);
+}
+
+fn writeCookieEntry(w: anytype, first: bool, name: []const u8, value: []const u8, domain: ?[]const u8) !void {
+    if (!first) try w.writeByte(',');
+    try writeCookieNameValue(w, name, value);
     if (domain) |d| {
         try w.writeAll(",\"domain\":");
         try cdp.writeJsonString(w, d);
@@ -5372,11 +6348,13 @@ fn handleCookieSetBulk(allocator: Allocator, sender: *WsSender, resp_map: *respo
     return respondOk(allocator);
 }
 
-fn handleSetViewport(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, width_str: ?[]const u8, height_str: ?[]const u8) []u8 {
+fn handleSetViewport(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, width_str: ?[]const u8, height_str: ?[]const u8, scale_str: ?[]const u8) []u8 {
     const w = std.fmt.parseInt(i32, width_str orelse "1280", 10) catch 1280;
     const h = std.fmt.parseInt(i32, height_str orelse "720", 10) catch 720;
+    // set viewport <w> <h> [scale] — deviceScaleFactor (기본 1)
+    const scale = if (scale_str) |s| (std.fmt.parseFloat(f64, s) catch 1.0) else 1.0;
     var buf: [128]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":1,\"mobile\":false}}", .{ w, h }) catch
+    const params = std.fmt.bufPrint(&buf, "{{\"width\":{d},\"height\":{d},\"deviceScaleFactor\":{d},\"mobile\":false}}", .{ w, h, scale }) catch
         return respondErr(allocator, "format error");
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Emulation.setDeviceMetricsOverride", params, session_id) catch
         return respondErr(allocator, "cmd error");
@@ -5385,15 +6363,27 @@ fn handleSetViewport(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Comma
     return respondOk(allocator);
 }
 
-fn handleSetMedia(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, scheme: ?[]const u8) []u8 {
-    const s = scheme orelse "dark";
+/// Emulation.setEmulatedMedia params. prefers-color-scheme + 선택적
+/// prefers-reduced-motion:reduce (set media <scheme> [reduced-motion]).
+fn buildEmulatedMediaParams(allocator: Allocator, scheme: []const u8, reduced: bool) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(allocator);
+    errdefer buf.deinit(allocator);
     const w = buf.writer(allocator);
-    w.writeAll("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(w, s) catch return respondErr(allocator, "write error");
-    w.writeAll("}]}") catch {};
-    const params = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    try w.writeAll("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":");
+    try cdp.writeJsonString(w, scheme);
+    try w.writeByte('}');
+    if (reduced) try w.writeAll(",{\"name\":\"prefers-reduced-motion\",\"value\":\"reduce\"}");
+    try w.writeAll("]}");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn handleSetMedia(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, scheme: ?[]const u8, reduced_opt: ?[]const u8) []u8 {
+    const s = scheme orelse "dark";
+    const reduced = if (reduced_opt) |rm|
+        (std.mem.eql(u8, rm, "reduced-motion") or std.mem.eql(u8, rm, "reduce"))
+    else
+        false;
+    const params = buildEmulatedMediaParams(allocator, s, reduced) catch return respondErr(allocator, "alloc error");
     defer allocator.free(params);
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Emulation.setEmulatedMedia", params, session_id) catch
         return respondErr(allocator, "cmd error");
@@ -5431,24 +6421,53 @@ fn handleSetUserAgent(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.Comm
     return respondOk(allocator);
 }
 
+const MouseCoords = struct { a: i32, b: i32, button: ?[]const u8 };
+/// 패킹된 coords "a:b" 또는 "a:b:button" 파싱 (move=x:y, wheel=dx:dy).
+fn parseMouseCoords(s: []const u8) MouseCoords {
+    var parts = std.mem.splitScalar(u8, s, ':');
+    const a_str = parts.next() orelse "0";
+    const b_str = parts.next() orelse "0";
+    const btn = parts.next();
+    return .{
+        .a = std.fmt.parseInt(i32, a_str, 10) catch 0,
+        .b = std.fmt.parseInt(i32, b_str, 10) catch 0,
+        .button = if (btn) |x| (if (x.len > 0) x else null) else null,
+    };
+}
+
 fn handleMouse(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, action: ?[]const u8, coords: ?[]const u8) []u8 {
     const act = action orelse "move";
-    const coord_str = coords orelse "0:0";
+    const mc = parseMouseCoords(coords orelse "0:0");
+    const a_val = mc.a;
+    const b_val = mc.b;
+    const btn_part = mc.button;
 
-    // Parse "x:y" packed coords
-    var x: i32 = 0;
-    var y: i32 = 0;
-    if (std.mem.indexOf(u8, coord_str, ":")) |sep| {
-        x = std.fmt.parseInt(i32, coord_str[0..sep], 10) catch 0;
-        y = std.fmt.parseInt(i32, coord_str[sep + 1 ..], 10) catch 0;
-    } else {
-        x = std.fmt.parseInt(i32, coord_str, 10) catch 0;
+    if (std.mem.eql(u8, act, "wheel")) {
+        // mouse wheel <dx> <dy> → 공용 mouseWheel 디스패치
+        return dispatchMouseWheel(allocator, sender, cmd_id, session_id, a_val, b_val);
     }
 
     const mouse_type = if (std.mem.eql(u8, act, "down")) "mousePressed" else if (std.mem.eql(u8, act, "up")) "mouseReleased" else "mouseMoved";
+    // button: left(기본)|right|middle. down/up은 좌표 생략 시 0,0 (현재 위치 의도면 move 선행).
+    const button: []const u8 = if (btn_part) |b|
+        (if (std.mem.eql(u8, b, "right") or std.mem.eql(u8, b, "middle")) b else "left")
+    else
+        "left";
 
-    var buf: [128]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"left\"}}", .{ mouse_type, x, y }) catch
+    var buf: [160]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"{s}\",\"x\":{d},\"y\":{d},\"button\":\"{s}\",\"buttons\":1}}", .{ mouse_type, a_val, b_val, button }) catch
+        return respondErr(allocator, "format error");
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
+/// Input.dispatchMouseEvent type:mouseWheel 디스패치 (handleScroll/handleMouse 공용).
+fn dispatchMouseWheel(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, delta_x: i32, delta_y: i32) []u8 {
+    var buf: [160]u8 = undefined;
+    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"mouseWheel\",\"x\":400,\"y\":300,\"deltaX\":{d},\"deltaY\":{d}}}", .{ delta_x, delta_y }) catch
         return respondErr(allocator, "format error");
     const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
         return respondErr(allocator, "cmd error");
@@ -5459,22 +6478,10 @@ fn handleMouse(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, 
 
 fn handleScroll(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, dir_opt: ?[]const u8, px_opt: ?[]const u8) []u8 {
     const direction = dir_opt orelse "down";
-    const px_str = px_opt orelse "300";
-    const px = std.fmt.parseInt(i32, px_str, 10) catch 300;
-
+    const px = std.fmt.parseInt(i32, px_opt orelse "300", 10) catch 300;
     const delta_x: i32 = if (std.mem.eql(u8, direction, "left")) -px else if (std.mem.eql(u8, direction, "right")) px else 0;
     const delta_y: i32 = if (std.mem.eql(u8, direction, "up")) -px else if (std.mem.eql(u8, direction, "down")) px else 0;
-
-    var buf: [256]u8 = undefined;
-    const params = std.fmt.bufPrint(&buf, "{{\"type\":\"mouseWheel\",\"x\":400,\"y\":300,\"deltaX\":{d},\"deltaY\":{d}}}", .{ delta_x, delta_y }) catch
-        return respondErr(allocator, "format error");
-
-    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchMouseEvent", params, session_id) catch
-        return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd);
-    sender.sendText(cmd) catch {};
-
-    return respondOk(allocator);
+    return dispatchMouseWheel(allocator, sender, cmd_id, session_id, delta_x, delta_y);
 }
 
 fn handleStorage(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, action: []const u8, key: ?[]const u8, value: ?[]const u8) []u8 {
@@ -5595,11 +6602,83 @@ fn handleGetElementProp(allocator: Allocator, sender: *WsSender, resp_map: *resp
     return respondErr(allocator, "get property timeout");
 }
 
-fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
+const ElementRect = struct { x: f64, y: f64, width: f64, height: f64 };
+
+/// querySelector 요소의 페이지 좌표 rect를 "x,y,w,h" CSV로 반환하는 JS 표현식.
+/// selector는 JSON 인코딩(인젝션 안전), 미발견 시 빈 문자열.
+fn buildRectExpr(allocator: Allocator, selector: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("(function(){var e=document.querySelector(");
+    try cdp.writeJsonString(w, selector);
+    try w.writeAll(");if(!e)return'';var r=e.getBoundingClientRect();" ++
+        "return [r.left+scrollX,r.top+scrollY,r.width,r.height].join(',')})()");
+    return buf.toOwnedSlice(allocator);
+}
+
+fn parseRectCsv(s: []const u8) ?ElementRect {
+    var it = std.mem.splitScalar(u8, s, ',');
+    const x = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    const y = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    const wd = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    const ht = std.fmt.parseFloat(f64, it.next() orelse return null) catch return null;
+    if (it.next() != null) return null;
+    return .{ .x = x, .y = y, .width = wd, .height = ht };
+}
+
+const ScreenshotOpts = struct {
+    selector: ?[]const u8 = null,
+    format: []const u8 = "png", // png|jpeg|webp
+    quality: ?u32 = null,
+    full_page: bool = false,
+};
+
+/// CDP Page.captureScreenshot params JSON. clip(요소 영역) 우선, 없고 full_page면
+/// 전체 페이지. quality는 png가 아닐 때만 적용 (agent-browser와 동일).
+fn buildScreenshotParams(allocator: Allocator, opts: ScreenshotOpts, clip: ?ElementRect) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"format\":");
+    try cdp.writeJsonString(w, opts.format);
+    if (opts.quality) |q| {
+        if (!std.mem.eql(u8, opts.format, "png")) try w.print(",\"quality\":{d}", .{q});
+    }
+    if (clip) |c| {
+        // clip 좌표는 페이지(문서) 기준 CSS px (buildRectExpr가 scrollX/Y 가산).
+        // captureBeyondViewport로 스크롤 밖 요소도 정확히 캡처.
+        try w.print(",\"clip\":{{\"x\":{d},\"y\":{d},\"width\":{d},\"height\":{d},\"scale\":1}},\"captureBeyondViewport\":true", .{ c.x, c.y, c.width, c.height });
+    } else if (opts.full_page) {
+        try w.writeAll(",\"captureBeyondViewport\":true,\"fromSurface\":true");
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// screenshot opts JSON (`{"sel":..,"fmt":..,"q":..,"full":..}`) 파싱.
+fn parseScreenshotOpts(parsed: std.json.Value) ScreenshotOpts {
+    var o = ScreenshotOpts{};
+    if (parsed != .object) return o;
+    if (parsed.object.get("sel")) |v| {
+        if (v == .string and v.string.len > 0) o.selector = v.string;
+    }
+    if (parsed.object.get("fmt")) |v| {
+        if (v == .string and v.string.len > 0) o.format = v.string;
+    }
+    if (parsed.object.get("q")) |v| {
+        if (v == .integer and v.integer > 0) o.quality = @intCast(v.integer);
+    }
+    if (parsed.object.get("full")) |v| {
+        if (v == .bool) o.full_page = v.bool;
+    }
+    return o;
+}
+
+/// 공통: Page.captureScreenshot 전송 → 응답을 파일 저장 또는 base64로 반환.
+fn captureScreenshotRespond(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, params: []const u8, path_opt: ?[]const u8) []u8 {
     const sent_id = cmd_id.next();
-    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
-        \\{"format":"png"}
-    , session_id) catch return respondErr(allocator, "cmd error");
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot", params, session_id) catch return respondErr(allocator, "cmd error");
     defer allocator.free(cmd);
 
     const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
@@ -5656,65 +6735,35 @@ fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response
     return respondErr(allocator, "screenshot timeout");
 }
 
-fn handleScreenshotFull(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
-    const sent_id = cmd_id.next();
-    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.captureScreenshot",
-        \\{"format":"png","captureBeyondViewport":true,"fromSurface":true}
-    , session_id) catch return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd);
-
-    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 15_000) orelse
-        return respondErr(allocator, "screenshot timeout");
-    defer allocator.free(raw);
-
-    const parsed = cdp.parseMessage(allocator, raw) catch
-        return respondErr(allocator, "parse error");
-    defer parsed.parsed.deinit();
-
-    if (parsed.message.isResponse()) {
-        if (parsed.message.result) |result| {
-            if (cdp.getString(result, "data")) |base64_data| {
-                // If path provided, save to file
-                if (path_opt) |file_path| {
-                    const decoded_size = std.base64.standard.Decoder.calcSizeUpperBound(base64_data.len) catch
-                        return respondErr(allocator, "invalid base64");
-                    const buf = allocator.alloc(u8, decoded_size) catch return respondErr(allocator, "alloc error");
-                    defer allocator.free(buf);
-
-                    std.base64.standard.Decoder.decode(buf, base64_data) catch
-                        return respondErr(allocator, "decode error");
-
-                    const file = std.fs.cwd().createFile(file_path, .{}) catch
-                        return respondErr(allocator, "file create error");
-                    defer file.close();
-                    _ = file.write(buf[0..decoded_size]) catch return respondErr(allocator, "write error");
-
-                    var resp_buf2: std.ArrayList(u8) = .empty;
-                    defer resp_buf2.deinit(allocator);
-                    const rw2 = resp_buf2.writer(allocator);
-                    rw2.writeAll("{\"file\":") catch return respondOk(allocator);
-                    cdp.writeJsonString(rw2, file_path) catch return respondOk(allocator);
-                    rw2.print(",\"size\":{d}}}", .{decoded_size}) catch return respondOk(allocator);
-                    const data = resp_buf2.toOwnedSlice(allocator) catch return respondOk(allocator);
-                    defer allocator.free(data);
-                    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondOk(allocator);
-                } else {
-                    // Return base64 data directly
-                    var resp_buf: std.ArrayList(u8) = .empty;
-                    defer resp_buf.deinit(allocator);
-                    const writer = resp_buf.writer(allocator);
-                    writer.writeAll("{\"data\":\"") catch return respondErr(allocator, "write error");
-                    writer.writeAll(base64_data) catch return respondErr(allocator, "write error");
-                    writer.writeAll("\"}") catch {};
-
-                    const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-                    defer allocator.free(data);
-                    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
-                }
-            }
-        }
+/// screenshot: selector(요소 clip)/format/quality 지원. extra_opt = opts JSON.
+fn handleScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8, extra_opt: ?[]const u8) []u8 {
+    var opts = ScreenshotOpts{};
+    var parsed_opts: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_opts) |p| p.deinit();
+    if (extra_opt) |ex| {
+        parsed_opts = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch null;
+        if (parsed_opts) |p| opts = parseScreenshotOpts(p.value);
     }
-    return respondErr(allocator, "screenshot full-page timeout");
+
+    var clip: ?ElementRect = null;
+    if (opts.selector) |sel| {
+        const expr = buildRectExpr(allocator, sel) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(expr);
+        const rect_str = handleEvalRaw(allocator, sender, resp_map, cmd_id, session_id, expr) orelse
+            return respondErr(allocator, "selector eval failed");
+        defer allocator.free(rect_str);
+        clip = parseRectCsv(rect_str) orelse return respondErr(allocator, "selector not found");
+    }
+
+    const params = buildScreenshotParams(allocator, opts, clip) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    return captureScreenshotRespond(allocator, sender, resp_map, cmd_id, session_id, params, path_opt);
+}
+
+fn handleScreenshotFull(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, path_opt: ?[]const u8) []u8 {
+    return captureScreenshotRespond(allocator, sender, resp_map, cmd_id, session_id,
+        \\{"format":"png","captureBeyondViewport":true,"fromSurface":true}
+    , path_opt);
 }
 
 fn handleDiffScreenshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, baseline_path_opt: ?[]const u8, params_opt: ?[]const u8) []u8 {
@@ -6156,9 +7205,189 @@ fn handleStatusFull(allocator: Allocator, collector: *const network.Collector, c
 // Find (Semantic Element Queries)
 // ============================================================================
 
-fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, strategy_opt: ?[]const u8, value_opt: ?[]const u8) []u8 {
+/// strategy → DOM 속성명. placeholder/testid/alt/title 지원.
+fn findAttrName(strategy: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, strategy, "placeholder")) return "placeholder";
+    if (std.mem.eql(u8, strategy, "testid")) return "data-testid";
+    if (std.mem.eql(u8, strategy, "alt")) return "alt";
+    if (std.mem.eql(u8, strategy, "title")) return "title";
+    return null;
+}
+
+/// 한 backend 노드의 DOM 속성값을 해석 (호출자 free). 실패/없음 시 null.
+/// firstAttrRefId 와 find 목록(attr) 경로가 공유 — CDP 파이프라인 1곳화.
+fn resolveEntryAttr(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, backend_id: i64, attr: []const u8) ?[]u8 {
+    const oid = resolveNodeObjectId(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse return null;
+    defer allocator.free(oid);
+    const cp = buildCallFunctionOnParams(allocator, oid, "function(a){return this.getAttribute(a)}", attr) orelse return null;
+    defer allocator.free(cp);
+    const cid = cmd_id.next();
+    const cc = cdp.serializeCommand(allocator, cid, "Runtime.callFunctionOn", cp, session_id) catch return null;
+    defer allocator.free(cc);
+    const raw = sendAndWait(sender, resp_map, cc, cid, 3_000) orelse return null;
+    defer allocator.free(raw);
+    const parsed = cdp.parseMessage(allocator, raw) catch return null;
+    defer parsed.parsed.deinit();
+    if (parsed.message.isResponse()) if (parsed.message.result) |r| {
+        if (cdp.getObject(r, "result")) |ro| if (cdp.getString(ro, "value")) |av| {
+            return allocator.dupe(u8, av) catch null;
+        };
+    };
+    return null;
+}
+
+/// role/text/label 매칭 술어 (목록·액션 경로 공유 — --exact/--name 일관 적용).
+/// role: role 정확 일치 + (name_filter 비어있지 않으면 name이 name_filter
+/// 포함/정확). text/label: name이 value 포함(exact면 정확).
+fn axMatches(role: []const u8, name: []const u8, strategy: []const u8, value: []const u8, exact: bool, name_filter: []const u8) bool {
+    if (std.mem.eql(u8, strategy, "role")) {
+        if (!std.mem.eql(u8, role, value)) return false;
+        if (name_filter.len == 0) return true;
+        return if (exact) std.mem.eql(u8, name, name_filter) else std.mem.indexOf(u8, name, name_filter) != null;
+    }
+    return if (exact) std.mem.eql(u8, name, value) else std.mem.indexOf(u8, name, value) != null;
+}
+
+/// DOM 속성 기반(placeholder/testid/alt/title) 첫 일치 ref_id (포함 매칭).
+fn firstAttrRefId(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, strategy: []const u8, value: []const u8) ?[]const u8 {
+    const attr = findAttrName(strategy) orelse return null;
+    var it = ref_map.entries.iterator();
+    var checked: usize = 0;
+    while (it.next()) |entry| {
+        if (checked >= 200) break;
+        checked += 1;
+        const e = entry.value_ptr.*;
+        const backend_id = e.backend_node_id orelse continue;
+        const av = resolveEntryAttr(allocator, sender, resp_map, cmd_id, session_id, backend_id, attr) orelse continue;
+        defer allocator.free(av);
+        if (std.mem.indexOf(u8, av, value) != null) return e.ref_id;
+    }
+    return null;
+}
+
+/// 해석된 ref에 액션 위임 (click/hover/fill/type/check/text).
+fn dispatchFindAction(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, act: []const u8, ref_id: []const u8, txt: []const u8) []u8 {
+    if (std.mem.eql(u8, act, "click") or std.mem.eql(u8, act, "hover"))
+        return handleClick(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id);
+    if (std.mem.eql(u8, act, "fill") or std.mem.eql(u8, act, "type"))
+        return handleFill(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id, txt);
+    if (std.mem.eql(u8, act, "check"))
+        return handleCheck(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id);
+    if (std.mem.eql(u8, act, "text"))
+        return handleGetElementProp(allocator, sender, resp_map, cmd_id, session_id, ref_map, ref_id, "get_text");
+    return respondErr(allocator, "find: unknown action (click/hover/fill/type/check/text)");
+}
+
+/// find first|last|nth <selector> [action] — querySelectorAll 기반 JS 직접 수행.
+fn handleFindNth(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, strategy: []const u8, selector: []const u8, opts: FindOpts) []u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    w.writeAll("(function(){var els=document.querySelectorAll(") catch return respondErr(allocator, "write error");
+    cdp.writeJsonString(w, selector) catch return respondErr(allocator, "write error");
+    w.writeAll(");if(!els.length)return 'NOMATCH';var i=") catch return respondErr(allocator, "write error");
+    if (std.mem.eql(u8, strategy, "first")) {
+        w.writeAll("0") catch {};
+    } else if (std.mem.eql(u8, strategy, "last")) {
+        w.writeAll("els.length-1") catch {};
+    } else {
+        // nth: 음수 인덱스는 뒤에서부터 (Playwright와 동일)
+        if (opts.idx < 0) {
+            std.fmt.format(w, "els.length{d}", .{opts.idx}) catch {};
+        } else {
+            std.fmt.format(w, "{d}", .{opts.idx}) catch {};
+        }
+    }
+    w.writeAll(";var el=els[i];if(!el)return 'NOMATCH';") catch {};
+    const act = opts.act;
+    if (act.len == 0 or std.mem.eql(u8, act, "click") or std.mem.eql(u8, act, "hover")) {
+        w.writeAll("el.click();return 'OK'})()") catch {};
+    } else if (std.mem.eql(u8, act, "text")) {
+        w.writeAll("return (el.innerText||el.textContent||'')})()") catch {};
+    } else if (std.mem.eql(u8, act, "fill") or std.mem.eql(u8, act, "type")) {
+        w.writeAll("el.focus();el.value=") catch {};
+        cdp.writeJsonString(w, opts.txt) catch {};
+        w.writeAll(";el.dispatchEvent(new Event('input',{bubbles:true}));el.dispatchEvent(new Event('change',{bubbles:true}));return 'OK'})()") catch {};
+    } else if (std.mem.eql(u8, act, "check")) {
+        w.writeAll("if(el.type==='checkbox'||el.type==='radio'){el.checked=true;el.dispatchEvent(new Event('change',{bubbles:true}))}else{el.click()}return 'OK'})()") catch {};
+    } else {
+        // dispatchFindAction과 동일하게 미지원 액션은 에러 (조용한 click 금지)
+        return respondErr(allocator, "find: unknown action (click/hover/fill/type/check/text)");
+    }
+    const expr = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(expr);
+    return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
+}
+
+/// find의 extra(JSON) 파싱 — act/txt/name/exact. (순수, 테스트 가능)
+/// act/txt/name: 빈 문자열은 "" 리터럴(비할당) 센티넬, len>0이면 heap 소유.
+const FindOpts = struct {
+    act: []const u8 = "",
+    txt: []const u8 = "",
+    name: []const u8 = "",
+    exact: bool = false,
+    idx: i64 = 0,
+    fn deinit(self: FindOpts, allocator: Allocator) void {
+        if (self.act.len > 0) allocator.free(@constCast(self.act));
+        if (self.txt.len > 0) allocator.free(@constCast(self.txt));
+        if (self.name.len > 0) allocator.free(@constCast(self.name));
+    }
+};
+fn parseFindOpts(allocator: Allocator, json_opt: ?[]const u8) FindOpts {
+    const j = json_opt orelse return .{};
+    const p = std.json.parseFromSlice(std.json.Value, allocator, j, .{}) catch return .{};
+    defer p.deinit();
+    const dup = struct {
+        fn d(a: Allocator, v: std.json.Value, k: []const u8) []const u8 {
+            const s = cdp.getString(v, k) orelse return "";
+            if (s.len == 0) return "";
+            return a.dupe(u8, s) catch "";
+        }
+    }.d;
+    return .{
+        .act = dup(allocator, p.value, "act"),
+        .txt = dup(allocator, p.value, "txt"),
+        .name = dup(allocator, p.value, "name"),
+        .exact = cdp.getBool(p.value, "exact") orelse false,
+        .idx = cdp.getInt(p.value, "idx") orelse 0,
+    };
+}
+
+/// role/text/label 로케이터로 ref_map에서 첫 일치 ref_id 반환. (순수, 테스트 가능)
+/// role: 정확 일치. text/label: name에 value 포함(exact면 정확 일치).
+fn firstAxRefId(ref_map: *const snapshot_mod.RefMap, strategy: []const u8, value: []const u8, exact: bool, name_filter: []const u8) ?[]const u8 {
+    var it = ref_map.entries.iterator();
+    while (it.next()) |entry| {
+        const e = entry.value_ptr.*;
+        if (axMatches(e.role, e.name, strategy, value, exact, name_filter)) return e.ref_id;
+    }
+    return null;
+}
+
+fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, strategy_opt: ?[]const u8, value_opt: ?[]const u8, extra_opt: ?[]const u8) []u8 {
     const strategy = strategy_opt orelse return respondErr(allocator, "strategy required");
     const value = value_opt orelse return respondErr(allocator, "value required");
+
+    const opts = parseFindOpts(allocator, extra_opt);
+    defer opts.deinit(allocator);
+
+    // first/last/nth — CSS 셀렉터 기반: JS로 직접 요소 선택 + 액션 수행
+    if (std.mem.eql(u8, strategy, "first") or std.mem.eql(u8, strategy, "last") or std.mem.eql(u8, strategy, "nth")) {
+        return handleFindNth(allocator, sender, resp_map, cmd_id, session_id, strategy, value, opts);
+    }
+
+    // 액션이 주어지면 첫 일치 요소에 위임 (role/text/label은 ref_map에서 즉시 해석)
+    if (opts.act.len > 0) {
+        const ref_id = blk: {
+            if (std.mem.eql(u8, strategy, "role") or std.mem.eql(u8, strategy, "text") or std.mem.eql(u8, strategy, "label")) {
+                break :blk firstAxRefId(ref_map, strategy, value, opts.exact, opts.name);
+            }
+            // placeholder/testid/alt/title: DOM 속성으로 첫 일치 ref 탐색
+            break :blk firstAttrRefId(allocator, sender, resp_map, cmd_id, session_id, ref_map, strategy, value);
+        } orelse return respondErr(allocator, "find: no element matched (run `snapshot -i` first)");
+
+        return dispatchFindAction(allocator, sender, resp_map, cmd_id, session_id, ref_map, opts.act, ref_id, opts.txt);
+    }
 
     if (std.mem.eql(u8, strategy, "role") or std.mem.eql(u8, strategy, "text") or std.mem.eql(u8, strategy, "label")) {
         // Search through ref_map entries
@@ -6171,11 +7400,8 @@ fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
         var it = ref_map.entries.iterator();
         while (it.next()) |entry| {
             const ref_entry = entry.value_ptr.*;
-            const matches = if (std.mem.eql(u8, strategy, "role"))
-                std.mem.eql(u8, ref_entry.role, value)
-            else
-                // text and label both match on the accessible name
-                std.mem.indexOf(u8, ref_entry.name, value) != null;
+            // 액션 경로와 동일 술어 — 목록 경로도 --exact/--name 일관 적용
+            const matches = axMatches(ref_entry.role, ref_entry.name, strategy, value, opts.exact, opts.name);
 
             if (matches) {
                 if (!first) writer.writeByte(',') catch {};
@@ -6194,9 +7420,8 @@ fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
         const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
         defer allocator.free(data);
         return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
-    } else if (std.mem.eql(u8, strategy, "placeholder") or std.mem.eql(u8, strategy, "testid")) {
-        // For placeholder/testid, we need DOM access: resolve each ref and check attribute
-        const attr_name = if (std.mem.eql(u8, strategy, "testid")) "data-testid" else "placeholder";
+    } else if (findAttrName(strategy)) |attr_name| {
+        // placeholder/testid/alt/title: DOM 속성으로 매칭
 
         var buf: std.ArrayList(u8) = .empty;
         defer buf.deinit(allocator);
@@ -6254,7 +7479,7 @@ fn handleFind(allocator: Allocator, sender: *WsSender, resp_map: *response_map_m
         defer allocator.free(data);
         return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
     } else {
-        return respondErr(allocator, "unknown find strategy (use: role, text, label, placeholder, testid)");
+        return respondErr(allocator, "unknown find strategy (role|text|label|placeholder|alt|title|testid|first|last|nth)");
     }
 }
 
@@ -6893,6 +8118,78 @@ fn handleClipboardSet(allocator: Allocator, sender: *WsSender, resp_map: *respon
     defer allocator.free(raw);
 
     return respondOk(allocator);
+}
+
+/// tab new [--label name] [url]: 새 탭 생성 후 targetId 반환. label이 있으면
+/// label→targetId를 ctx에 기록(이후 tab switch/close에서 라벨 참조 가능).
+fn handleTabNew(ctx: *DaemonContext, url_opt: ?[]const u8, label_opt: ?[]const u8) []u8 {
+    const a = ctx.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    const w = buf.writer(a);
+    w.writeAll("{\"url\":") catch return respondErr(a, "write error");
+    cdp.writeJsonString(w, url_opt orelse "about:blank") catch return respondErr(a, "write error");
+    w.writeByte('}') catch {};
+    const params = buf.toOwnedSlice(a) catch return respondErr(a, "alloc error");
+    defer a.free(params);
+
+    const sent_id = ctx.cmd_id.next();
+    const cmd = cdp.serializeCommand(a, sent_id, "Target.createTarget", params, null) catch
+        return respondErr(a, "cmd error");
+    defer a.free(cmd);
+    const raw = sendAndWait(ctx.sender, ctx.response_map, cmd, sent_id, 10_000) orelse
+        return respondErr(a, "tab new timeout");
+    defer a.free(raw);
+    const parsed = cdp.parseMessage(a, raw) catch return respondErr(a, "parse error");
+    defer parsed.parsed.deinit();
+    const tid = blk: {
+        if (parsed.message.isResponse()) if (parsed.message.result) |r|
+            if (cdp.getString(r, "targetId")) |t| break :blk t;
+        return respondErr(a, "tab new failed");
+    };
+
+    if (label_opt) |label| {
+        if (label.len > 0) {
+            ctx.tab_labels_mutex.lock();
+            defer ctx.tab_labels_mutex.unlock();
+            const tid_dup = a.dupe(u8, tid) catch return respondErr(a, "alloc error");
+            if (ctx.tab_labels.fetchRemove(label)) |old| {
+                a.free(old.key);
+                a.free(old.value);
+            }
+            const key_dup = a.dupe(u8, label) catch {
+                a.free(tid_dup);
+                return respondErr(a, "alloc error");
+            };
+            ctx.tab_labels.put(key_dup, tid_dup) catch {
+                a.free(key_dup);
+                a.free(tid_dup);
+                return respondErr(a, "alloc error");
+            };
+        }
+    }
+
+    const data = cdp.jsonObject1(a, "targetId", tid) catch return respondErr(a, "alloc error");
+    defer a.free(data);
+    return daemon.serializeResponse(a, .{ .success = true, .data = data }) catch respondErr(a, "resp error");
+}
+
+/// 라벨 맵에서 ref를 조회: 등록된 라벨이면 targetId, 아니면 원본 그대로.
+/// (순수 — 동시성 보호는 호출부 담당. 반환은 map/ref 소유 슬라이스 — 동기 사용만.)
+fn lookupTabLabel(map: *const std.StringHashMap([]u8), ref: ?[]const u8) ?[]const u8 {
+    const r = ref orelse return null;
+    if (map.get(r)) |tid| return tid;
+    return r;
+}
+
+/// tab ref가 등록된 라벨이면 targetId로 치환, 아니면 원본 그대로 — owned 복사
+/// 반환(호출자 free). 뮤텍스 보호 하에 즉시 dup하므로 수명 안전.
+fn resolveTabLabelRefDup(ctx: *DaemonContext, ref: ?[]const u8) ?[]u8 {
+    if (ref == null) return null;
+    ctx.tab_labels_mutex.lock();
+    defer ctx.tab_labels_mutex.unlock();
+    const resolved = lookupTabLabel(&ctx.tab_labels, ref) orelse return null;
+    return ctx.allocator.dupe(u8, resolved) catch null;
 }
 
 /// 탭 ref(안정 targetId 또는 0-base 인덱스) → targetId 해석 결과.
@@ -7698,6 +8995,133 @@ fn handleStateList(allocator: Allocator) []u8 {
     const data = buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
     defer allocator.free(data);
     return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+}
+
+/// state 이름 검증: 경로 분리자/`..` 금지, 영숫자·`-_.`만 허용 (디렉터리 탈출 방지).
+fn isValidStateName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 128) return false;
+    if (std.mem.eql(u8, name, ".") or std.mem.eql(u8, name, "..")) return false;
+    for (name) |c| {
+        const ok = (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+            (c >= '0' and c <= '9') or c == '-' or c == '_' or c == '.';
+        if (!ok) return false;
+    }
+    return true;
+}
+
+/// 후행 ".json" 제거 (agent-browser는 rename/show에서 확장자 허용).
+fn stripJsonExt(name: []const u8) []const u8 {
+    return if (std.mem.endsWith(u8, name, ".json")) name[0 .. name.len - ".json".len] else name;
+}
+
+fn statesDirPath(buf: []u8) ![]const u8 {
+    var dir_buf: [512]u8 = undefined;
+    const socket_dir = daemon.getSocketDir(&dir_buf);
+    return std.fmt.bufPrint(buf, "{s}/states", .{socket_dir});
+}
+
+/// `{states_dir}/{name}.json` 경로 (name은 호출 전 isValidStateName 검증 가정).
+fn stateFilePath(buf: []u8, states_dir: []const u8, name: []const u8) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{s}/{s}.json", .{ states_dir, name });
+}
+
+/// state clear [name] | state clear --all
+fn handleStateClear(allocator: Allocator, name_opt: ?[]const u8, flag_opt: ?[]const u8) []u8 {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    const all = if (flag_opt) |f| std.mem.eql(u8, f, "all") else false;
+
+    if (all) {
+        var dir = std.fs.openDirAbsolute(states_dir, .{ .iterate = true }) catch
+            return respondOk(allocator);
+        defer dir.close();
+        var n: usize = 0;
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".json")) {
+                dir.deleteFile(entry.name) catch continue;
+                n += 1;
+            }
+        }
+        var b: [64]u8 = undefined;
+        const d = std.fmt.bufPrint(&b, "{{\"cleared\":{d}}}", .{n}) catch return respondOk(allocator);
+        return daemon.serializeResponse(allocator, .{ .success = true, .data = d }) catch respondOk(allocator);
+    }
+
+    const name = name_opt orelse return respondErr(allocator, "state clear: name or --all required");
+    const sname = stripJsonExt(name);
+    if (!isValidStateName(sname)) return respondErr(allocator, "invalid state name");
+    var fbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const fpath = stateFilePath(&fbuf, states_dir, sname) catch
+        return respondErr(allocator, "path error");
+    std.fs.deleteFileAbsolute(fpath) catch return respondErr(allocator, "state not found");
+    return respondOk(allocator);
+}
+
+/// state show <name>: 저장된 상태 JSON 원문 반환.
+fn handleStateShow(allocator: Allocator, name_opt: ?[]const u8) []u8 {
+    const name = name_opt orelse return respondErr(allocator, "state show: name required");
+    const sname = stripJsonExt(name);
+    if (!isValidStateName(sname)) return respondErr(allocator, "invalid state name");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    var fbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const fpath = stateFilePath(&fbuf, states_dir, sname) catch
+        return respondErr(allocator, "path error");
+    const content = std.fs.cwd().readFileAlloc(allocator, fpath, 16 * 1024 * 1024) catch
+        return respondErr(allocator, "state not found");
+    defer allocator.free(content);
+    if (content.len == 0) return respondErr(allocator, "state file empty/corrupt");
+    // 파일 내용은 이미 JSON — data로 그대로 전달
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = content }) catch
+        respondErr(allocator, "resp error");
+}
+
+/// state clean --older-than <days>: mtime이 N일보다 오래된 상태 삭제.
+fn handleStateClean(allocator: Allocator, days_opt: ?[]const u8) []u8 {
+    const days_str = days_opt orelse return respondErr(allocator, "state clean: --older-than <days> required");
+    const days = std.fmt.parseInt(i64, days_str, 10) catch
+        return respondErr(allocator, "state clean: days must be an integer");
+    if (days < 0) return respondErr(allocator, "state clean: days must be >= 0");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    var dir = std.fs.openDirAbsolute(states_dir, .{ .iterate = true }) catch
+        return respondOk(allocator);
+    defer dir.close();
+    const cutoff: i128 = @as(i128, std.time.nanoTimestamp()) - @as(i128, days) * std.time.ns_per_day;
+    var n: usize = 0;
+    var iter = dir.iterate();
+    while (iter.next() catch null) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".json")) continue;
+        const st = dir.statFile(entry.name) catch continue;
+        if (st.mtime < cutoff) {
+            dir.deleteFile(entry.name) catch continue;
+            n += 1;
+        }
+    }
+    var b: [64]u8 = undefined;
+    const d = std.fmt.bufPrint(&b, "{{\"cleaned\":{d}}}", .{n}) catch return respondOk(allocator);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = d }) catch respondOk(allocator);
+}
+
+/// state rename <old> <new>
+fn handleStateRename(allocator: Allocator, old_opt: ?[]const u8, new_opt: ?[]const u8) []u8 {
+    const old_raw = old_opt orelse return respondErr(allocator, "state rename: old/new required");
+    const new_raw = new_opt orelse return respondErr(allocator, "state rename: old/new required");
+    const old_name = stripJsonExt(old_raw);
+    const new_name = stripJsonExt(new_raw);
+    if (!isValidStateName(old_name) or !isValidStateName(new_name))
+        return respondErr(allocator, "invalid state name");
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const states_dir = statesDirPath(&path_buf) catch return respondErr(allocator, "path error");
+    var ob: [std.fs.max_path_bytes]u8 = undefined;
+    var nb: [std.fs.max_path_bytes]u8 = undefined;
+    const op = stateFilePath(&ob, states_dir, old_name) catch
+        return respondErr(allocator, "path error");
+    const np = stateFilePath(&nb, states_dir, new_name) catch
+        return respondErr(allocator, "path error");
+    std.fs.renameAbsolute(op, np) catch return respondErr(allocator, "state rename failed (source not found?)");
+    return respondOk(allocator);
 }
 
 // ============================================================================
@@ -9251,7 +10675,7 @@ fn handleScreenshotAnnotate(
     }
 
     // Step 4: Take the screenshot
-    const result = handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, path_opt);
+    const result = handleScreenshot(allocator, sender, resp_map, cmd_id, session_id, path_opt, null);
 
     // Step 5: Remove the overlay
     {
@@ -9408,8 +10832,9 @@ fn printUsage() void {
         \\  styles <@ref> <prop>      Get computed CSS style value
         \\  highlight <@ref>          Highlight element with overlay
         \\
-        \\Find Elements:  agent-devtools find <locator> <value>
-        \\  role, text, label, placeholder, testid
+        \\Find Elements:  agent-devtools find <locator> <value> [action] [text] [--name N] [--exact]
+        \\  locators: role text label placeholder alt title testid | first/last <sel> | nth <i> <sel>
+        \\  action(생략 시 매칭 목록): click hover fill type check text
         \\
         \\Mouse:  agent-devtools mouse <action> [args]
         \\  move <x> <y>, down, up
@@ -9515,6 +10940,12 @@ fn printUsage() void {
         \\  --session <name>          Isolated session (default: "default")
         \\  --headed                  Show browser window (default: headless)
         \\  --port <port>             Connect to existing Chrome via CDP port
+        \\  --cdp <url>               Attach to a CDP endpoint (ws://|wss://|http(s)://)
+        \\                            Sugar: 'connect <port|url>' (e.g. connect 9222)
+        \\  --executable-path <path>  Use a specific Chrome/Chromium binary
+        \\  --args "<a> <b>"          Extra space-separated Chrome launch args
+        \\  --ignore-https-errors     Ignore TLS cert errors on launch
+        \\  (모든 값 플래그는 '--flag value'와 '--flag=value' 둘 다 허용)
         \\  --auto-connect            Connect to running Chrome to reuse its auth state
         \\                            Tip: agent-devtools --auto-connect state save ./auth.json
         \\  --user-agent <ua>         Set user agent on launch
@@ -10284,6 +11715,59 @@ test "buildDynamicBoundaries: keeps only dynamic boundaries" {
     try std.testing.expectEqual(@as(i64, 4), out.value.array.items[2].object.get("id").?.integer);
 }
 
+test "findAttrName: maps strategies, rejects unknown" {
+    try std.testing.expectEqualStrings("placeholder", findAttrName("placeholder").?);
+    try std.testing.expectEqualStrings("data-testid", findAttrName("testid").?);
+    try std.testing.expectEqualStrings("alt", findAttrName("alt").?);
+    try std.testing.expectEqualStrings("title", findAttrName("title").?);
+    try std.testing.expect(findAttrName("role") == null);
+}
+
+test "parseFindOpts: parses act/txt/name/exact/idx; null → defaults" {
+    const a = std.testing.allocator;
+    const o = parseFindOpts(a, "{\"act\":\"fill\",\"txt\":\"hi there\",\"name\":\"\",\"exact\":true,\"idx\":-1}");
+    defer o.deinit(a);
+    try std.testing.expectEqualStrings("fill", o.act);
+    try std.testing.expectEqualStrings("hi there", o.txt);
+    try std.testing.expectEqualStrings("", o.name);
+    try std.testing.expect(o.exact);
+    try std.testing.expectEqual(@as(i64, -1), o.idx);
+
+    const d = parseFindOpts(a, null);
+    try std.testing.expectEqualStrings("", d.act);
+    try std.testing.expect(!d.exact);
+    try std.testing.expectEqual(@as(i64, 0), d.idx);
+}
+
+test "firstAxRefId: role exact, text/label contains vs exact" {
+    const a = std.testing.allocator;
+    var rm = snapshot_mod.RefMap.init(a);
+    defer rm.deinit();
+    _ = try rm.addRef(1, "button", "Submit form");
+    _ = try rm.addRef(2, "link", "Home");
+    // role: 정확 일치
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", false, "") != null);
+    try std.testing.expect(firstAxRefId(&rm, "role", "butto", false, "") == null);
+    // text: 포함 매칭
+    try std.testing.expect(firstAxRefId(&rm, "text", "Submit", false, "") != null);
+    // exact: 정확 일치만
+    try std.testing.expect(firstAxRefId(&rm, "text", "Submit", true, "") == null);
+    try std.testing.expect(firstAxRefId(&rm, "label", "Home", true, "") != null);
+    // --name: role + accessible name 필터
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", false, "Submit") != null);
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", false, "Cancel") == null);
+    try std.testing.expect(firstAxRefId(&rm, "role", "button", true, "Submit") == null); // exact name != "Submit form"
+}
+
+test "axMatches: shared predicate honors exact + name filter" {
+    try std.testing.expect(axMatches("button", "Submit form", "role", "button", false, ""));
+    try std.testing.expect(axMatches("button", "Submit form", "role", "button", false, "Submit"));
+    try std.testing.expect(!axMatches("button", "Submit form", "role", "button", true, "Submit"));
+    try std.testing.expect(!axMatches("link", "Submit", "role", "button", false, ""));
+    try std.testing.expect(axMatches("link", "Click here", "text", "here", false, ""));
+    try std.testing.expect(!axMatches("link", "Click here", "text", "here", true, ""));
+}
+
 test "buildDynamicBoundaries: empty input yields empty array" {
     const a = std.testing.allocator;
     var buf = try buildDynamicBoundaries(a, &.{});
@@ -10609,6 +12093,308 @@ test "parseCountFromJson: zero count" {
     const count = parseCountFromJson("{\"success\":true,\"data\":{\"requests\":0}}", "requests");
     try std.testing.expect(count != null);
     try std.testing.expectEqual(@as(usize, 0), count.?);
+}
+
+test "classifyCdpEndpoint: ws/wss/http/https → url" {
+    try std.testing.expectEqualStrings("ws://127.0.0.1:9222/devtools/page/X", classifyCdpEndpoint("ws://127.0.0.1:9222/devtools/page/X").url);
+    try std.testing.expectEqualStrings("wss://h/d", classifyCdpEndpoint("wss://h/d").url);
+    try std.testing.expectEqualStrings("http://localhost:9222", classifyCdpEndpoint("http://localhost:9222").url);
+    try std.testing.expectEqualStrings("https://x:1", classifyCdpEndpoint("https://x:1").url);
+}
+
+test "classifyCdpEndpoint: numeric → port" {
+    try std.testing.expectEqualStrings("9222", classifyCdpEndpoint("9222").port);
+    try std.testing.expectEqualStrings("0", classifyCdpEndpoint("0").port);
+}
+
+test "classifyCdpEndpoint: empty / non-numeric → invalid" {
+    try std.testing.expect(classifyCdpEndpoint("") == .invalid);
+    try std.testing.expect(classifyCdpEndpoint("localhost") == .invalid);
+    try std.testing.expect(classifyCdpEndpoint("92x2") == .invalid);
+    try std.testing.expect(classifyCdpEndpoint("tcp://1") == .invalid);
+}
+
+test "parseHttpHostPort: explicit port" {
+    const hp = parseHttpHostPort("http://127.0.0.1:9222").?;
+    try std.testing.expectEqualStrings("127.0.0.1", hp.host);
+    try std.testing.expectEqual(@as(u16, 9222), hp.port);
+}
+
+test "parseHttpHostPort: default ports + path stripped" {
+    const a = parseHttpHostPort("http://example.com/json/version").?;
+    try std.testing.expectEqualStrings("example.com", a.host);
+    try std.testing.expectEqual(@as(u16, 80), a.port);
+    const b = parseHttpHostPort("https://example.com").?;
+    try std.testing.expectEqual(@as(u16, 443), b.port);
+}
+
+test "parseHttpHostPort: rejects non-http and malformed" {
+    try std.testing.expect(parseHttpHostPort("ws://x:1") == null);
+    try std.testing.expect(parseHttpHostPort("http://") == null);
+    try std.testing.expect(parseHttpHostPort("http://h:notaport") == null);
+}
+
+test "buildCountExpr: JSON-encodes selector into querySelectorAll" {
+    const a = std.testing.allocator;
+    const e1 = try buildCountExpr(a, "div.item");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("String(document.querySelectorAll(\"div.item\").length)", e1);
+    // injection-safe: quotes/backslashes escaped
+    const e2 = try buildCountExpr(a, "a[href=\"x\"]");
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("String(document.querySelectorAll(\"a[href=\\\"x\\\"]\").length)", e2);
+}
+
+test "buildSingleCookieArrayJson: name/value only" {
+    const a = std.testing.allocator;
+    const j = try buildSingleCookieArrayJson(a, "sid", "abc", .{});
+    defer a.free(j);
+    try std.testing.expectEqualStrings("[{\"name\":\"sid\",\"value\":\"abc\"}]", j);
+}
+
+test "buildSingleCookieArrayJson: all attributes + JSON-escaped" {
+    const a = std.testing.allocator;
+    const j = try buildSingleCookieArrayJson(a, "n\"x", "v", .{
+        .domain = "example.com",
+        .path = "/app",
+        .http_only = true,
+        .secure = true,
+        .same_site = "Lax",
+        .expires = 1700000000,
+    });
+    defer a.free(j);
+    try std.testing.expectEqualStrings(
+        "[{\"name\":\"n\\\"x\",\"value\":\"v\",\"domain\":\"example.com\",\"path\":\"/app\",\"httpOnly\":true,\"secure\":true,\"sameSite\":\"Lax\",\"expires\":1700000000}]",
+        j,
+    );
+}
+
+test "buildSingleCookieArrayJson: url only (no domain)" {
+    const a = std.testing.allocator;
+    const j = try buildSingleCookieArrayJson(a, "k", "1", .{ .url = "https://h/p" });
+    defer a.free(j);
+    try std.testing.expectEqualStrings("[{\"name\":\"k\",\"value\":\"1\",\"url\":\"https://h/p\"}]", j);
+}
+
+test "isScreenshotSelector: selector vs path" {
+    try std.testing.expect(isScreenshotSelector("#main"));
+    try std.testing.expect(isScreenshotSelector(".btn"));
+    try std.testing.expect(isScreenshotSelector("@e3"));
+    try std.testing.expect(!isScreenshotSelector("out.png"));
+    try std.testing.expect(!isScreenshotSelector("./shot.png"));
+    try std.testing.expect(!isScreenshotSelector("dir/file"));
+    // agent-browser 패리티: 접두 없는 평문도 selector (path 마커 없으면)
+    try std.testing.expect(isScreenshotSelector("body"));
+    try std.testing.expect(isScreenshotSelector("main"));
+    try std.testing.expect(!isScreenshotSelector(""));
+}
+
+test "buildScreenshotExtraJson: subsets + escaping" {
+    const a = std.testing.allocator;
+    const e1 = try buildScreenshotExtraJson(a, "#x", "jpeg", "80", true);
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"sel\":\"#x\",\"fmt\":\"jpeg\",\"q\":80,\"full\":true}", e1);
+    const e2 = try buildScreenshotExtraJson(a, null, null, null, false);
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{}", e2);
+    try std.testing.expectError(error.InvalidQuality, buildScreenshotExtraJson(a, null, "jpeg", "abc", false));
+}
+
+test "parseRectCsv: valid + invalid" {
+    const r = parseRectCsv("10.5,20,300,150").?;
+    try std.testing.expectEqual(@as(f64, 10.5), r.x);
+    try std.testing.expectEqual(@as(f64, 150), r.height);
+    try std.testing.expect(parseRectCsv("") == null);
+    try std.testing.expect(parseRectCsv("1,2,3") == null);
+    try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildRectExpr: selector JSON-encoded" {
+    const a = std.testing.allocator;
+    const e = try buildRectExpr(a, "a[data-x=\"1\"]");
+    defer a.free(e);
+    try std.testing.expect(std.mem.indexOf(u8, e, "querySelector(\"a[data-x=\\\"1\\\"]\")") != null);
+}
+
+test "buildScreenshotParams: format/quality/clip" {
+    const a = std.testing.allocator;
+    const p1 = try buildScreenshotParams(a, .{}, null);
+    defer a.free(p1);
+    try std.testing.expectEqualStrings("{\"format\":\"png\"}", p1);
+    const p2 = try buildScreenshotParams(a, .{ .format = "jpeg", .quality = 70 }, null);
+    defer a.free(p2);
+    try std.testing.expectEqualStrings("{\"format\":\"jpeg\",\"quality\":70}", p2);
+    // quality ignored for png
+    const p3 = try buildScreenshotParams(a, .{ .format = "png", .quality = 70 }, null);
+    defer a.free(p3);
+    try std.testing.expectEqualStrings("{\"format\":\"png\"}", p3);
+    const p4 = try buildScreenshotParams(a, .{ .full_page = true }, null);
+    defer a.free(p4);
+    try std.testing.expectEqualStrings("{\"format\":\"png\",\"captureBeyondViewport\":true,\"fromSurface\":true}", p4);
+    const p5 = try buildScreenshotParams(a, .{ .full_page = true }, .{ .x = 1, .y = 2, .width = 3, .height = 4 });
+    defer a.free(p5);
+    try std.testing.expectEqualStrings("{\"format\":\"png\",\"clip\":{\"x\":1,\"y\":2,\"width\":3,\"height\":4,\"scale\":1},\"captureBeyondViewport\":true}", p5);
+}
+
+test "isValidStateName: rejects traversal/empty/bad chars" {
+    try std.testing.expect(isValidStateName("auth"));
+    try std.testing.expect(isValidStateName("my-state_1.bak"));
+    try std.testing.expect(!isValidStateName(""));
+    try std.testing.expect(!isValidStateName(".."));
+    try std.testing.expect(!isValidStateName("a/b"));
+    try std.testing.expect(!isValidStateName("../etc"));
+    try std.testing.expect(!isValidStateName("a b"));
+}
+
+test "stripJsonExt: trailing .json removed once" {
+    try std.testing.expectEqualStrings("auth", stripJsonExt("auth.json"));
+    try std.testing.expectEqualStrings("auth", stripJsonExt("auth"));
+    try std.testing.expectEqualStrings("a.json", stripJsonExt("a.json.json"));
+}
+
+test "netStatusMatches: exact + class" {
+    try std.testing.expect(netStatusMatches(404, "404"));
+    try std.testing.expect(!netStatusMatches(404, "403"));
+    try std.testing.expect(netStatusMatches(404, "4xx"));
+    try std.testing.expect(netStatusMatches(200, "2XX"));
+    try std.testing.expect(!netStatusMatches(500, "4xx"));
+    try std.testing.expect(!netStatusMatches(null, "200"));
+    try std.testing.expect(!netStatusMatches(200, "abc"));
+}
+
+test "netMatches: combined filters (case-insensitive)" {
+    const info = network.RequestInfo{
+        .request_id = "1", .url = "https://api.example.com/users", .method = "POST",
+        .resource_type = "XHR", .status = 201, .status_text = "", .mime_type = "",
+        .timestamp = 0, .encoded_data_length = null, .error_text = "", .state = .finished,
+    };
+    try std.testing.expect(netMatches(info, .{ .url = "api.example" }));
+    try std.testing.expect(netMatches(info, .{ .method = "post" })); // case-insensitive
+    try std.testing.expect(netMatches(info, .{ .rtype = "xhr", .status = "2xx" }));
+    try std.testing.expect(!netMatches(info, .{ .method = "GET" }));
+    try std.testing.expect(!netMatches(info, .{ .url = "nope" }));
+}
+
+test "buildNetFilterExtraJson: subset + escaping" {
+    const a = std.testing.allocator;
+    const e1 = try buildNetFilterExtraJson(a, "XHR", "GET", "404");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"type\":\"XHR\",\"method\":\"GET\",\"status\":\"404\"}", e1);
+    const e2 = try buildNetFilterExtraJson(a, null, "POST", null);
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{\"method\":\"POST\"}", e2);
+}
+
+test "buildSnapshotExtraJson: depth/selector subsets" {
+    const a = std.testing.allocator;
+    const e1 = try buildSnapshotExtraJson(a, "3", "#main");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"depth\":3,\"selector\":\"#main\"}", e1);
+    const e2 = try buildSnapshotExtraJson(a, null, ".x");
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{\"selector\":\".x\"}", e2);
+    const e3 = try buildSnapshotExtraJson(a, "5", null);
+    defer a.free(e3);
+    try std.testing.expectEqualStrings("{\"depth\":5}", e3);
+    try std.testing.expectError(error.InvalidDepth, buildSnapshotExtraJson(a, "abc", null));
+}
+
+test "diffLines: add/remove/unchanged + summary" {
+    const a = std.testing.allocator;
+    const d = try diffLines(a, "x\ny\nz\n", "x\nY\nz\n");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "  x\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "- y\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ Y\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "  z\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "(1 added, 1 removed, 2 unchanged)") != null);
+}
+
+test "diffLines: identical → all unchanged, zero add/remove" {
+    const a = std.testing.allocator;
+    const d = try diffLines(a, "a\nb\n", "a\nb\n");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "(0 added, 0 removed, 2 unchanged)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "- ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ ") == null);
+}
+
+test "diffLines: pure additions" {
+    const a = std.testing.allocator;
+    const d = try diffLines(a, "", "n1\nn2\n");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ n1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ n2\n") != null);
+}
+
+test "buildDiffExtraJson: subsets + depth validation" {
+    const a = std.testing.allocator;
+    const e1 = try buildDiffExtraJson(a, "base.txt", "#m", "3", true, "load");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"baseline\":\"base.txt\",\"selector\":\"#m\",\"depth\":3,\"waitUntil\":\"load\",\"interactive\":true}", e1);
+    const e2 = try buildDiffExtraJson(a, null, null, null, false, null);
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{}", e2);
+    try std.testing.expectError(error.InvalidDepth, buildDiffExtraJson(a, null, null, "x", false, null));
+}
+
+test "lookupTabLabel: label→targetId, passthrough, null" {
+    const a = std.testing.allocator;
+    var map = std.StringHashMap([]u8).init(a);
+    defer map.deinit();
+    const tid = try a.dupe(u8, "TARGET-123");
+    defer a.free(tid);
+    try map.put("login", tid);
+    try std.testing.expectEqualStrings("TARGET-123", lookupTabLabel(&map, "login").?);
+    try std.testing.expectEqualStrings("other", lookupTabLabel(&map, "other").?); // passthrough
+    try std.testing.expect(lookupTabLabel(&map, null) == null);
+}
+
+test "parseMouseCoords: x:y and x:y:button" {
+    const m1 = parseMouseCoords("10:20");
+    try std.testing.expectEqual(@as(i32, 10), m1.a);
+    try std.testing.expectEqual(@as(i32, 20), m1.b);
+    try std.testing.expect(m1.button == null);
+    const m2 = parseMouseCoords("0:0:right");
+    try std.testing.expectEqualStrings("right", m2.button.?);
+    const m3 = parseMouseCoords("-50:100"); // wheel deltas
+    try std.testing.expectEqual(@as(i32, -50), m3.a);
+    try std.testing.expectEqual(@as(i32, 100), m3.b);
+}
+
+test "buildEmulatedMediaParams: scheme + optional reduced-motion" {
+    const a = std.testing.allocator;
+    const p1 = try buildEmulatedMediaParams(a, "dark", false);
+    defer a.free(p1);
+    try std.testing.expectEqualStrings("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"dark\"}]}", p1);
+    const p2 = try buildEmulatedMediaParams(a, "light", true);
+    defer a.free(p2);
+    try std.testing.expectEqualStrings("{\"features\":[{\"name\":\"prefers-color-scheme\",\"value\":\"light\"},{\"name\":\"prefers-reduced-motion\",\"value\":\"reduce\"}]}", p2);
+}
+
+test "flagIs: matches --name and --name=" {
+    try std.testing.expect(flagIs("--port", "--port"));
+    try std.testing.expect(flagIs("--port=9222", "--port"));
+    try std.testing.expect(!flagIs("--portx", "--port"));
+    try std.testing.expect(!flagIs("--proxy", "--port"));
+}
+
+test "flagValue: equals form and space form" {
+    const FakeIt = struct {
+        items: []const []const u8,
+        i: usize = 0,
+        fn next(self: *@This()) ?[]const u8 {
+            if (self.i >= self.items.len) return null;
+            defer self.i += 1;
+            return self.items[self.i];
+        }
+    };
+    var it1 = FakeIt{ .items = &.{} };
+    try std.testing.expectEqualStrings("9222", flagValue("--port=9222", "--port", &it1).?);
+    var it2 = FakeIt{ .items = &.{"9333"} };
+    try std.testing.expectEqualStrings("9333", flagValue("--port", "--port", &it2).?);
+    var it3 = FakeIt{ .items = &.{} }; // space form, missing value → null
+    try std.testing.expect(flagValue("--port", "--port", &it3) == null);
 }
 
 test "buildDebugResponse: merges debug into response" {
