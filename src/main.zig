@@ -36,7 +36,7 @@ const WsSender = struct {
         return self.ws.sendText(payload);
     }
 };
-const version = "0.1.0";
+const version = "0.1.2";
 
 const ConsoleEntry = struct {
     log_type: []u8, // "log", "warn", "error", "info", "debug"
