@@ -743,6 +743,8 @@ test "SocketClient.isReady: returns false for non-existent session" {
 }
 
 test "recvLineAlloc: reads >64KB line across chunk boundary, trims at newline" {
+    // posix.pipe()/fd 모델은 Windows에 없음 (소켓은 Unix 도메인 소켓 경로 전용)
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
 
@@ -772,6 +774,7 @@ test "recvLineAlloc: reads >64KB line across chunk boundary, trims at newline" {
 }
 
 test "recvLineAlloc: EndOfStream on empty closed stream" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
     const fds = try std.posix.pipe();
     defer std.posix.close(fds[0]);
     std.posix.close(fds[1]);
