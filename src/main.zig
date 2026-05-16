@@ -736,11 +736,17 @@ pub fn main() void {
         sendAction(session, "vitals", args_iter.next(), null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "react")) {
         const sub = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools react <tree|inspect|renders|suspense>\n", .{});
+            writeErr("Usage: agent-devtools react <tree|inspect>\n", .{});
             std.process.exit(1);
         };
         if (std.mem.eql(u8, sub, "tree")) {
             sendAction(session, "react_tree", null, null, daemon_opts);
+        } else if (std.mem.eql(u8, sub, "inspect")) {
+            const fid = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools react inspect <fiberId>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "react_inspect", fid, null, daemon_opts);
         } else {
             writeErr("Unknown react subcommand: {s}\n", .{sub});
             std.process.exit(1);
@@ -3240,6 +3246,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleVitals(allocator, sender, resp_map, cmd_id, session_id, req.url, ctx.allowed_domains);
     } else if (std.mem.eql(u8, req.action, "react_tree")) {
         return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, REACT_TREE_SNAPSHOT);
+    } else if (std.mem.eql(u8, req.action, "react_inspect")) {
+        return handleReactInspect(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "get_url")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "window.location.href");
     } else if (std.mem.eql(u8, req.action, "get_title")) {
@@ -6991,6 +6999,7 @@ fn handleEvalRaw(allocator: Allocator, sender: *WsSender, resp_map: *response_ma
 // ============================================================================
 
 const REACT_TREE_SNAPSHOT = @embedFile("react/tree_snapshot.js");
+const REACT_TREE_INSPECT = @embedFile("react/tree_inspect.js"); // {{ID}} 치환 필요
 
 /// async React 스크립트를 평가해 JSON 문자열(또는 에러)을 daemon 응답으로 반환.
 fn handleReactScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, expression: []const u8) []u8 {
@@ -7031,6 +7040,27 @@ fn handleReactScript(allocator: Allocator, sender: *WsSender, resp_map: *respons
         }
     }
     return respondErr(allocator, "react script returned no value");
+}
+
+/// react inspect <fiberId> — TREE_INSPECT의 {{ID}}를 검증된 숫자 id로 치환 후 평가.
+fn handleReactInspect(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, id_opt: ?[]const u8) []u8 {
+    const id_str = id_opt orelse return respondErr(allocator, "fiber id required");
+    // 숫자만 허용 — id는 JS 표현식 `const id = {{ID}};`에 그대로 치환되므로
+    // 검증 실패 시 거부해 인젝션 방지. fiber id는 음수 아님 → u32.
+    _ = std.fmt.parseInt(u32, id_str, 10) catch return respondErr(allocator, "fiber id must be a non-negative number");
+
+    const placeholder = "{{ID}}";
+    const idx = std.mem.indexOf(u8, REACT_TREE_INSPECT, placeholder) orelse
+        return respondErr(allocator, "inspect template malformed");
+
+    const script = std.mem.concat(allocator, u8, &.{
+        REACT_TREE_INSPECT[0..idx],
+        id_str,
+        REACT_TREE_INSPECT[idx + placeholder.len ..],
+    }) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(script);
+
+    return handleReactScript(allocator, sender, resp_map, cmd_id, session_id, script);
 }
 
 fn handleStateLoad(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, name_opt: ?[]const u8) []u8 {
@@ -8860,6 +8890,7 @@ fn printUsage() void {
         \\  pushstate <url>           SPA client-side navigation (history.pushState)
         \\  vitals [url]              Core Web Vitals (LCP/CLS/FCP/INP) + TTFB
         \\  react tree                React 컴포넌트 트리 (--enable=react-devtools 필요)
+        \\  react inspect <fiberId>   특정 fiber의 props/hooks/state
         \\  url                       Get current URL
         \\  title                     Get page title
         \\  content                   Get page HTML
@@ -9685,6 +9716,13 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "REACT_TREE_INSPECT: embedded template has exactly one {{ID}} placeholder" {
+    const ph = "{{ID}}";
+    const first = std.mem.indexOf(u8, REACT_TREE_INSPECT, ph) orelse unreachable;
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_INSPECT[first + ph.len ..], ph) == null);
+    try std.testing.expect(std.mem.indexOf(u8, REACT_TREE_INSPECT, "__REACT_DEVTOOLS_GLOBAL_HOOK__") != null);
 }
 
 test "REACT_TREE_SNAPSHOT: embedded async script references hook and returns JSON" {
