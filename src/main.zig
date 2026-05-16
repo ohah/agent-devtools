@@ -711,6 +711,33 @@ pub fn main() void {
             std.process.exit(1);
         };
         sendAction(session, "press", key, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "keydown") or std.mem.eql(u8, cmd, "keyup")) {
+        const key = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools {s} <key>\n", .{cmd});
+            std.process.exit(1);
+        };
+        sendAction(session, cmd, key, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "keyboard")) {
+        const sub = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools keyboard <type|inserttext> <text>\n", .{});
+            std.process.exit(1);
+        };
+        if (std.mem.eql(u8, sub, "type")) {
+            const txt = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools keyboard type <text>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "keyboard_type", txt, null, daemon_opts);
+        } else if (std.mem.eql(u8, sub, "inserttext") or std.mem.eql(u8, sub, "insertText")) {
+            const txt = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools keyboard inserttext <text>\n", .{});
+                std.process.exit(1);
+            };
+            sendAction(session, "keyboard_insert", txt, null, daemon_opts);
+        } else {
+            writeErr("Unknown keyboard subcommand: {s}\n", .{sub});
+            std.process.exit(1);
+        }
     } else if (std.mem.eql(u8, cmd, "hover")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools hover <@ref>\n", .{});
@@ -3164,6 +3191,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleFill(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "press")) {
         return handlePress(allocator, sender, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "keydown")) {
+        return handleKeyHalf(allocator, sender, cmd_id, session_id, req.url, "keyDown");
+    } else if (std.mem.eql(u8, req.action, "keyup")) {
+        return handleKeyHalf(allocator, sender, cmd_id, session_id, req.url, "keyUp");
+    } else if (std.mem.eql(u8, req.action, "keyboard_type")) {
+        return handleKeyboardType(allocator, sender, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "keyboard_insert")) {
+        return handleKeyboardInsert(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "scroll")) {
         return handleScroll(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "select_option")) {
@@ -4293,52 +4328,89 @@ fn getKeyInfo(key_name: []const u8) KeyInfo {
     return .{ .key = key_name, .code = key_name, .key_code = 0, .text = null };
 }
 
+/// Input.dispatchKeyEvent params 빌드. kind = "keyDown"|"keyUp"|"rawKeyDown".
+/// keyDown에만 text 포함 (keyUp은 문자 입력 없음). 호출자가 free.
+fn buildKeyEventParams(allocator: Allocator, kind: []const u8, info: KeyInfo) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"type\":");
+    try cdp.writeJsonString(w, kind);
+    try w.writeAll(",\"key\":");
+    try cdp.writeJsonString(w, info.key);
+    try w.writeAll(",\"code\":");
+    try cdp.writeJsonString(w, info.code);
+    try std.fmt.format(w, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code });
+    if (std.mem.eql(u8, kind, "keyDown")) {
+        if (info.text) |text| {
+            try w.writeAll(",\"text\":");
+            try cdp.writeJsonString(w, text);
+        }
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// 단일 키 이벤트(keyDown 또는 keyUp) 전송 — keydown/keyup 명령용 (모디파이어 홀드).
+fn handleKeyHalf(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8, kind: []const u8) []u8 {
+    const key_name = key orelse return respondErr(allocator, "key required");
+    const params = buildKeyEventParams(allocator, kind, getKeyInfo(key_name)) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
+
 fn handlePress(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, key: ?[]const u8) []u8 {
     const key_name = key orelse return respondErr(allocator, "key required");
     const info = getKeyInfo(key_name);
 
-    // keyDown
-    var down_buf: std.ArrayList(u8) = .empty;
-    defer down_buf.deinit(allocator);
-    const dw = down_buf.writer(allocator);
-    dw.writeAll("{\"type\":\"keyDown\",\"key\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(dw, info.key) catch return respondErr(allocator, "write error");
-    dw.writeAll(",\"code\":") catch {};
-    cdp.writeJsonString(dw, info.code) catch {};
-    std.fmt.format(dw, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code }) catch {};
-    if (info.text) |text| {
-        dw.writeAll(",\"text\":") catch {};
-        cdp.writeJsonString(dw, text) catch {};
+    inline for (.{ "keyDown", "keyUp" }) |kind| {
+        const params = buildKeyEventParams(allocator, kind, info) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(params);
+        const c = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+            return respondErr(allocator, "cmd error");
+        defer allocator.free(c);
+        sender.sendText(c) catch {};
     }
-    dw.writeByte('}') catch {};
+    return respondOk(allocator);
+}
 
-    const down_params = down_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-    defer allocator.free(down_params);
-
-    const cmd1 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", down_params, session_id) catch
+/// keyboard inserttext <text> — 포커스된 요소에 Input.insertText로 원자 삽입
+/// (키 이벤트 미발생).
+fn handleKeyboardInsert(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, text: ?[]const u8) []u8 {
+    const t = text orelse return respondErr(allocator, "text required");
+    const cmd = snapshot_mod.buildInsertTextCmd(allocator, cmd_id.next(), t, session_id) catch
         return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd1);
-    sender.sendText(cmd1) catch {};
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
+}
 
-    // keyUp
-    var up_buf: std.ArrayList(u8) = .empty;
-    defer up_buf.deinit(allocator);
-    const uw = up_buf.writer(allocator);
-    uw.writeAll("{\"type\":\"keyUp\",\"key\":") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(uw, info.key) catch {};
-    uw.writeAll(",\"code\":") catch {};
-    cdp.writeJsonString(uw, info.code) catch {};
-    std.fmt.format(uw, ",\"windowsVirtualKeyCode\":{d},\"nativeVirtualKeyCode\":{d}", .{ info.key_code, info.key_code }) catch {};
-    uw.writeByte('}') catch {};
-
-    const up_params = up_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-    defer allocator.free(up_params);
-
-    const cmd2 = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", up_params, session_id) catch
-        return respondErr(allocator, "cmd error");
-    defer allocator.free(cmd2);
-    sender.sendText(cmd2) catch {};
-
+/// keyboard type <text> — 문자별 합성 키스트로크(keyDown+text → keyUp)로
+/// 포커스된 요소에 입력. inserttext와 달리 keydown/input 핸들러가 동작
+/// (agent-browser type 시맨틱). UTF-8 코드포인트 단위.
+fn handleKeyboardType(allocator: Allocator, sender: *WsSender, cmd_id: *cdp.CommandId, session_id: ?[]const u8, text: ?[]const u8) []u8 {
+    const t = text orelse return respondErr(allocator, "text required");
+    var i: usize = 0;
+    while (i < t.len) {
+        const len = std.unicode.utf8ByteSequenceLength(t[i]) catch 1;
+        const end = @min(i + len, t.len);
+        const ch = t[i..end];
+        const info = KeyInfo{ .key = ch, .code = "", .key_code = 0, .text = ch };
+        inline for (.{ "keyDown", "keyUp" }) |kind| {
+            const params = buildKeyEventParams(allocator, kind, info) catch return respondErr(allocator, "alloc error");
+            defer allocator.free(params);
+            const c = cdp.serializeCommand(allocator, cmd_id.next(), "Input.dispatchKeyEvent", params, session_id) catch
+                return respondErr(allocator, "cmd error");
+            defer allocator.free(c);
+            sender.sendText(c) catch {};
+        }
+        i = end;
+    }
     return respondOk(allocator);
 }
 
@@ -9091,6 +9163,10 @@ fn printUsage() void {
         \\  type <@ref> <text>        Type into element
         \\  fill <@ref> <text>        Clear and fill
         \\  press <key>               Press key (Enter, Tab, Control+a)
+        \\  keydown <key>             Key down only (hold modifier)
+        \\  keyup <key>               Key up only (release modifier)
+        \\  keyboard type <text>      Type into focused element (synthetic keystrokes)
+        \\  keyboard inserttext <text>  Atomic insert into focused element (no key events)
         \\  hover <@ref>              Hover element
         \\  focus <@ref>              Focus element
         \\  check <@ref>              Check checkbox
