@@ -199,6 +199,8 @@ pub fn main() void {
     var allowed_domains: ?[]const u8 = null;
     var content_boundaries = false;
     var no_auto_dialog = false;
+    // --init-script=PATH (반복 가능) → 쉼표로 join 누적
+    var init_scripts_buf: std.ArrayList(u8) = .empty;
 
     // Load config file defaults (best-effort)
     var config_headed = false;
@@ -231,6 +233,10 @@ pub fn main() void {
             content_boundaries = true;
         } else if (std.mem.eql(u8, arg, "--no-auto-dialog")) {
             no_auto_dialog = true;
+        } else if (std.mem.startsWith(u8, arg, "--init-script=")) {
+            const path = arg["--init-script=".len..];
+            if (init_scripts_buf.items.len > 0) init_scripts_buf.append(std.heap.page_allocator, ',') catch {};
+            init_scripts_buf.appendSlice(std.heap.page_allocator, path) catch {};
         } else if (std.mem.eql(u8, arg, "--interactive") or std.mem.eql(u8, arg, "--pipe")) {
             interactive = true;
         } else if (std.mem.eql(u8, arg, "--debug")) {
@@ -259,6 +265,7 @@ pub fn main() void {
         .allowed_domains = allowed_domains,
         .content_boundaries = content_boundaries,
         .no_auto_dialog = no_auto_dialog,
+        .init_scripts = if (init_scripts_buf.items.len > 0) init_scripts_buf.items else null,
     };
 
     if (interactive) {
@@ -944,6 +951,12 @@ pub fn main() void {
             std.process.exit(1);
         };
         sendAction(session, "addscript", js_code, null, daemon_opts);
+    } else if (std.mem.eql(u8, cmd, "removeinitscript")) {
+        const identifier = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools removeinitscript <identifier>\n", .{});
+            std.process.exit(1);
+        };
+        sendAction(session, "removeinitscript", identifier, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "waiturl")) {
         const pattern = args_iter.next() orelse {
             writeErr("Usage: agent-devtools waiturl <pattern> [timeout_ms]\n", .{});
@@ -1825,6 +1838,7 @@ fn runDaemon() void {
     const ext_port = daemon.getenv("AGENT_DEVTOOLS_PORT");
     const env_auto_connect = daemon.getenv("AGENT_DEVTOOLS_AUTO_CONNECT") != null;
     const env_user_agent = daemon.getenv("AGENT_DEVTOOLS_USER_AGENT");
+    const env_init_scripts = daemon.getenv("AGENT_DEVTOOLS_INIT_SCRIPTS");
     const env_proxy = daemon.getenv("AGENT_DEVTOOLS_PROXY");
     const env_proxy_bypass = daemon.getenv("AGENT_DEVTOOLS_PROXY_BYPASS");
     const env_extensions = daemon.getenv("AGENT_DEVTOOLS_EXTENSIONS");
@@ -2015,9 +2029,17 @@ fn runDaemon() void {
         }
     }
 
-    // Drain enable responses (short timeout to avoid 5s hang on last iteration)
+    // --init-script: 파일들을 Page.addScriptToEvaluateOnNewDocument로 등록
+    // (다음 네비게이션의 페이지 JS보다 먼저 실행됨)
+    const init_script_count: usize = if (env_init_scripts) |csv|
+        registerInitScripts(allocator, &ws, &cmd_id, session_id, csv)
+    else
+        0;
+
+    // Drain enable responses (short timeout to avoid 5s hang on last iteration).
+    // 캡을 init 스크립트 수만큼 늘려 각 addScript 응답까지 흡수.
     ws.setReadTimeout(500);
-    for (0..15) |_| {
+    for (0..15 + init_script_count) |_| {
         const msg = ws.recvMessage() catch break;
         allocator.free(msg);
     }
@@ -3255,6 +3277,8 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleSetContent(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "addscript")) {
         return handleAddScript(allocator, sender, resp_map, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "removeinitscript")) {
+        return handleRemoveInitScript(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "waiturl")) {
         return handleWaitUrl(allocator, sender, resp_map, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "waitfunction")) {
@@ -5852,6 +5876,55 @@ fn handleSetContent(allocator: Allocator, sender: *WsSender, resp_map: *response
 // ============================================================================
 // AddScript (Page.addScriptToEvaluateOnNewDocument)
 // ============================================================================
+
+/// 쉼표/개행 구분 경로 목록의 각 파일을 읽어
+/// Page.addScriptToEvaluateOnNewDocument로 등록 (best-effort, 실패는 stderr 경고).
+fn registerInitScripts(allocator: Allocator, ws: *websocket.Client, cmd_id: *cdp.CommandId, session_id: ?[]const u8, csv: []const u8) usize {
+    var sent: usize = 0;
+    var it = std.mem.tokenizeAny(u8, csv, ",\n");
+    while (it.next()) |path_raw| {
+        const path = std.mem.trim(u8, path_raw, " \t\r");
+        if (path.len == 0) continue;
+        const source = std.fs.cwd().readFileAlloc(allocator, path, 10 * 1024 * 1024) catch {
+            std.debug.print("Daemon: failed to read --init-script '{s}'\n", .{path});
+            continue;
+        };
+        defer allocator.free(source);
+
+        const params = cdp.jsonObject1(allocator, "source", source) catch continue;
+        defer allocator.free(params);
+
+        const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Page.addScriptToEvaluateOnNewDocument", params, session_id) catch continue;
+        defer allocator.free(cmd);
+        ws.sendText(cmd) catch continue;
+        sent += 1;
+    }
+    return sent;
+}
+
+/// addscript가 반환한 identifier로 등록된 init 스크립트 제거.
+fn handleRemoveInitScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, id_opt: ?[]const u8) []u8 {
+    const identifier = id_opt orelse return respondErr(allocator, "identifier required");
+
+    const params = cdp.jsonObject1(allocator, "identifier", identifier) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+
+    const sent_id = cmd_id.next();
+    const cmd = cdp.serializeCommand(allocator, sent_id, "Page.removeScriptToEvaluateOnNewDocument", params, session_id) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+
+    const raw = sendAndWait(sender, resp_map, cmd, sent_id, 10_000) orelse
+        return respondErr(allocator, "removeinitscript timeout");
+    defer allocator.free(raw);
+
+    const parsed = cdp.parseMessage(allocator, raw) catch
+        return respondErr(allocator, "parse error");
+    defer parsed.parsed.deinit();
+
+    if (parsed.message.isErrorResponse()) return respondErr(allocator, "removeinitscript failed (invalid identifier?)");
+    return respondOk(allocator);
+}
 
 fn handleAddScript(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, js_code_opt: ?[]const u8) []u8 {
     const js_code = js_code_opt orelse return respondErr(allocator, "js code required");
@@ -8793,6 +8866,7 @@ fn printUsage() void {
         \\
         \\Other:
         \\  addscript <js>            Add script to evaluate on every new page
+        \\  removeinitscript <id>     Remove a script added by addscript/--init-script (by identifier)
         \\  addstyle <css>            Add <style> tag to page
         \\  credentials <user> <pass> Set HTTP basic auth credentials
         \\  download-path <dir>       Set download directory
@@ -8822,6 +8896,7 @@ fn printUsage() void {
         \\  --allowed-domains <list>  Restrict navigation to domains (e.g. example.com,*.internal.com)
         \\  --content-boundaries      Wrap page content output with boundary markers
         \\  --no-auto-dialog          Do not auto-dismiss alert/beforeunload dialogs
+        \\  --init-script <path>      Register a script file to run before page JS (repeatable)
         \\  --interactive, --pipe     Persistent REPL mode (JSON stdin/stdout + event streaming)
         \\  -h, --help                Show this help
         \\  -v, --version             Show version
@@ -9515,6 +9590,23 @@ test "collectLinkBackendIds: empty/missing nodes yields empty slice" {
     const ids = try collectLinkBackendIds(allocator, parsed.value);
     defer allocator.free(ids);
     try std.testing.expectEqual(@as(usize, 0), ids.len);
+}
+
+test "init-script CSV: comma/newline separated paths, trimmed, blanks skipped" {
+    // registerInitScripts의 경로 분리 계약 회귀 방지
+    var it = std.mem.tokenizeAny(u8, " a.js, b.js\n\n c.js ,", ",\n");
+    var got: [3][]const u8 = undefined;
+    var n: usize = 0;
+    while (it.next()) |p| {
+        const t = std.mem.trim(u8, p, " \t\r");
+        if (t.len == 0) continue;
+        got[n] = t;
+        n += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 3), n);
+    try std.testing.expectEqualStrings("a.js", got[0]);
+    try std.testing.expectEqualStrings("b.js", got[1]);
+    try std.testing.expectEqualStrings("c.js", got[2]);
 }
 
 test "VITALS scripts: observe all core web vitals + emit expected keys" {

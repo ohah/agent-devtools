@@ -220,7 +220,7 @@ pub fn runtimeEvaluate(allocator: Allocator, id: u64, expression: []const u8, se
 }
 
 /// Build a JSON object with a single string key-value pair, properly escaped.
-fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
+pub fn jsonObject1(allocator: Allocator, key: []const u8, value: []const u8) ![]u8 {
     var buf: std.ArrayList(u8) = .empty;
     errdefer buf.deinit(allocator);
 
