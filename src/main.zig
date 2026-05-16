@@ -553,7 +553,17 @@ pub fn main() void {
         if (std.mem.eql(u8, subcmd, "list") or std.mem.eql(u8, subcmd, "tab")) {
             sendAction(session, "tab_list", null, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "new")) {
-            sendAction(session, "tab_new", args_iter.next(), null, daemon_opts);
+            // tab new [--label <name>] [url] (순서 무관)
+            var tab_url: ?[]const u8 = null;
+            var tab_label: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--label")) {
+                    tab_label = args_iter.next();
+                } else if (tab_url == null) {
+                    tab_url = a;
+                }
+            }
+            sendActionEx(session, "tab_new", tab_url, tab_label, null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "close")) {
             sendAction(session, "tab_close", args_iter.next(), null, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "count")) {
@@ -3010,7 +3020,16 @@ fn runDaemon() void {
         .trace_mutex = &trace_mutex,
         .video_recorder = &video_recorder,
         .cdp_url = ws_url,
+        .tab_labels = std.StringHashMap([]u8).init(allocator),
     };
+    defer {
+        var lit = shared_ctx.tab_labels.iterator();
+        while (lit.next()) |e| {
+            allocator.free(e.key_ptr.*);
+            allocator.free(e.value_ptr.*);
+        }
+        shared_ctx.tab_labels.deinit();
+    }
 
     const MAX_WORKERS = 8;
     var worker_slots: [MAX_WORKERS]WorkerSlot = .{WorkerSlot{}} ** MAX_WORKERS;
@@ -3507,6 +3526,8 @@ const DaemonContext = struct {
     video_recorder: *VideoRecorder,
     cdp_url: []const u8 = "", // 연결된 CDP WebSocket URL (get cdp-url)
     last_snapshot: ?[]u8 = null, // diff snapshot 세션 베이스라인 (allocator 소유)
+    tab_labels: std.StringHashMap([]u8), // tab new --label: label→targetId (키·값 allocator 소유)
+    tab_labels_mutex: std.Thread.Mutex = .{}, // tab_labels 동시 접근 보호 (워커 풀)
 };
 
 /// Send a CDP command and wait for the response. Returns raw message bytes (caller must free).
@@ -3987,10 +4008,12 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
                 }
             }
         }
-        return handleSimpleCdpWithParams(allocator, sender, cmd_id, session_id, "Target.createTarget", req.url);
-        // NOTE: extra closing brace was needed for the if(ctx.allowed_domains) block — but the structure above closes correctly
+        // req.url = url, req.pattern = --label 이름
+        return handleTabNew(ctx, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "tab_close")) {
-        return handleTabClose(allocator, sender, resp_map, cmd_id, session_id, req.url);
+        const tref = resolveTabLabelRefDup(ctx, req.url);
+        defer if (tref) |t| allocator.free(t);
+        return handleTabClose(allocator, sender, resp_map, cmd_id, session_id, tref);
     } else if (std.mem.eql(u8, req.action, "cookies_list")) {
         return handleEval(allocator, sender, resp_map, cmd_id, session_id, "JSON.stringify(document.cookie)");
     } else if (std.mem.eql(u8, req.action, "cookies_clear")) {
@@ -4208,7 +4231,9 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "clipboard_set")) {
         return handleClipboardSet(allocator, sender, resp_map, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "tab_switch")) {
-        return handleTabSwitch(allocator, sender, resp_map, cmd_id, session_id, req.url);
+        const tref = resolveTabLabelRefDup(ctx, req.url);
+        defer if (tref) |t| allocator.free(t);
+        return handleTabSwitch(allocator, sender, resp_map, cmd_id, session_id, tref);
     } else if (std.mem.eql(u8, req.action, "window_new")) {
         return handleWindowNew(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "pause")) {
@@ -7979,6 +8004,78 @@ fn handleClipboardSet(allocator: Allocator, sender: *WsSender, resp_map: *respon
     defer allocator.free(raw);
 
     return respondOk(allocator);
+}
+
+/// tab new [--label name] [url]: 새 탭 생성 후 targetId 반환. label이 있으면
+/// label→targetId를 ctx에 기록(이후 tab switch/close에서 라벨 참조 가능).
+fn handleTabNew(ctx: *DaemonContext, url_opt: ?[]const u8, label_opt: ?[]const u8) []u8 {
+    const a = ctx.allocator;
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    const w = buf.writer(a);
+    w.writeAll("{\"url\":") catch return respondErr(a, "write error");
+    cdp.writeJsonString(w, url_opt orelse "about:blank") catch return respondErr(a, "write error");
+    w.writeByte('}') catch {};
+    const params = buf.toOwnedSlice(a) catch return respondErr(a, "alloc error");
+    defer a.free(params);
+
+    const sent_id = ctx.cmd_id.next();
+    const cmd = cdp.serializeCommand(a, sent_id, "Target.createTarget", params, null) catch
+        return respondErr(a, "cmd error");
+    defer a.free(cmd);
+    const raw = sendAndWait(ctx.sender, ctx.response_map, cmd, sent_id, 10_000) orelse
+        return respondErr(a, "tab new timeout");
+    defer a.free(raw);
+    const parsed = cdp.parseMessage(a, raw) catch return respondErr(a, "parse error");
+    defer parsed.parsed.deinit();
+    const tid = blk: {
+        if (parsed.message.isResponse()) if (parsed.message.result) |r|
+            if (cdp.getString(r, "targetId")) |t| break :blk t;
+        return respondErr(a, "tab new failed");
+    };
+
+    if (label_opt) |label| {
+        if (label.len > 0) {
+            ctx.tab_labels_mutex.lock();
+            defer ctx.tab_labels_mutex.unlock();
+            const tid_dup = a.dupe(u8, tid) catch return respondErr(a, "alloc error");
+            if (ctx.tab_labels.fetchRemove(label)) |old| {
+                a.free(old.key);
+                a.free(old.value);
+            }
+            const key_dup = a.dupe(u8, label) catch {
+                a.free(tid_dup);
+                return respondErr(a, "alloc error");
+            };
+            ctx.tab_labels.put(key_dup, tid_dup) catch {
+                a.free(key_dup);
+                a.free(tid_dup);
+                return respondErr(a, "alloc error");
+            };
+        }
+    }
+
+    const data = cdp.jsonObject1(a, "targetId", tid) catch return respondErr(a, "alloc error");
+    defer a.free(data);
+    return daemon.serializeResponse(a, .{ .success = true, .data = data }) catch respondErr(a, "resp error");
+}
+
+/// 라벨 맵에서 ref를 조회: 등록된 라벨이면 targetId, 아니면 원본 그대로.
+/// (순수 — 동시성 보호는 호출부 담당. 반환은 map/ref 소유 슬라이스 — 동기 사용만.)
+fn lookupTabLabel(map: *const std.StringHashMap([]u8), ref: ?[]const u8) ?[]const u8 {
+    const r = ref orelse return null;
+    if (map.get(r)) |tid| return tid;
+    return r;
+}
+
+/// tab ref가 등록된 라벨이면 targetId로 치환, 아니면 원본 그대로 — owned 복사
+/// 반환(호출자 free). 뮤텍스 보호 하에 즉시 dup하므로 수명 안전.
+fn resolveTabLabelRefDup(ctx: *DaemonContext, ref: ?[]const u8) ?[]u8 {
+    if (ref == null) return null;
+    ctx.tab_labels_mutex.lock();
+    defer ctx.tab_labels_mutex.unlock();
+    const resolved = lookupTabLabel(&ctx.tab_labels, ref) orelse return null;
+    return ctx.allocator.dupe(u8, resolved) catch null;
 }
 
 /// 탭 ref(안정 targetId 또는 0-base 인덱스) → targetId 해석 결과.
@@ -12121,6 +12218,18 @@ test "buildDiffExtraJson: subsets + depth validation" {
     defer a.free(e2);
     try std.testing.expectEqualStrings("{}", e2);
     try std.testing.expectError(error.InvalidDepth, buildDiffExtraJson(a, null, null, "x", false, null));
+}
+
+test "lookupTabLabel: label→targetId, passthrough, null" {
+    const a = std.testing.allocator;
+    var map = std.StringHashMap([]u8).init(a);
+    defer map.deinit();
+    const tid = try a.dupe(u8, "TARGET-123");
+    defer a.free(tid);
+    try map.put("login", tid);
+    try std.testing.expectEqualStrings("TARGET-123", lookupTabLabel(&map, "login").?);
+    try std.testing.expectEqualStrings("other", lookupTabLabel(&map, "other").?); // passthrough
+    try std.testing.expect(lookupTabLabel(&map, null) == null);
 }
 
 test "buildDebugResponse: merges debug into response" {
