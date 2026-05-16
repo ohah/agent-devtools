@@ -1204,11 +1204,52 @@ pub fn main() void {
         };
         sendAction(session, "record", name, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "diff")) {
-        const name = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools diff <recording-name>\n", .{});
+        const first = args_iter.next() orelse {
+            writeErr("Usage: agent-devtools diff <snapshot|url|recording-name>\n", .{});
             std.process.exit(1);
         };
-        sendAction(session, "diff", name, null, daemon_opts);
+        if (std.mem.eql(u8, first, "snapshot") or std.mem.eql(u8, first, "url")) {
+            const is_url = std.mem.eql(u8, first, "url");
+            var url1: ?[]const u8 = null;
+            var url2: ?[]const u8 = null;
+            if (is_url) {
+                url1 = args_iter.next();
+                url2 = args_iter.next();
+                if (url1 == null or url2 == null) {
+                    writeErr("Usage: agent-devtools diff url <url1> <url2> [-s sel] [-c] [-d n] [--wait-until w]\n", .{});
+                    std.process.exit(1);
+                }
+            }
+            var baseline: ?[]const u8 = null;
+            var selector: ?[]const u8 = null;
+            var depth: ?[]const u8 = null;
+            var interactive_d = false;
+            var wait_until: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "-b") or std.mem.eql(u8, a, "--baseline")) {
+                    baseline = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-s") or std.mem.eql(u8, a, "--selector")) {
+                    selector = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-d") or std.mem.eql(u8, a, "--depth")) {
+                    depth = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-i") or std.mem.eql(u8, a, "--interactive")) {
+                    interactive_d = true;
+                } else if (std.mem.eql(u8, a, "--wait-until")) {
+                    wait_until = args_iter.next();
+                } else if (std.mem.eql(u8, a, "-c") or std.mem.eql(u8, a, "--compact")) {
+                    // accepted no-op (출력 기본 compact)
+                }
+            }
+            const pa = std.heap.page_allocator;
+            const extra = buildDiffExtraJson(pa, baseline, selector, depth, interactive_d, wait_until) catch {
+                writeErr("diff: build error (depth must be an integer)\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(extra);
+            sendActionEx(session, if (is_url) "diff_url" else "diff_snapshot", url1, url2, extra, daemon_opts);
+        } else {
+            sendAction(session, "diff", first, null, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "find")) {
         const strategy = args_iter.next() orelse {
             writeErr("Usage: agent-devtools find <role|text|label|placeholder|alt|title|testid|first|last|nth> <value> [action] [text] [--name N] [--exact]\n", .{});
@@ -1772,6 +1813,44 @@ fn buildSnapshotExtraJson(allocator: Allocator, depth: ?[]const u8, selector: ?[
         if (!first) try w.writeByte(',');
         try w.writeAll("\"selector\":");
         try cdp.writeJsonString(w, s);
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// diff snapshot/url → 데몬 전달 JSON. depth는 정수 검증, 나머지는 선택.
+fn buildDiffExtraJson(allocator: Allocator, baseline: ?[]const u8, selector: ?[]const u8, depth: ?[]const u8, interactive: bool, wait_until: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeByte('{');
+    var first = true;
+    if (baseline) |b| {
+        try w.writeAll("\"baseline\":");
+        try cdp.writeJsonString(w, b);
+        first = false;
+    }
+    if (selector) |s| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"selector\":");
+        try cdp.writeJsonString(w, s);
+        first = false;
+    }
+    if (depth) |d| {
+        const n = std.fmt.parseInt(u32, d, 10) catch return error.InvalidDepth;
+        if (!first) try w.writeByte(',');
+        try w.print("\"depth\":{d}", .{n});
+        first = false;
+    }
+    if (wait_until) |wu| {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"waitUntil\":");
+        try cdp.writeJsonString(w, wu);
+        first = false;
+    }
+    if (interactive) {
+        if (!first) try w.writeByte(',');
+        try w.writeAll("\"interactive\":true");
     }
     try w.writeByte('}');
     return buf.toOwnedSlice(allocator);
@@ -3427,6 +3506,7 @@ const DaemonContext = struct {
     trace_mutex: *std.Thread.Mutex,
     video_recorder: *VideoRecorder,
     cdp_url: []const u8 = "", // 연결된 CDP WebSocket URL (get cdp-url)
+    last_snapshot: ?[]u8 = null, // diff snapshot 세션 베이스라인 (allocator 소유)
 };
 
 /// Send a CDP command and wait for the response. Returns raw message bytes (caller must free).
@@ -3997,6 +4077,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         collector_mutex.lock();
         defer collector_mutex.unlock();
         return handleDiff(allocator, collector, req.url);
+    } else if (std.mem.eql(u8, req.action, "diff_snapshot")) {
+        ctx.ref_map_rwlock.lock();
+        defer ctx.ref_map_rwlock.unlock();
+        return handleDiffSnapshot(ctx, req);
+    } else if (std.mem.eql(u8, req.action, "diff_url")) {
+        ctx.ref_map_rwlock.lock();
+        defer ctx.ref_map_rwlock.unlock();
+        return handleDiffUrl(ctx, req);
     } else if (std.mem.eql(u8, req.action, "intercept_mock")) {
         ctx.intercept_mutex.lock();
         defer ctx.intercept_mutex.unlock();
@@ -4510,36 +4598,123 @@ fn resolveElementHref(allocator: Allocator, sender: *WsSender, resp_map: *respon
     return null;
 }
 
-fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool, extra_opt: ?[]const u8) []u8 {
-    // -d/--depth, -s/--selector 옵션 파싱
-    var snap_opts = snapshot_mod.SnapOpts{};
-    var parsed_extra: ?std.json.Parsed(std.json.Value) = null;
-    defer if (parsed_extra) |p| p.deinit();
-    if (extra_opt) |ex| {
-        parsed_extra = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch null;
-        if (parsed_extra) |p| {
-            if (p.value == .object) {
-                if (p.value.object.get("depth")) |dv| {
-                    if (dv == .integer and dv.integer > 0) snap_opts.max_depth = @intCast(dv.integer);
-                }
-                if (p.value.object.get("selector")) |sv| {
-                    if (sv == .string and sv.string.len > 0) {
-                        snap_opts.root_backend_id = resolveSelectorBackendId(allocator, sender, resp_map, cmd_id, session_id, sv.string);
-                        if (snap_opts.root_backend_id == null)
-                            return respondErr(allocator, "snapshot --selector: element not found");
-                    }
-                }
+/// 두 텍스트의 라인 단위 diff (LCS). `- `/`+ `/`  ` 접두 + 끝에 요약 1줄.
+/// 스냅샷은 수십~수백 줄이라 O(n*m) DP 허용. 호출자가 free.
+fn diffLines(allocator: Allocator, old_text: []const u8, new_text: []const u8) ![]u8 {
+    var old_lines: std.ArrayList([]const u8) = .empty;
+    defer old_lines.deinit(allocator);
+    var new_lines: std.ArrayList([]const u8) = .empty;
+    defer new_lines.deinit(allocator);
+    {
+        var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, old_text, "\n"), '\n');
+        while (it.next()) |l| try old_lines.append(allocator, l);
+    }
+    {
+        var it = std.mem.splitScalar(u8, std.mem.trimRight(u8, new_text, "\n"), '\n');
+        while (it.next()) |l| try new_lines.append(allocator, l);
+    }
+    const a = old_lines.items;
+    const b = new_lines.items;
+    const n = a.len;
+    const m = b.len;
+
+    // LCS DP 테이블 (n+1)*(m+1)
+    const lcs = try allocator.alloc(usize, (n + 1) * (m + 1));
+    defer allocator.free(lcs);
+    @memset(lcs, 0);
+    const idx = struct {
+        fn at(i: usize, j: usize, w: usize) usize {
+            return i * (w + 1) + j;
+        }
+    }.at;
+    var i: usize = n;
+    while (i > 0) : (i -= 1) {
+        var j: usize = m;
+        while (j > 0) : (j -= 1) {
+            if (std.mem.eql(u8, a[i - 1], b[j - 1])) {
+                lcs[idx(i - 1, j - 1, m)] = lcs[idx(i, j, m)] + 1;
+            } else {
+                lcs[idx(i - 1, j - 1, m)] = @max(lcs[idx(i, j - 1, m)], lcs[idx(i - 1, j, m)]);
             }
         }
     }
-    // Clear old refs
+
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(allocator);
+    const w = out.writer(allocator);
+    var added: usize = 0;
+    var removed: usize = 0;
+    var same: usize = 0;
+    var x: usize = 0;
+    var y: usize = 0;
+    while (x < n and y < m) {
+        if (std.mem.eql(u8, a[x], b[y])) {
+            try w.print("  {s}\n", .{a[x]});
+            same += 1;
+            x += 1;
+            y += 1;
+        } else if (lcs[idx(x + 1, y, m)] >= lcs[idx(x, y + 1, m)]) {
+            try w.print("- {s}\n", .{a[x]});
+            removed += 1;
+            x += 1;
+        } else {
+            try w.print("+ {s}\n", .{b[y]});
+            added += 1;
+            y += 1;
+        }
+    }
+    while (x < n) : (x += 1) {
+        try w.print("- {s}\n", .{a[x]});
+        removed += 1;
+    }
+    while (y < m) : (y += 1) {
+        try w.print("+ {s}\n", .{b[y]});
+        added += 1;
+    }
+    try w.print("({d} added, {d} removed, {d} unchanged)", .{ added, removed, same });
+    return out.toOwnedSlice(allocator);
+}
+
+/// extra JSON을 한 번만 파싱해 snapshot/diff 옵션 전부 해석.
+/// selector가 주어졌으나 DOM에서 못 찾으면 sel_missing=true.
+/// baseline은 owned 복사 — 호출자가 free.
+const SnapOptsResult = struct {
+    opts: snapshot_mod.SnapOpts,
+    sel_missing: bool = false,
+    interactive: bool = false,
+    baseline: ?[]u8 = null,
+};
+fn resolveSnapOpts(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, extra_opt: ?[]const u8) SnapOptsResult {
+    var opts = snapshot_mod.SnapOpts{};
+    const ex = extra_opt orelse return .{ .opts = opts };
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, ex, .{}) catch return .{ .opts = opts };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .opts = opts };
+    const obj = parsed.value.object;
+    if (obj.get("depth")) |dv| {
+        if (dv == .integer and dv.integer > 0) opts.max_depth = @intCast(dv.integer);
+    }
+    const interactive = if (obj.get("interactive")) |iv| (iv == .bool and iv.bool) else false;
+    const baseline: ?[]u8 = if (obj.get("baseline")) |bv|
+        (if (bv == .string and bv.string.len > 0) (allocator.dupe(u8, bv.string) catch null) else null)
+    else
+        null;
+    if (obj.get("selector")) |sv| {
+        if (sv == .string and sv.string.len > 0) {
+            opts.root_backend_id = resolveSelectorBackendId(allocator, sender, resp_map, cmd_id, session_id, sv.string);
+            if (opts.root_backend_id == null) return .{ .opts = opts, .sel_missing = true, .interactive = interactive, .baseline = baseline };
+        }
+    }
+    return .{ .opts = opts, .interactive = interactive, .baseline = baseline };
+}
+
+/// 현재 페이지의 스냅샷 텍스트(원문)를 캡처. 실패 시 null. 호출자가 free.
+fn captureSnapshotText(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool, snap_opts: snapshot_mod.SnapOpts) ?[]u8 {
     ref_map.deinit();
     ref_map.* = snapshot_mod.RefMap.init(allocator);
 
-    // Step 1: Detect cursor-interactive elements (best-effort)
     var cursor_map = findCursorInteractiveElements(allocator, sender, resp_map, cmd_id, session_id);
     defer if (cursor_map) |*cm| {
-        // Free allocated strings in the map
         var it = cm.iterator();
         while (it.next()) |entry| {
             allocator.free(@constCast(entry.value_ptr.kind));
@@ -4549,62 +4724,136 @@ fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_m
         cm.deinit();
     };
 
-    // Get AX tree
     const snap_sent_id = cmd_id.next();
-    const cmd = cdp.serializeCommand(allocator, snap_sent_id, "Accessibility.getFullAXTree", null, session_id) catch
-        return respondErr(allocator, "cmd error");
+    const cmd = cdp.serializeCommand(allocator, snap_sent_id, "Accessibility.getFullAXTree", null, session_id) catch return null;
     defer allocator.free(cmd);
-
-    const raw = sendAndWait(sender, resp_map, cmd, snap_sent_id, 15_000) orelse
-        return respondErr(allocator, "snapshot timeout");
+    const raw = sendAndWait(sender, resp_map, cmd, snap_sent_id, 15_000) orelse return null;
     defer allocator.free(raw);
-
-    const parsed = cdp.parseMessage(allocator, raw) catch
-        return respondErr(allocator, "parse error");
+    const parsed = cdp.parseMessage(allocator, raw) catch return null;
     defer parsed.parsed.deinit();
+    if (!parsed.message.isResponse()) return null;
+    const result = parsed.message.result orelse return null;
 
-    if (parsed.message.isResponse()) {
-        if (parsed.message.result) |result| {
-            const cursor_ptr: ?*const snapshot_mod.CursorElementMap = if (cursor_map) |*cm| cm else null;
-
-            // --urls: link 요소의 href를 backendNodeId 기준으로 미리 해석
-            var link_url_map = std.AutoHashMap(i64, []const u8).init(allocator);
-            defer {
-                var uit = link_url_map.iterator();
-                while (uit.next()) |e| allocator.free(@constCast(e.value_ptr.*));
-                link_url_map.deinit();
-            }
-            if (with_urls) {
-                if (collectLinkBackendIds(allocator, result)) |ids| {
-                    defer allocator.free(ids);
-                    for (ids) |bid| {
-                        if (link_url_map.contains(bid)) continue;
-                        if (resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, bid)) |href| {
-                            link_url_map.put(bid, href) catch allocator.free(href);
-                        }
-                    }
-                } else |_| {}
-            }
-            const url_ptr: ?*const std.AutoHashMap(i64, []const u8) = if (with_urls) &link_url_map else null;
-
-            const snap = snapshot_mod.buildSnapshotWithOpts(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr, snap_opts) catch
-                return respondErr(allocator, "snapshot build error");
-            defer allocator.free(snap);
-
-            // Return snapshot text as JSON string
-            var resp_buf: std.ArrayList(u8) = .empty;
-            defer resp_buf.deinit(allocator);
-            cdp.writeJsonString(resp_buf.writer(allocator), snap) catch
-                return respondErr(allocator, "serialize error");
-
-            const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
-            defer allocator.free(data);
-
-            return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
-                respondErr(allocator, "resp error");
-        }
+    const cursor_ptr: ?*const snapshot_mod.CursorElementMap = if (cursor_map) |*cm| cm else null;
+    var link_url_map = std.AutoHashMap(i64, []const u8).init(allocator);
+    defer {
+        var uit = link_url_map.iterator();
+        while (uit.next()) |e| allocator.free(@constCast(e.value_ptr.*));
+        link_url_map.deinit();
     }
-    return respondErr(allocator, "snapshot failed");
+    if (with_urls) {
+        if (collectLinkBackendIds(allocator, result)) |ids| {
+            defer allocator.free(ids);
+            for (ids) |bid| {
+                if (link_url_map.contains(bid)) continue;
+                if (resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, bid)) |href| {
+                    link_url_map.put(bid, href) catch allocator.free(href);
+                }
+            }
+        } else |_| {}
+    }
+    const url_ptr: ?*const std.AutoHashMap(i64, []const u8) = if (with_urls) &link_url_map else null;
+    return snapshot_mod.buildSnapshotWithOpts(allocator, result, ref_map, interactive_only, cursor_ptr, url_ptr, snap_opts) catch null;
+}
+
+fn handleSnapshot(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, interactive_only: bool, with_urls: bool, extra_opt: ?[]const u8) []u8 {
+    const so = resolveSnapOpts(allocator, sender, resp_map, cmd_id, session_id, extra_opt);
+    defer if (so.baseline) |b| allocator.free(b);
+    if (so.sel_missing) return respondErr(allocator, "snapshot --selector: element not found");
+
+    const snap = captureSnapshotText(allocator, sender, resp_map, cmd_id, session_id, ref_map, interactive_only, with_urls, so.opts) orelse
+        return respondErr(allocator, "snapshot failed");
+    defer allocator.free(snap);
+
+    var resp_buf: std.ArrayList(u8) = .empty;
+    defer resp_buf.deinit(allocator);
+    cdp.writeJsonString(resp_buf.writer(allocator), snap) catch
+        return respondErr(allocator, "serialize error");
+    const data = resp_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch
+        respondErr(allocator, "resp error");
+}
+
+/// diff 결과 텍스트를 JSON 문자열 data로 응답.
+fn respondDiffText(allocator: Allocator, diff_text: []const u8) []u8 {
+    var rb: std.ArrayList(u8) = .empty;
+    defer rb.deinit(allocator);
+    cdp.writeJsonString(rb.writer(allocator), diff_text) catch return respondErr(allocator, "serialize error");
+    const data = rb.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(data);
+    return daemon.serializeResponse(allocator, .{ .success = true, .data = data }) catch respondErr(allocator, "resp error");
+}
+
+/// diff snapshot: 현재 스냅샷 vs (--baseline 파일 | 세션 직전 스냅샷).
+fn handleDiffSnapshot(ctx: *DaemonContext, req: daemon.Request) []u8 {
+    const a = ctx.allocator;
+    const so = resolveSnapOpts(a, ctx.sender, ctx.response_map, ctx.cmd_id, ctx.session_id, req.extra);
+    defer if (so.baseline) |b| a.free(b);
+    if (so.sel_missing) return respondErr(a, "diff snapshot --selector: element not found");
+
+    const cur = captureSnapshotText(a, ctx.sender, ctx.response_map, ctx.cmd_id, ctx.session_id, ctx.ref_map, so.interactive, false, so.opts) orelse
+        return respondErr(a, "diff snapshot: capture failed");
+    defer a.free(cur);
+
+    // baseline: --baseline 파일 우선, 없으면 세션 직전 스냅샷
+    var baseline_owned: ?[]u8 = null;
+    defer if (baseline_owned) |b| a.free(b);
+    const baseline: []const u8 = blk: {
+        if (so.baseline) |path| {
+            baseline_owned = std.fs.cwd().readFileAlloc(a, path, 16 * 1024 * 1024) catch
+                return respondErr(a, "diff snapshot: cannot read baseline file");
+            break :blk baseline_owned.?;
+        }
+        break :blk ctx.last_snapshot orelse {
+            // 베이스라인 없음 → 현재를 베이스라인으로 저장하고 안내
+            if (ctx.last_snapshot) |old| a.free(old);
+            ctx.last_snapshot = a.dupe(u8, cur) catch null;
+            return respondDiffText(a, "(no baseline yet — current snapshot saved as baseline)");
+        };
+    };
+
+    const diff_text = diffLines(a, baseline, cur) catch return respondErr(a, "diff error");
+    defer a.free(diff_text);
+
+    // 세션 베이스라인 갱신 (다음 diff는 이번 스냅샷 기준)
+    if (ctx.last_snapshot) |old| a.free(old);
+    ctx.last_snapshot = a.dupe(u8, cur) catch null;
+
+    return respondDiffText(a, diff_text);
+}
+
+/// diff url <u1> <u2>: 두 URL의 스냅샷을 순차 캡처해 비교.
+fn handleDiffUrl(ctx: *DaemonContext, req: daemon.Request) []u8 {
+    const a = ctx.allocator;
+    const url1 = req.url orelse return respondErr(a, "diff url: url1 required");
+    const url2 = req.pattern orelse return respondErr(a, "diff url: url2 required");
+    const so = resolveSnapOpts(a, ctx.sender, ctx.response_map, ctx.cmd_id, ctx.session_id, req.extra);
+    defer if (so.baseline) |b| a.free(b);
+    const interactive = so.interactive;
+    // selector는 페이지마다 별도 해석돼야 하므로 여기선 depth만 사용 (selector는
+    // u1에서 해석된 backendId가 u2엔 무의미) → root_backend_id 무시
+    var opts = so.opts;
+    opts.root_backend_id = null;
+
+    const cap = struct {
+        fn go(c: *DaemonContext, url: []const u8, o: snapshot_mod.SnapOpts, intr: bool) ?[]u8 {
+            const r1 = handleOpen(c.allocator, c.sender, c.cmd_id, c.session_id, url, c.allowed_domains);
+            c.allocator.free(r1);
+            const r2 = handleWaitLoad(c.allocator, c.sender, c.response_map, c.cmd_id, c.session_id, "15000");
+            c.allocator.free(r2);
+            return captureSnapshotText(c.allocator, c.sender, c.response_map, c.cmd_id, c.session_id, c.ref_map, intr, false, o);
+        }
+    }.go;
+
+    const s1 = cap(ctx, url1, opts, interactive) orelse return respondErr(a, "diff url: capture of url1 failed");
+    defer a.free(s1);
+    const s2 = cap(ctx, url2, opts, interactive) orelse return respondErr(a, "diff url: capture of url2 failed");
+    defer a.free(s2);
+
+    const diff_text = diffLines(a, s1, s2) catch return respondErr(a, "diff error");
+    defer a.free(diff_text);
+    return respondDiffText(a, diff_text);
 }
 
 /// JS script to detect non-ARIA interactive elements (cursor:pointer, onclick, tabindex, contenteditable).
@@ -11833,6 +12082,45 @@ test "buildSnapshotExtraJson: depth/selector subsets" {
     defer a.free(e3);
     try std.testing.expectEqualStrings("{\"depth\":5}", e3);
     try std.testing.expectError(error.InvalidDepth, buildSnapshotExtraJson(a, "abc", null));
+}
+
+test "diffLines: add/remove/unchanged + summary" {
+    const a = std.testing.allocator;
+    const d = try diffLines(a, "x\ny\nz\n", "x\nY\nz\n");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "  x\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "- y\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ Y\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "  z\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "(1 added, 1 removed, 2 unchanged)") != null);
+}
+
+test "diffLines: identical → all unchanged, zero add/remove" {
+    const a = std.testing.allocator;
+    const d = try diffLines(a, "a\nb\n", "a\nb\n");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "(0 added, 0 removed, 2 unchanged)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "- ") == null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ ") == null);
+}
+
+test "diffLines: pure additions" {
+    const a = std.testing.allocator;
+    const d = try diffLines(a, "", "n1\nn2\n");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ n1\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "+ n2\n") != null);
+}
+
+test "buildDiffExtraJson: subsets + depth validation" {
+    const a = std.testing.allocator;
+    const e1 = try buildDiffExtraJson(a, "base.txt", "#m", "3", true, "load");
+    defer a.free(e1);
+    try std.testing.expectEqualStrings("{\"baseline\":\"base.txt\",\"selector\":\"#m\",\"depth\":3,\"waitUntil\":\"load\",\"interactive\":true}", e1);
+    const e2 = try buildDiffExtraJson(a, null, null, null, false, null);
+    defer a.free(e2);
+    try std.testing.expectEqualStrings("{}", e2);
+    try std.testing.expectError(error.InvalidDepth, buildDiffExtraJson(a, null, null, "x", false, null));
 }
 
 test "buildDebugResponse: merges debug into response" {
