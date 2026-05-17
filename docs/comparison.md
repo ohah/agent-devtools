@@ -8,7 +8,7 @@
 | **배포** | 단일 바이너리 (~2MB) | npm 패키지 |
 | **스레딩** | 멀티스레드 (워커 풀) | tokio async |
 | **통신** | Unix Socket / TCP (Windows) | Unix Socket / TCP (Windows) |
-| **AX Tree** | 100% 동일 (diff 0줄 검증) | 기준 구현 |
+| **AX Tree** | 동일 포맷·구조 (정적 페이지 diff 0; 동적은 ref번호/상태차) | 기준 구현 |
 | **테스트** | 533개 유닛 + 실제 Chrome E2E | 44 E2E |
 | **버전 기준** | agent-browser 0.27 동기화 완료 | 0.27 |
 
@@ -89,14 +89,17 @@ space-separated(`--flag value`) 파싱 · `batch` 인라인 인자 · `vitals --
 
 ## 스냅샷 동일성 검증
 
-4개 사이트에서 실제 비교 (diff 0줄):
+**포맷·구조 동일** (`- role "name" [props, ref=eN]` 들여쓰기 트리). 토큰량도
+동등 — Wikipedia 실측: `snapshot -i` agent-devtools가 약 2.7% **작고**,
+full은 약 0.8% 큼(오차범위).
 
-| 사이트 | agent-browser | agent-devtools | diff |
-|---|---|---|---|
-| Google | 18줄 | 18줄 | **0** |
-| httpbin (폼) | 16줄 | 16줄 | **0** |
-| YouTube | 14줄 | 14줄 | **0** |
-| GitHub (142줄) | 142줄 | 142줄 | **0** |
+| 페이지 유형 | 결과 |
+|---|---|
+| 정적 소형 (example.com, Google, httpbin) | **diff 0** (완전 일치) |
+| 동적 대형 (Wikipedia 등) | 구조/역할/이름/들여쓰기 동일. 줄 단위 차이는 ref ID 일련번호·캡처시점 위젯 상태(`expanded` 등)·페이지 언어·`generic` 접기 휴리스틱 미세차에서 발생(포맷 차이 아님) |
+
+> 이전 "4개 사이트 diff 0줄" 표기는 정적 소형 페이지에 한해 참이며,
+> 동적 페이지엔 적용되지 않아 위와 같이 정정함(정직한 표기).
 
 ## 포지셔닝
 
