@@ -10252,37 +10252,18 @@ fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, passwo
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return;
 
-    // JSON 직렬화: cdp.writeJsonString으로 안전 이스케이프 (기존 수작업
-    // 이스케이프 3중 복사 제거). 선택적 셀렉터는 있을 때만 기록.
     var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
     defer _ = gpa.deinit();
     const a = gpa.allocator();
-    var buf: std.ArrayList(u8) = .empty;
-    defer buf.deinit(a);
-    const w = buf.writer(a);
-    w.writeAll("{\"url\":") catch return;
-    cdp.writeJsonString(w, url) catch return;
-    w.writeAll(",\"username\":") catch return;
-    cdp.writeJsonString(w, username) catch return;
-    w.writeAll(",\"password\":") catch return;
-    cdp.writeJsonString(w, password) catch return;
-    const opt_fields = [_]struct { k: []const u8, v: ?[]const u8 }{
-        .{ .k = "usernameSelector", .v = sel_user },
-        .{ .k = "passwordSelector", .v = sel_pass },
-        .{ .k = "submitSelector", .v = sel_submit },
+    const json = buildAuthVaultJson(a, url, username, password, sel_user, sel_pass, sel_submit) catch {
+        writeErr("Failed to serialize auth profile\n", .{});
+        return;
     };
-    for (opt_fields) |f| {
-        if (f.v) |val| {
-            if (val.len == 0) continue;
-            w.print(",\"{s}\":", .{f.k}) catch return;
-            cdp.writeJsonString(w, val) catch return;
-        }
-    }
-    w.writeByte('}') catch return;
+    defer a.free(json);
 
     if (std.fs.createFileAbsolute(path, .{})) |file| {
         defer file.close();
-        file.writeAll(buf.items) catch {
+        file.writeAll(json) catch {
             writeErr("Failed to write auth profile\n", .{});
             return;
         };
@@ -10373,6 +10354,63 @@ fn authVaultDelete(name: []const u8) void {
 }
 
 /// Load auth profile from file, return url, username, password.
+/// vault 프로필 JSON 직렬화 (순수, 테스트 가능). 선택적 셀렉터는 값이
+/// 있을 때만 기록. 모든 문자열 cdp.writeJsonString으로 안전 이스케이프.
+fn buildAuthVaultJson(allocator: Allocator, url: []const u8, username: []const u8, password: []const u8, sel_user: ?[]const u8, sel_pass: ?[]const u8, sel_submit: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"url\":");
+    try cdp.writeJsonString(w, url);
+    try w.writeAll(",\"username\":");
+    try cdp.writeJsonString(w, username);
+    try w.writeAll(",\"password\":");
+    try cdp.writeJsonString(w, password);
+    const opt = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "usernameSelector", .v = sel_user },
+        .{ .k = "passwordSelector", .v = sel_pass },
+        .{ .k = "submitSelector", .v = sel_submit },
+    };
+    for (opt) |f| {
+        if (f.v) |val| {
+            if (val.len == 0) continue;
+            try w.print(",\"{s}\":", .{f.k});
+            try cdp.writeJsonString(w, val);
+        }
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// vault JSON 본문 → AuthCreds (순수, 테스트 가능). 호출자 allocator 소유.
+fn parseAuthVaultJson(allocator: Allocator, content: []const u8) ?AuthCreds {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    const url_val = cdp.getString(parsed.value, "url") orelse return null;
+    const user_val = cdp.getString(parsed.value, "username") orelse return null;
+    const pass_val = cdp.getString(parsed.value, "password") orelse return null;
+    const dupOpt = struct {
+        fn go(a: Allocator, v: ?[]const u8) ?[]u8 {
+            const s = v orelse return null;
+            if (s.len == 0) return null;
+            return a.dupe(u8, s) catch null;
+        }
+    }.go;
+    const url = allocator.dupe(u8, url_val) catch return null;
+    errdefer allocator.free(url);
+    const username = allocator.dupe(u8, user_val) catch return null;
+    errdefer allocator.free(username);
+    const password = allocator.dupe(u8, pass_val) catch return null;
+    return .{
+        .url = url,
+        .username = username,
+        .password = password,
+        .sel_user = dupOpt(allocator, cdp.getString(parsed.value, "usernameSelector")),
+        .sel_pass = dupOpt(allocator, cdp.getString(parsed.value, "passwordSelector")),
+        .sel_submit = dupOpt(allocator, cdp.getString(parsed.value, "submitSelector")),
+    };
+}
+
 const AuthCreds = struct {
     url: []u8,
     username: []u8,
@@ -10402,36 +10440,7 @@ fn authVaultLoad(allocator: Allocator, name: []const u8) ?AuthCreds {
 
     var content_buf: [4096]u8 = undefined;
     const content = std.fs.cwd().readFile(path, &content_buf) catch return null;
-
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
-    defer parsed.deinit();
-
-    const url_val = cdp.getString(parsed.value, "url") orelse return null;
-    const user_val = cdp.getString(parsed.value, "username") orelse return null;
-    const pass_val = cdp.getString(parsed.value, "password") orelse return null;
-
-    const dupOpt = struct {
-        fn go(a: Allocator, v: ?[]const u8) ?[]u8 {
-            const s = v orelse return null;
-            if (s.len == 0) return null;
-            return a.dupe(u8, s) catch null;
-        }
-    }.go;
-
-    const url = allocator.dupe(u8, url_val) catch return null;
-    errdefer allocator.free(url);
-    const username = allocator.dupe(u8, user_val) catch return null;
-    errdefer allocator.free(username);
-    const password = allocator.dupe(u8, pass_val) catch return null;
-
-    return .{
-        .url = url,
-        .username = username,
-        .password = password,
-        .sel_user = dupOpt(allocator, cdp.getString(parsed.value, "usernameSelector")),
-        .sel_pass = dupOpt(allocator, cdp.getString(parsed.value, "passwordSelector")),
-        .sel_submit = dupOpt(allocator, cdp.getString(parsed.value, "submitSelector")),
-    };
+    return parseAuthVaultJson(allocator, content);
 }
 
 /// Collect Tracing.dataCollected events — called from receiver thread
@@ -12357,6 +12366,45 @@ test "parseRectCsv: valid + invalid" {
     try std.testing.expect(parseRectCsv("") == null);
     try std.testing.expect(parseRectCsv("1,2,3") == null);
     try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildAuthVaultJson: required + optional selectors, escaping" {
+    const a = std.testing.allocator;
+    const j1 = try buildAuthVaultJson(a, "https://x.com", "u\"x", "p\\y", null, null, null);
+    defer a.free(j1);
+    try std.testing.expectEqualStrings(
+        "{\"url\":\"https://x.com\",\"username\":\"u\\\"x\",\"password\":\"p\\\\y\"}",
+        j1,
+    );
+    const j2 = try buildAuthVaultJson(a, "u", "n", "p", "#user", null, "#go");
+    defer a.free(j2);
+    try std.testing.expectEqualStrings(
+        "{\"url\":\"u\",\"username\":\"n\",\"password\":\"p\",\"usernameSelector\":\"#user\",\"submitSelector\":\"#go\"}",
+        j2,
+    );
+}
+
+test "auth vault JSON round-trip: save→load preserves all fields" {
+    const a = std.testing.allocator;
+    const json = try buildAuthVaultJson(a, "https://site/login", "alice", "s3cret!\"\\", "#u", "#p", "#submit");
+    defer a.free(json);
+    const c = parseAuthVaultJson(a, json) orelse return error.ParseFailed;
+    defer c.deinit(a);
+    try std.testing.expectEqualStrings("https://site/login", c.url);
+    try std.testing.expectEqualStrings("alice", c.username);
+    try std.testing.expectEqualStrings("s3cret!\"\\", c.password); // 특수문자 라운드트립
+    try std.testing.expectEqualStrings("#u", c.sel_user.?);
+    try std.testing.expectEqualStrings("#p", c.sel_pass.?);
+    try std.testing.expectEqualStrings("#submit", c.sel_submit.?);
+}
+
+test "parseAuthVaultJson: no selectors → null opts; missing required → null" {
+    const a = std.testing.allocator;
+    const c = parseAuthVaultJson(a, "{\"url\":\"x\",\"username\":\"u\",\"password\":\"p\"}") orelse return error.ParseFailed;
+    defer c.deinit(a);
+    try std.testing.expect(c.sel_user == null and c.sel_pass == null and c.sel_submit == null);
+    try std.testing.expect(parseAuthVaultJson(a, "{\"url\":\"x\"}") == null); // password 누락
+    try std.testing.expect(parseAuthVaultJson(a, "not json") == null);
 }
 
 test "buildAuthFillJs: custom selector vs default qsa" {
