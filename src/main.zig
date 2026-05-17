@@ -1090,8 +1090,20 @@ pub fn main() void {
             };
             sendAction(session, "scroll_to", x, y, daemon_opts);
         } else {
-            const px = args_iter.next() orelse "300";
-            sendAction(session, "scroll", dir, px, daemon_opts);
+            // scroll [dir] [px] [--selector <css>]
+            var px: ?[]const u8 = null;
+            var sel: ?[]const u8 = null;
+            if (std.mem.eql(u8, dir, "--selector")) {
+                sel = args_iter.next();
+            }
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--selector")) sel = args_iter.next() else if (px == null) px = a;
+            }
+            if (sel) |s| {
+                sendAction(session, "scroll_selector", s, null, daemon_opts);
+            } else {
+                sendAction(session, "scroll", dir, px orelse "300", daemon_opts);
+            }
         }
     } else if (std.mem.eql(u8, cmd, "check")) {
         const target = args_iter.next() orelse {
@@ -4035,6 +4047,11 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleKeyboardType(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "keyboard_insert")) {
         return handleKeyboardInsert(allocator, sender, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "scroll_selector")) {
+        const sel = req.url orelse return respondErr(allocator, "scroll --selector: selector required");
+        const expr = buildScrollIntoViewExpr(allocator, sel) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(expr);
+        return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
     } else if (std.mem.eql(u8, req.action, "scroll")) {
         return handleScroll(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "select_option")) {
@@ -6622,6 +6639,18 @@ fn buildRectExpr(allocator: Allocator, selector: []const u8) ![]u8 {
     try cdp.writeJsonString(w, selector);
     try w.writeAll(");if(!e)return'';var r=e.getBoundingClientRect();" ++
         "return [r.left+scrollX,r.top+scrollY,r.width,r.height].join(',')})()");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `scroll --selector` → 요소를 화면 중앙으로 스크롤하는 JS 표현식.
+/// selector는 JSON 인코딩(인젝션 안전). 미발견 시 'notfound' 반환.
+fn buildScrollIntoViewExpr(allocator: Allocator, selector: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("(function(){var e=document.querySelector(");
+    try cdp.writeJsonString(w, selector);
+    try w.writeAll(");if(!e)return'notfound';e.scrollIntoView({block:'center',inline:'center'});return'ok'})()");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -12215,6 +12244,15 @@ test "parseRectCsv: valid + invalid" {
     try std.testing.expect(parseRectCsv("") == null);
     try std.testing.expect(parseRectCsv("1,2,3") == null);
     try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildScrollIntoViewExpr: selector JSON-encoded + notfound guard" {
+    const a = std.testing.allocator;
+    const e = try buildScrollIntoViewExpr(a, "a[data-x=\"1\"]");
+    defer a.free(e);
+    try std.testing.expect(std.mem.indexOf(u8, e, "querySelector(\"a[data-x=\\\"1\\\"]\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "scrollIntoView({block:'center'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "return'notfound'") != null);
 }
 
 test "buildRectExpr: selector JSON-encoded" {
