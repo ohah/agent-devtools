@@ -911,10 +911,14 @@ pub fn main() void {
         }
     } else if (std.mem.eql(u8, cmd, "click")) {
         const target = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools click <@ref or selector>\n", .{});
+            writeErr("Usage: agent-devtools click <@ref> [--new-tab]\n", .{});
             std.process.exit(1);
         };
-        sendAction(session, "click", target, null, daemon_opts);
+        var new_tab = false;
+        while (args_iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--new-tab")) new_tab = true;
+        }
+        sendAction(session, if (new_tab) "click_newtab" else "click", target, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "fill")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools fill <@ref> <text>\n", .{});
@@ -1090,8 +1094,20 @@ pub fn main() void {
             };
             sendAction(session, "scroll_to", x, y, daemon_opts);
         } else {
-            const px = args_iter.next() orelse "300";
-            sendAction(session, "scroll", dir, px, daemon_opts);
+            // scroll [dir] [px] [--selector <css>]
+            var px: ?[]const u8 = null;
+            var sel: ?[]const u8 = null;
+            if (std.mem.eql(u8, dir, "--selector")) {
+                sel = args_iter.next();
+            }
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--selector")) sel = args_iter.next() else if (px == null) px = a;
+            }
+            if (sel) |s| {
+                sendAction(session, "scroll_selector", s, null, daemon_opts);
+            } else {
+                sendAction(session, "scroll", dir, px orelse "300", daemon_opts);
+            }
         }
     } else if (std.mem.eql(u8, cmd, "check")) {
         const target = args_iter.next() orelse {
@@ -1235,8 +1251,27 @@ pub fn main() void {
             std.process.exit(1);
         }
     } else if (std.mem.eql(u8, cmd, "wait")) {
-        const ms = args_iter.next() orelse "1000";
-        sendAction(session, "wait", ms, null, daemon_opts);
+        const first = args_iter.next() orelse "1000";
+        if (std.mem.eql(u8, first, "--text") or std.mem.eql(u8, first, "-t")) {
+            // wait --text "<문구>" [--timeout <ms>] — 텍스트 등장까지 폴링 대기
+            const text = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools wait --text <text> [--timeout <ms>]\n", .{});
+                std.process.exit(1);
+            };
+            var timeout: []const u8 = "30000";
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--timeout")) timeout = args_iter.next() orelse "30000";
+            }
+            const pa = std.heap.page_allocator;
+            const expr = buildWaitTextExpr(pa, text) catch {
+                writeErr("wait --text: build error\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(expr);
+            sendAction(session, "waitfunction", expr, timeout, daemon_opts);
+        } else {
+            sendAction(session, "wait", first, null, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "connect")) {
         // endpoint는 이미 cdp_url/cdp_port로 디슈가됨 → 데몬 기동 + 상태 보고
         sendAction(session, "status", null, null, daemon_opts);
@@ -1575,25 +1610,25 @@ pub fn main() void {
             var auth_url: ?[]const u8 = null;
             var auth_user: ?[]const u8 = null;
             var auth_pass: ?[]const u8 = null;
+            var sel_user: ?[]const u8 = null;
+            var sel_pass: ?[]const u8 = null;
+            var sel_submit: ?[]const u8 = null;
             while (args_iter.next()) |aarg| {
                 if (std.mem.eql(u8, aarg, "--url")) { auth_url = args_iter.next(); }
                 else if (std.mem.eql(u8, aarg, "--username")) { auth_user = args_iter.next(); }
                 else if (std.mem.eql(u8, aarg, "--password")) { auth_pass = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--username-selector")) { sel_user = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--password-selector")) { sel_pass = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--submit-selector")) { sel_submit = args_iter.next(); }
             }
             if (auth_url == null or auth_user == null or auth_pass == null) {
                 writeErr("Usage: agent-devtools auth save <name> --url <url> --username <user> --password <pass>\n", .{});
                 std.process.exit(1);
             }
-            // Build JSON: url|username|password packed into url and pattern fields
-            // Pack as "url\x00username" in url, password in pattern
-            var pack_buf: [2048]u8 = undefined;
-            const pack_data = std.fmt.bufPrint(&pack_buf, "{s}\x00{s}", .{ auth_url.?, auth_user.? }) catch {
-                writeErr("auth data too long\n", .{});
-                std.process.exit(1);
-            };
-            sendAction(session, "auth_save", pack_data, auth_pass.?, daemon_opts);
-            // Also save to local file (name passed via a second field)
-            authVaultSave(name, auth_url.?, auth_user.?, auth_pass.?);
+            // auth save는 순수 로컬 vault 파일 작업 — 데몬 왕복 불필요.
+            // (기존엔 미구현 "auth_save" 액션을 보내 Unknown action 에러로
+            //  exit하면서 vault 저장이 안 되던 잠복 버그를 제거)
+            authVaultSave(name, auth_url.?, auth_user.?, auth_pass.?, sel_user, sel_pass, sel_submit);
         } else if (std.mem.eql(u8, subcmd, "login")) {
             const name = args_iter.next() orelse {
                 writeErr("Usage: agent-devtools auth login <name>\n", .{});
@@ -1638,7 +1673,12 @@ pub fn main() void {
             std.process.exit(1);
         };
         if (std.mem.eql(u8, subcmd, "start")) {
-            sendAction(session, "profiler_start", null, null, daemon_opts);
+            // profiler start [--categories <csv>]
+            var cats: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--categories")) cats = args_iter.next();
+            }
+            sendAction(session, "profiler_start", null, cats, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "stop")) {
             const path = args_iter.next();
             sendAction(session, "profiler_stop", path, null, daemon_opts);
@@ -4021,6 +4061,10 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
         return handleClick(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
+    } else if (std.mem.eql(u8, req.action, "click_newtab")) {
+        ctx.ref_map_rwlock.lockShared();
+        defer ctx.ref_map_rwlock.unlockShared();
+        return handleClickNewTab(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
     } else if (std.mem.eql(u8, req.action, "fill") or std.mem.eql(u8, req.action, "type_text")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -4035,6 +4079,11 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         return handleKeyboardType(allocator, sender, cmd_id, session_id, req.url);
     } else if (std.mem.eql(u8, req.action, "keyboard_insert")) {
         return handleKeyboardInsert(allocator, sender, cmd_id, session_id, req.url);
+    } else if (std.mem.eql(u8, req.action, "scroll_selector")) {
+        const sel = req.url orelse return respondErr(allocator, "scroll --selector: selector required");
+        const expr = buildScrollIntoViewExpr(allocator, sel) catch return respondErr(allocator, "alloc error");
+        defer allocator.free(expr);
+        return handleEval(allocator, sender, resp_map, cmd_id, session_id, expr);
     } else if (std.mem.eql(u8, req.action, "scroll")) {
         return handleScroll(allocator, sender, cmd_id, session_id, req.url, req.pattern);
     } else if (std.mem.eql(u8, req.action, "select_option")) {
@@ -4220,6 +4269,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         defer allocator.free(disable);
         sender.sendText(disable) catch {};
         return respondOk(allocator);
+    } else if (std.mem.eql(u8, req.action, "frame")) {
+        // 단일 세션 모델: CDP 세션이 항상 페이지 메인 프레임에 attach돼 있음.
+        // frame main/mainframe → 메인 프레임 확정(성공). frame <sel>(iframe
+        // 컨텍스트 전환)은 별도 프레임 세션 필요라 미지원을 명시.
+        const t = req.url orelse "main";
+        if (std.mem.eql(u8, t, "main") or std.mem.eql(u8, t, "mainframe"))
+            return respondOk(allocator);
+        return respondErr(allocator, "frame <selector>: iframe context switching not supported (single-session model); use 'frame main'");
     } else if (std.mem.eql(u8, req.action, "status")) {
         collector_mutex.lock();
         defer collector_mutex.unlock();
@@ -4372,7 +4429,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "trace_stop")) {
         return handleTraceStop(allocator, sender, cmd_id, session_id, resp_map, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, req.url);
     } else if (std.mem.eql(u8, req.action, "profiler_start")) {
-        return handleTraceStart(allocator, sender, cmd_id, session_id, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, true);
+        return handleTraceStartCats(allocator, sender, cmd_id, session_id, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, true, req.pattern);
     } else if (std.mem.eql(u8, req.action, "profiler_stop")) {
         return handleTraceStop(allocator, sender, cmd_id, session_id, resp_map, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, req.url);
     } else if (std.mem.eql(u8, req.action, "screenshot_annotate")) {
@@ -5220,6 +5277,24 @@ fn cleanupCursorAttributes(allocator: Allocator, sender: *WsSender, resp_map: *r
     defer allocator.free(cleanup_cmd);
     const cleanup_raw = sendAndWait(sender, resp_map, cleanup_cmd, cleanup_id, 3_000);
     if (cleanup_raw) |cr| allocator.free(cr);
+}
+
+/// click @ref --new-tab: 링크 요소의 href를 새 탭으로 연다 (Ctrl+클릭 의도).
+/// href 없는 요소는 명시 에러(일반 click 사용 안내).
+fn handleClickNewTab(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, target: ?[]const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found — run 'snapshot -i' first");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+    const href = resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse
+        return respondErr(allocator, "click --new-tab: element has no link href (use plain 'click')");
+    defer allocator.free(href);
+    const params = cdp.jsonObject1(allocator, "url", href) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.createTarget", params, null) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
 }
 
 fn handleClick(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, target: ?[]const u8) []u8 {
@@ -6614,6 +6689,30 @@ fn buildRectExpr(allocator: Allocator, selector: []const u8) ![]u8 {
     try cdp.writeJsonString(w, selector);
     try w.writeAll(");if(!e)return'';var r=e.getBoundingClientRect();" ++
         "return [r.left+scrollX,r.top+scrollY,r.width,r.height].join(',')})()");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `wait --text` → 페이지에 텍스트가 보이는지 검사하는 JS 불린 표현식
+/// (waitfunction 폴링용). text는 JSON 인코딩(인젝션 안전).
+fn buildWaitTextExpr(allocator: Allocator, text: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("(!!document.body && (document.body.innerText||'').indexOf(");
+    try cdp.writeJsonString(w, text);
+    try w.writeAll(") >= 0)");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `scroll --selector` → 요소를 화면 중앙으로 스크롤하는 JS 표현식.
+/// selector는 JSON 인코딩(인젝션 안전). 미발견 시 'notfound' 반환.
+fn buildScrollIntoViewExpr(allocator: Allocator, selector: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("(function(){var e=document.querySelector(");
+    try cdp.writeJsonString(w, selector);
+    try w.writeAll(");if(!e)return'notfound';e.scrollIntoView({block:'center',inline:'center'});return'ok'})()");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -9899,12 +9998,49 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
 // Auth Login Handler (daemon-side)
 // ============================================================================
 
+/// auth login 필드 채우기 JS. custom_sel 있으면 querySelector(custom),
+/// 없으면 default_qsa(querySelectorAll 휴리스틱). value/셀렉터 JSON 인코딩.
+fn buildAuthFillJs(allocator: Allocator, custom_sel: ?[]const u8, default_qsa: []const u8, value: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    if (custom_sel) |sel| {
+        try w.writeAll("(function(){var e=document.querySelector(");
+        try cdp.writeJsonString(w, sel);
+        try w.writeAll(");if(!e)return'no_field';e.focus();e.value=");
+        try cdp.writeJsonString(w, value);
+        try w.writeAll(";e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return'filled'})()");
+    } else {
+        try w.writeAll("(function(){var inputs=document.querySelectorAll(");
+        try cdp.writeJsonString(w, default_qsa);
+        try w.writeAll(");for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=");
+        try cdp.writeJsonString(w, value);
+        try w.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return'filled'}}return'no_field'})()");
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// auth login 제출 JS. custom_sel 있으면 그 요소 click, 없으면 텍스트 휴리스틱.
+fn buildAuthSubmitJs(allocator: Allocator, custom_sel: ?[]const u8) ![]u8 {
+    if (custom_sel) |sel| {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+        try w.writeAll("(function(){var e=document.querySelector(");
+        try cdp.writeJsonString(w, sel);
+        try w.writeAll(");if(!e)return'no_submit_found';e.click();return'clicked'})()");
+        return buf.toOwnedSlice(allocator);
+    }
+    return allocator.dupe(u8, "(function(){var btns=document.querySelectorAll('button[type=\"submit\"],input[type=\"submit\"],button');for(var i=0;i<btns.length;i++){var t=(btns[i].textContent||btns[i].value||'').toLowerCase();if(t.match(/log\\s*in|sign\\s*in|submit|login|signin/)){btns[i].click();return 'clicked'}}var forms=document.querySelectorAll('form');if(forms.length>0){forms[0].submit();return 'submitted'}return 'no_submit_found'})()");
+}
+
 fn handleAuthLogin(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, name_opt: ?[]const u8) []u8 {
     _ = ref_map;
     const name = name_opt orelse return respondErr(allocator, "auth profile name required");
 
     // Load credentials from vault
-    const creds = authVaultLoad(name) orelse return respondErr(allocator, "auth profile not found");
+    const creds = authVaultLoad(allocator, name) orelse return respondErr(allocator, "auth profile not found");
+    defer creds.deinit(allocator);
 
     // 1. Navigate to URL
     const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), creds.url, session_id) catch
@@ -9915,44 +10051,26 @@ fn handleAuthLogin(allocator: Allocator, sender: *WsSender, resp_map: *response_
     // Wait for page load
     std.Thread.sleep(2000 * std.time.ns_per_ms);
 
-    // Find and fill username field (first visible text/email input)
-    var js_buf: std.ArrayList(u8) = .empty;
-    defer js_buf.deinit(allocator);
-    const w = js_buf.writer(allocator);
-    w.writeAll("(function(){var inputs=document.querySelectorAll('input[type=\"text\"],input[type=\"email\"],input:not([type])');for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(w, creds.username) catch return respondErr(allocator, "write error");
-    w.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return 'filled_username'}}return 'no_username_field'})()") catch return respondErr(allocator, "write error");
-
-    const username_js = js_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    // Fill username (custom selector if saved, else visible text/email input)
+    const username_js = buildAuthFillJs(allocator, creds.sel_user, "input[type=\"text\"],input[type=\"email\"],input:not([type])", creds.username) catch
+        return respondErr(allocator, "alloc error");
     defer allocator.free(username_js);
+    allocator.free(handleEval(allocator, sender, resp_map, cmd_id, session_id, username_js));
 
-    const uname_result = handleEval(allocator, sender, resp_map, cmd_id, session_id, username_js);
-    allocator.free(uname_result);
-
-    // Small delay between fields
     std.Thread.sleep(200 * std.time.ns_per_ms);
 
-    // Fill password field
-    var pw_buf: std.ArrayList(u8) = .empty;
-    defer pw_buf.deinit(allocator);
-    const pw = pw_buf.writer(allocator);
-    pw.writeAll("(function(){var inputs=document.querySelectorAll('input[type=\"password\"]');for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(pw, creds.password) catch return respondErr(allocator, "write error");
-    pw.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return 'filled_password'}}return 'no_password_field'})()") catch return respondErr(allocator, "write error");
-
-    const password_js = pw_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    // Fill password (custom selector if saved, else input[type=password])
+    const password_js = buildAuthFillJs(allocator, creds.sel_pass, "input[type=\"password\"]", creds.password) catch
+        return respondErr(allocator, "alloc error");
     defer allocator.free(password_js);
+    allocator.free(handleEval(allocator, sender, resp_map, cmd_id, session_id, password_js));
 
-    const pw_result = handleEval(allocator, sender, resp_map, cmd_id, session_id, password_js);
-    defer allocator.free(pw_result);
-
-    // Small delay before submit
     std.Thread.sleep(200 * std.time.ns_per_ms);
 
-    // Click submit button
-    const submit_js =
-        \\(function(){var btns=document.querySelectorAll('button[type="submit"],input[type="submit"],button');for(var i=0;i<btns.length;i++){var t=(btns[i].textContent||btns[i].value||'').toLowerCase();if(t.match(/log\s*in|sign\s*in|submit|login|signin/)){btns[i].click();return 'clicked'}}var forms=document.querySelectorAll('form');if(forms.length>0){forms[0].submit();return 'submitted'}return 'no_submit_found'})()
-    ;
+    // Submit (custom selector if saved, else text heuristic)
+    const submit_js = buildAuthSubmitJs(allocator, creds.sel_submit) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(submit_js);
     return handleEval(allocator, sender, resp_map, cmd_id, session_id, submit_js);
 }
 
@@ -10108,7 +10226,7 @@ fn isValidVaultName(name: []const u8) bool {
     return true;
 }
 
-fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, password: []const u8) void {
+fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, password: []const u8, sel_user: ?[]const u8, sel_pass: ?[]const u8, sel_submit: ?[]const u8) void {
     if (!isValidVaultName(name)) {
         writeErr("Invalid auth profile name (no /, \\, . allowed)\n", .{});
         return;
@@ -10134,74 +10252,21 @@ fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, passwo
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return;
 
-    var content_buf: [2048]u8 = undefined;
-    var pos: usize = 0;
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+    const json = buildAuthVaultJson(a, url, username, password, sel_user, sel_pass, sel_submit) catch {
+        writeErr("Failed to serialize auth profile\n", .{});
+        return;
+    };
+    defer a.free(json);
 
-    const prefix = "{\"url\":\"";
-    if (pos + prefix.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + prefix.len], prefix);
-    pos += prefix.len;
-
-    // Simple JSON - escape basic chars
-    for ([_]struct { key: []const u8, val: []const u8 }{ .{ .key = "", .val = url } }) |_| {
-        for (url) |c| {
-            if (c == '"' or c == '\\') {
-                if (pos + 2 > content_buf.len) return;
-                content_buf[pos] = '\\';
-                content_buf[pos + 1] = c;
-                pos += 2;
-            } else {
-                if (pos + 1 > content_buf.len) return;
-                content_buf[pos] = c;
-                pos += 1;
-            }
-        }
-    }
-
-    const mid1 = "\",\"username\":\"";
-    if (pos + mid1.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + mid1.len], mid1);
-    pos += mid1.len;
-
-    for (username) |c| {
-        if (c == '"' or c == '\\') {
-            if (pos + 2 > content_buf.len) return;
-            content_buf[pos] = '\\';
-            content_buf[pos + 1] = c;
-            pos += 2;
-        } else {
-            if (pos + 1 > content_buf.len) return;
-            content_buf[pos] = c;
-            pos += 1;
-        }
-    }
-
-    const mid2 = "\",\"password\":\"";
-    if (pos + mid2.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + mid2.len], mid2);
-    pos += mid2.len;
-
-    for (password) |c| {
-        if (c == '"' or c == '\\') {
-            if (pos + 2 > content_buf.len) return;
-            content_buf[pos] = '\\';
-            content_buf[pos + 1] = c;
-            pos += 2;
-        } else {
-            if (pos + 1 > content_buf.len) return;
-            content_buf[pos] = c;
-            pos += 1;
-        }
-    }
-
-    const suffix = "\"}";
-    if (pos + suffix.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + suffix.len], suffix);
-    pos += suffix.len;
-
-    if (std.fs.createFileAbsolute(path, .{})) |f| {
-        _ = f.write(content_buf[0..pos]) catch {};
-        f.close();
+    if (std.fs.createFileAbsolute(path, .{})) |file| {
+        defer file.close();
+        file.writeAll(json) catch {
+            writeErr("Failed to write auth profile\n", .{});
+            return;
+        };
         write("Saved auth profile: {s}\n", .{name});
     } else |_| {
         writeErr("Failed to save auth profile\n", .{});
@@ -10289,7 +10354,83 @@ fn authVaultDelete(name: []const u8) void {
 }
 
 /// Load auth profile from file, return url, username, password.
-fn authVaultLoad(name: []const u8) ?struct { url: []const u8, username: []const u8, password: []const u8 } {
+/// vault 프로필 JSON 직렬화 (순수, 테스트 가능). 선택적 셀렉터는 값이
+/// 있을 때만 기록. 모든 문자열 cdp.writeJsonString으로 안전 이스케이프.
+fn buildAuthVaultJson(allocator: Allocator, url: []const u8, username: []const u8, password: []const u8, sel_user: ?[]const u8, sel_pass: ?[]const u8, sel_submit: ?[]const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("{\"url\":");
+    try cdp.writeJsonString(w, url);
+    try w.writeAll(",\"username\":");
+    try cdp.writeJsonString(w, username);
+    try w.writeAll(",\"password\":");
+    try cdp.writeJsonString(w, password);
+    const opt = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "usernameSelector", .v = sel_user },
+        .{ .k = "passwordSelector", .v = sel_pass },
+        .{ .k = "submitSelector", .v = sel_submit },
+    };
+    for (opt) |f| {
+        if (f.v) |val| {
+            if (val.len == 0) continue;
+            try w.print(",\"{s}\":", .{f.k});
+            try cdp.writeJsonString(w, val);
+        }
+    }
+    try w.writeByte('}');
+    return buf.toOwnedSlice(allocator);
+}
+
+/// vault JSON 본문 → AuthCreds (순수, 테스트 가능). 호출자 allocator 소유.
+fn parseAuthVaultJson(allocator: Allocator, content: []const u8) ?AuthCreds {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
+    defer parsed.deinit();
+    const url_val = cdp.getString(parsed.value, "url") orelse return null;
+    const user_val = cdp.getString(parsed.value, "username") orelse return null;
+    const pass_val = cdp.getString(parsed.value, "password") orelse return null;
+    const dupOpt = struct {
+        fn go(a: Allocator, v: ?[]const u8) ?[]u8 {
+            const s = v orelse return null;
+            if (s.len == 0) return null;
+            return a.dupe(u8, s) catch null;
+        }
+    }.go;
+    const url = allocator.dupe(u8, url_val) catch return null;
+    errdefer allocator.free(url);
+    const username = allocator.dupe(u8, user_val) catch return null;
+    errdefer allocator.free(username);
+    const password = allocator.dupe(u8, pass_val) catch return null;
+    return .{
+        .url = url,
+        .username = username,
+        .password = password,
+        .sel_user = dupOpt(allocator, cdp.getString(parsed.value, "usernameSelector")),
+        .sel_pass = dupOpt(allocator, cdp.getString(parsed.value, "passwordSelector")),
+        .sel_submit = dupOpt(allocator, cdp.getString(parsed.value, "submitSelector")),
+    };
+}
+
+const AuthCreds = struct {
+    url: []u8,
+    username: []u8,
+    password: []u8,
+    sel_user: ?[]u8 = null,
+    sel_pass: ?[]u8 = null,
+    sel_submit: ?[]u8 = null,
+    fn deinit(self: *const AuthCreds, a: Allocator) void {
+        a.free(self.url);
+        a.free(self.username);
+        a.free(self.password);
+        if (self.sel_user) |s| a.free(s);
+        if (self.sel_pass) |s| a.free(s);
+        if (self.sel_submit) |s| a.free(s);
+    }
+};
+
+/// vault 프로필 로드 — 모든 값을 호출자 allocator로 소유 복사(정적 버퍼
+/// 제거: 동시 auth login 워커 간 데이터 레이스 방지). 호출자가 deinit.
+fn authVaultLoad(allocator: Allocator, name: []const u8) ?AuthCreds {
     if (!isValidVaultName(name)) return null;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse return null;
@@ -10297,37 +10438,9 @@ fn authVaultLoad(name: []const u8) ?struct { url: []const u8, username: []const 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return null;
 
-    const S = struct {
-        var content_buf: [2048]u8 = undefined;
-    };
-    const content = std.fs.cwd().readFile(path, &S.content_buf) catch return null;
-
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch return null;
-    defer parsed.deinit();
-
-    const url_val = cdp.getString(parsed.value, "url") orelse return null;
-    const user_val = cdp.getString(parsed.value, "username") orelse return null;
-    const pass_val = cdp.getString(parsed.value, "password") orelse return null;
-
-    // Copy into static buffers since parsed will be freed
-    const StaticBufs = struct {
-        var url: [512]u8 = undefined;
-        var user: [256]u8 = undefined;
-        var pass: [256]u8 = undefined;
-    };
-    if (url_val.len > StaticBufs.url.len or user_val.len > StaticBufs.user.len or pass_val.len > StaticBufs.pass.len) return null;
-    @memcpy(StaticBufs.url[0..url_val.len], url_val);
-    @memcpy(StaticBufs.user[0..user_val.len], user_val);
-    @memcpy(StaticBufs.pass[0..pass_val.len], pass_val);
-
-    return .{
-        .url = StaticBufs.url[0..url_val.len],
-        .username = StaticBufs.user[0..user_val.len],
-        .password = StaticBufs.pass[0..pass_val.len],
-    };
+    var content_buf: [4096]u8 = undefined;
+    const content = std.fs.cwd().readFile(path, &content_buf) catch return null;
+    return parseAuthVaultJson(allocator, content);
 }
 
 /// Collect Tracing.dataCollected events — called from receiver thread
@@ -10354,7 +10467,37 @@ fn collectTraceData(allocator: Allocator, params: std.json.Value, trace_events: 
     }
 }
 
-/// trace start / profiler start — send Tracing.start CDP command
+/// Tracing.start traceConfig params. profiler는 CPU 샘플링 카테고리 기본,
+/// categories_csv 지정 시 includedCategories를 그것으로 대체.
+fn buildTraceConfigParams(allocator: Allocator, is_profiler: bool, categories_csv: ?[]const u8) ![]u8 {
+    if (categories_csv) |csv| {
+        if (csv.len > 0) {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const w = buf.writer(allocator);
+            try w.writeAll("{\"traceConfig\":{\"includedCategories\":[");
+            var it = std.mem.splitScalar(u8, csv, ',');
+            var first = true;
+            while (it.next()) |raw| {
+                const c = std.mem.trim(u8, raw, " \t");
+                if (c.len == 0) continue;
+                if (!first) try w.writeByte(',');
+                try cdp.writeJsonString(w, c);
+                first = false;
+            }
+            try w.writeAll("]");
+            if (is_profiler) try w.writeAll(",\"enableSampling\":true");
+            try w.writeAll("},\"transferMode\":\"ReportEvents\"}");
+            return buf.toOwnedSlice(allocator);
+        }
+    }
+    const fixed = if (is_profiler)
+        "{\"traceConfig\":{\"includedCategories\":[\"devtools.timeline\",\"disabled-by-default-v8.cpu_profiler\",\"disabled-by-default-v8.cpu_profiler.hires\",\"v8.execute\",\"v8\",\"blink\",\"blink.user_timing\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}"
+    else
+        "{\"traceConfig\":{\"recordMode\":\"recordContinuously\"},\"transferMode\":\"ReportEvents\"}";
+    return allocator.dupe(u8, fixed);
+}
+
 fn handleTraceStart(
     allocator: Allocator,
     sender: *WsSender,
@@ -10365,6 +10508,22 @@ fn handleTraceStart(
     trace_events: *std.ArrayList([]u8),
     trace_mutex: *std.Thread.Mutex,
     is_profiler: bool,
+) []u8 {
+    return handleTraceStartCats(allocator, sender, cmd_id, session_id, trace_active, trace_complete, trace_events, trace_mutex, is_profiler, null);
+}
+
+/// trace start / profiler start [--categories csv] — Tracing.start
+fn handleTraceStartCats(
+    allocator: Allocator,
+    sender: *WsSender,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    trace_active: *std.atomic.Value(bool),
+    trace_complete: *std.atomic.Value(bool),
+    trace_events: *std.ArrayList([]u8),
+    trace_mutex: *std.Thread.Mutex,
+    is_profiler: bool,
+    categories_csv: ?[]const u8,
 ) []u8 {
     if (trace_active.load(.acquire)) {
         return respondErr(allocator, "tracing already active — stop first");
@@ -10378,10 +10537,9 @@ fn handleTraceStart(
     }
     trace_complete.store(false, .release);
 
-    const params = if (is_profiler)
-        "{\"traceConfig\":{\"includedCategories\":[\"devtools.timeline\",\"disabled-by-default-v8.cpu_profiler\",\"disabled-by-default-v8.cpu_profiler.hires\",\"v8.execute\",\"v8\",\"blink\",\"blink.user_timing\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}"
-    else
-        "{\"traceConfig\":{\"recordMode\":\"recordContinuously\"},\"transferMode\":\"ReportEvents\"}";
+    const params = buildTraceConfigParams(allocator, is_profiler, categories_csv) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
 
     const sent_id = cmd_id.next();
     const cmd = cdp.serializeCommand(allocator, sent_id, "Tracing.start", params, session_id) catch
@@ -10931,6 +11089,7 @@ fn printUsage() void {
         \\
         \\Auth Vault:
         \\  auth save <name> --url <url> --username <user> --password <pass>
+        \\           [--username-selector <css>] [--password-selector <css>] [--submit-selector <css>]
         \\  auth login <name>         Auto-login using saved credentials
         \\  auth list                 List saved auth profiles
         \\  auth show <name>          Show auth profile (masked password)
@@ -12207,6 +12366,103 @@ test "parseRectCsv: valid + invalid" {
     try std.testing.expect(parseRectCsv("") == null);
     try std.testing.expect(parseRectCsv("1,2,3") == null);
     try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildAuthVaultJson: required + optional selectors, escaping" {
+    const a = std.testing.allocator;
+    const j1 = try buildAuthVaultJson(a, "https://x.com", "u\"x", "p\\y", null, null, null);
+    defer a.free(j1);
+    try std.testing.expectEqualStrings(
+        "{\"url\":\"https://x.com\",\"username\":\"u\\\"x\",\"password\":\"p\\\\y\"}",
+        j1,
+    );
+    const j2 = try buildAuthVaultJson(a, "u", "n", "p", "#user", null, "#go");
+    defer a.free(j2);
+    try std.testing.expectEqualStrings(
+        "{\"url\":\"u\",\"username\":\"n\",\"password\":\"p\",\"usernameSelector\":\"#user\",\"submitSelector\":\"#go\"}",
+        j2,
+    );
+}
+
+test "auth vault JSON round-trip: save→load preserves all fields" {
+    const a = std.testing.allocator;
+    const json = try buildAuthVaultJson(a, "https://site/login", "alice", "s3cret!\"\\", "#u", "#p", "#submit");
+    defer a.free(json);
+    const c = parseAuthVaultJson(a, json) orelse return error.ParseFailed;
+    defer c.deinit(a);
+    try std.testing.expectEqualStrings("https://site/login", c.url);
+    try std.testing.expectEqualStrings("alice", c.username);
+    try std.testing.expectEqualStrings("s3cret!\"\\", c.password); // 특수문자 라운드트립
+    try std.testing.expectEqualStrings("#u", c.sel_user.?);
+    try std.testing.expectEqualStrings("#p", c.sel_pass.?);
+    try std.testing.expectEqualStrings("#submit", c.sel_submit.?);
+}
+
+test "parseAuthVaultJson: no selectors → null opts; missing required → null" {
+    const a = std.testing.allocator;
+    const c = parseAuthVaultJson(a, "{\"url\":\"x\",\"username\":\"u\",\"password\":\"p\"}") orelse return error.ParseFailed;
+    defer c.deinit(a);
+    try std.testing.expect(c.sel_user == null and c.sel_pass == null and c.sel_submit == null);
+    try std.testing.expect(parseAuthVaultJson(a, "{\"url\":\"x\"}") == null); // password 누락
+    try std.testing.expect(parseAuthVaultJson(a, "not json") == null);
+}
+
+test "buildAuthFillJs: custom selector vs default qsa" {
+    const a = std.testing.allocator;
+    const c = try buildAuthFillJs(a, "#user", "input", "alice\"x");
+    defer a.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "querySelector(\"#user\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "e.value=\"alice\\\"x\"") != null);
+    const d = try buildAuthFillJs(a, null, "input[type=\"password\"]", "pw");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "querySelectorAll(\"input[type=\\\"password\\\"]\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "no_field") != null);
+}
+
+test "buildAuthSubmitJs: custom click vs heuristic" {
+    const a = std.testing.allocator;
+    const c = try buildAuthSubmitJs(a, "button.login");
+    defer a.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "querySelector(\"button.login\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "e.click()") != null);
+    const d = try buildAuthSubmitJs(a, null);
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "log\\s*in|sign\\s*in") != null);
+}
+
+test "buildTraceConfigParams: default vs custom categories" {
+    const a = std.testing.allocator;
+    const p1 = try buildTraceConfigParams(a, true, null);
+    defer a.free(p1);
+    try std.testing.expect(std.mem.indexOf(u8, p1, "cpu_profiler") != null);
+    const p2 = try buildTraceConfigParams(a, false, null);
+    defer a.free(p2);
+    try std.testing.expect(std.mem.indexOf(u8, p2, "recordContinuously") != null);
+    const p3 = try buildTraceConfigParams(a, true, "blink, v8 ,devtools.timeline");
+    defer a.free(p3);
+    try std.testing.expectEqualStrings(
+        "{\"traceConfig\":{\"includedCategories\":[\"blink\",\"v8\",\"devtools.timeline\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}",
+        p3,
+    );
+}
+
+test "buildWaitTextExpr: JSON-encodes text into innerText check" {
+    const a = std.testing.allocator;
+    const e = try buildWaitTextExpr(a, "Wel\"come");
+    defer a.free(e);
+    try std.testing.expectEqualStrings(
+        "(!!document.body && (document.body.innerText||'').indexOf(\"Wel\\\"come\") >= 0)",
+        e,
+    );
+}
+
+test "buildScrollIntoViewExpr: selector JSON-encoded + notfound guard" {
+    const a = std.testing.allocator;
+    const e = try buildScrollIntoViewExpr(a, "a[data-x=\"1\"]");
+    defer a.free(e);
+    try std.testing.expect(std.mem.indexOf(u8, e, "querySelector(\"a[data-x=\\\"1\\\"]\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "scrollIntoView({block:'center'") != null);
+    try std.testing.expect(std.mem.indexOf(u8, e, "return'notfound'") != null);
 }
 
 test "buildRectExpr: selector JSON-encoded" {
