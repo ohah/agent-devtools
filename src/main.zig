@@ -4220,6 +4220,14 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         defer allocator.free(disable);
         sender.sendText(disable) catch {};
         return respondOk(allocator);
+    } else if (std.mem.eql(u8, req.action, "frame")) {
+        // 단일 세션 모델: CDP 세션이 항상 페이지 메인 프레임에 attach돼 있음.
+        // frame main/mainframe → 메인 프레임 확정(성공). frame <sel>(iframe
+        // 컨텍스트 전환)은 별도 프레임 세션 필요라 미지원을 명시.
+        const t = req.url orelse "main";
+        if (std.mem.eql(u8, t, "main") or std.mem.eql(u8, t, "mainframe"))
+            return respondOk(allocator);
+        return respondErr(allocator, "frame <selector>: iframe context switching not supported (single-session model); use 'frame main'");
     } else if (std.mem.eql(u8, req.action, "status")) {
         collector_mutex.lock();
         defer collector_mutex.unlock();
