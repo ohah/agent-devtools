@@ -911,10 +911,14 @@ pub fn main() void {
         }
     } else if (std.mem.eql(u8, cmd, "click")) {
         const target = args_iter.next() orelse {
-            writeErr("Usage: agent-devtools click <@ref or selector>\n", .{});
+            writeErr("Usage: agent-devtools click <@ref> [--new-tab]\n", .{});
             std.process.exit(1);
         };
-        sendAction(session, "click", target, null, daemon_opts);
+        var new_tab = false;
+        while (args_iter.next()) |a| {
+            if (std.mem.eql(u8, a, "--new-tab")) new_tab = true;
+        }
+        sendAction(session, if (new_tab) "click_newtab" else "click", target, null, daemon_opts);
     } else if (std.mem.eql(u8, cmd, "fill")) {
         const target = args_iter.next() orelse {
             writeErr("Usage: agent-devtools fill <@ref> <text>\n", .{});
@@ -4057,6 +4061,10 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
         return handleClick(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
+    } else if (std.mem.eql(u8, req.action, "click_newtab")) {
+        ctx.ref_map_rwlock.lockShared();
+        defer ctx.ref_map_rwlock.unlockShared();
+        return handleClickNewTab(allocator, sender, resp_map, cmd_id, session_id, ref_map, req.url);
     } else if (std.mem.eql(u8, req.action, "fill") or std.mem.eql(u8, req.action, "type_text")) {
         ctx.ref_map_rwlock.lockShared();
         defer ctx.ref_map_rwlock.unlockShared();
@@ -5269,6 +5277,24 @@ fn cleanupCursorAttributes(allocator: Allocator, sender: *WsSender, resp_map: *r
     defer allocator.free(cleanup_cmd);
     const cleanup_raw = sendAndWait(sender, resp_map, cleanup_cmd, cleanup_id, 3_000);
     if (cleanup_raw) |cr| allocator.free(cr);
+}
+
+/// click @ref --new-tab: 링크 요소의 href를 새 탭으로 연다 (Ctrl+클릭 의도).
+/// href 없는 요소는 명시 에러(일반 click 사용 안내).
+fn handleClickNewTab(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, target: ?[]const u8) []u8 {
+    const ref_id = target orelse return respondErr(allocator, "target required");
+    const entry = ref_map.getByRef(ref_id) orelse return respondErr(allocator, "ref not found — run 'snapshot -i' first");
+    const backend_id = entry.backend_node_id orelse return respondErr(allocator, "no backend node ID");
+    const href = resolveElementHref(allocator, sender, resp_map, cmd_id, session_id, backend_id) orelse
+        return respondErr(allocator, "click --new-tab: element has no link href (use plain 'click')");
+    defer allocator.free(href);
+    const params = cdp.jsonObject1(allocator, "url", href) catch return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
+    const cmd = cdp.serializeCommand(allocator, cmd_id.next(), "Target.createTarget", params, null) catch
+        return respondErr(allocator, "cmd error");
+    defer allocator.free(cmd);
+    sender.sendText(cmd) catch {};
+    return respondOk(allocator);
 }
 
 fn handleClick(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *const snapshot_mod.RefMap, target: ?[]const u8) []u8 {
