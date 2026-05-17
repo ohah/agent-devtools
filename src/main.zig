@@ -1610,25 +1610,25 @@ pub fn main() void {
             var auth_url: ?[]const u8 = null;
             var auth_user: ?[]const u8 = null;
             var auth_pass: ?[]const u8 = null;
+            var sel_user: ?[]const u8 = null;
+            var sel_pass: ?[]const u8 = null;
+            var sel_submit: ?[]const u8 = null;
             while (args_iter.next()) |aarg| {
                 if (std.mem.eql(u8, aarg, "--url")) { auth_url = args_iter.next(); }
                 else if (std.mem.eql(u8, aarg, "--username")) { auth_user = args_iter.next(); }
                 else if (std.mem.eql(u8, aarg, "--password")) { auth_pass = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--username-selector")) { sel_user = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--password-selector")) { sel_pass = args_iter.next(); }
+                else if (std.mem.eql(u8, aarg, "--submit-selector")) { sel_submit = args_iter.next(); }
             }
             if (auth_url == null or auth_user == null or auth_pass == null) {
                 writeErr("Usage: agent-devtools auth save <name> --url <url> --username <user> --password <pass>\n", .{});
                 std.process.exit(1);
             }
-            // Build JSON: url|username|password packed into url and pattern fields
-            // Pack as "url\x00username" in url, password in pattern
-            var pack_buf: [2048]u8 = undefined;
-            const pack_data = std.fmt.bufPrint(&pack_buf, "{s}\x00{s}", .{ auth_url.?, auth_user.? }) catch {
-                writeErr("auth data too long\n", .{});
-                std.process.exit(1);
-            };
-            sendAction(session, "auth_save", pack_data, auth_pass.?, daemon_opts);
-            // Also save to local file (name passed via a second field)
-            authVaultSave(name, auth_url.?, auth_user.?, auth_pass.?);
+            // auth save는 순수 로컬 vault 파일 작업 — 데몬 왕복 불필요.
+            // (기존엔 미구현 "auth_save" 액션을 보내 Unknown action 에러로
+            //  exit하면서 vault 저장이 안 되던 잠복 버그를 제거)
+            authVaultSave(name, auth_url.?, auth_user.?, auth_pass.?, sel_user, sel_pass, sel_submit);
         } else if (std.mem.eql(u8, subcmd, "login")) {
             const name = args_iter.next() orelse {
                 writeErr("Usage: agent-devtools auth login <name>\n", .{});
@@ -9998,6 +9998,42 @@ fn parseTextCommand(allocator: Allocator, line: []const u8, id: []const u8) ?[]u
 // Auth Login Handler (daemon-side)
 // ============================================================================
 
+/// auth login 필드 채우기 JS. custom_sel 있으면 querySelector(custom),
+/// 없으면 default_qsa(querySelectorAll 휴리스틱). value/셀렉터 JSON 인코딩.
+fn buildAuthFillJs(allocator: Allocator, custom_sel: ?[]const u8, default_qsa: []const u8, value: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    if (custom_sel) |sel| {
+        try w.writeAll("(function(){var e=document.querySelector(");
+        try cdp.writeJsonString(w, sel);
+        try w.writeAll(");if(!e)return'no_field';e.focus();e.value=");
+        try cdp.writeJsonString(w, value);
+        try w.writeAll(";e.dispatchEvent(new Event('input',{bubbles:true}));e.dispatchEvent(new Event('change',{bubbles:true}));return'filled'})()");
+    } else {
+        try w.writeAll("(function(){var inputs=document.querySelectorAll(");
+        try cdp.writeJsonString(w, default_qsa);
+        try w.writeAll(");for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=");
+        try cdp.writeJsonString(w, value);
+        try w.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return'filled'}}return'no_field'})()");
+    }
+    return buf.toOwnedSlice(allocator);
+}
+
+/// auth login 제출 JS. custom_sel 있으면 그 요소 click, 없으면 텍스트 휴리스틱.
+fn buildAuthSubmitJs(allocator: Allocator, custom_sel: ?[]const u8) ![]u8 {
+    if (custom_sel) |sel| {
+        var buf: std.ArrayList(u8) = .empty;
+        errdefer buf.deinit(allocator);
+        const w = buf.writer(allocator);
+        try w.writeAll("(function(){var e=document.querySelector(");
+        try cdp.writeJsonString(w, sel);
+        try w.writeAll(");if(!e)return'no_submit_found';e.click();return'clicked'})()");
+        return buf.toOwnedSlice(allocator);
+    }
+    return allocator.dupe(u8, "(function(){var btns=document.querySelectorAll('button[type=\"submit\"],input[type=\"submit\"],button');for(var i=0;i<btns.length;i++){var t=(btns[i].textContent||btns[i].value||'').toLowerCase();if(t.match(/log\\s*in|sign\\s*in|submit|login|signin/)){btns[i].click();return 'clicked'}}var forms=document.querySelectorAll('form');if(forms.length>0){forms[0].submit();return 'submitted'}return 'no_submit_found'})()");
+}
+
 fn handleAuthLogin(allocator: Allocator, sender: *WsSender, resp_map: *response_map_mod.ResponseMap, cmd_id: *cdp.CommandId, session_id: ?[]const u8, ref_map: *snapshot_mod.RefMap, name_opt: ?[]const u8) []u8 {
     _ = ref_map;
     const name = name_opt orelse return respondErr(allocator, "auth profile name required");
@@ -10014,44 +10050,26 @@ fn handleAuthLogin(allocator: Allocator, sender: *WsSender, resp_map: *response_
     // Wait for page load
     std.Thread.sleep(2000 * std.time.ns_per_ms);
 
-    // Find and fill username field (first visible text/email input)
-    var js_buf: std.ArrayList(u8) = .empty;
-    defer js_buf.deinit(allocator);
-    const w = js_buf.writer(allocator);
-    w.writeAll("(function(){var inputs=document.querySelectorAll('input[type=\"text\"],input[type=\"email\"],input:not([type])');for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(w, creds.username) catch return respondErr(allocator, "write error");
-    w.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return 'filled_username'}}return 'no_username_field'})()") catch return respondErr(allocator, "write error");
-
-    const username_js = js_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    // Fill username (custom selector if saved, else visible text/email input)
+    const username_js = buildAuthFillJs(allocator, creds.sel_user, "input[type=\"text\"],input[type=\"email\"],input:not([type])", creds.username) catch
+        return respondErr(allocator, "alloc error");
     defer allocator.free(username_js);
+    allocator.free(handleEval(allocator, sender, resp_map, cmd_id, session_id, username_js));
 
-    const uname_result = handleEval(allocator, sender, resp_map, cmd_id, session_id, username_js);
-    allocator.free(uname_result);
-
-    // Small delay between fields
     std.Thread.sleep(200 * std.time.ns_per_ms);
 
-    // Fill password field
-    var pw_buf: std.ArrayList(u8) = .empty;
-    defer pw_buf.deinit(allocator);
-    const pw = pw_buf.writer(allocator);
-    pw.writeAll("(function(){var inputs=document.querySelectorAll('input[type=\"password\"]');for(var i=0;i<inputs.length;i++){var s=getComputedStyle(inputs[i]);if(s.display!==\"none\"&&s.visibility!==\"hidden\"){inputs[i].focus();inputs[i].value=") catch return respondErr(allocator, "write error");
-    cdp.writeJsonString(pw, creds.password) catch return respondErr(allocator, "write error");
-    pw.writeAll(";inputs[i].dispatchEvent(new Event('input',{bubbles:true}));inputs[i].dispatchEvent(new Event('change',{bubbles:true}));return 'filled_password'}}return 'no_password_field'})()") catch return respondErr(allocator, "write error");
-
-    const password_js = pw_buf.toOwnedSlice(allocator) catch return respondErr(allocator, "alloc error");
+    // Fill password (custom selector if saved, else input[type=password])
+    const password_js = buildAuthFillJs(allocator, creds.sel_pass, "input[type=\"password\"]", creds.password) catch
+        return respondErr(allocator, "alloc error");
     defer allocator.free(password_js);
+    allocator.free(handleEval(allocator, sender, resp_map, cmd_id, session_id, password_js));
 
-    const pw_result = handleEval(allocator, sender, resp_map, cmd_id, session_id, password_js);
-    defer allocator.free(pw_result);
-
-    // Small delay before submit
     std.Thread.sleep(200 * std.time.ns_per_ms);
 
-    // Click submit button
-    const submit_js =
-        \\(function(){var btns=document.querySelectorAll('button[type="submit"],input[type="submit"],button');for(var i=0;i<btns.length;i++){var t=(btns[i].textContent||btns[i].value||'').toLowerCase();if(t.match(/log\s*in|sign\s*in|submit|login|signin/)){btns[i].click();return 'clicked'}}var forms=document.querySelectorAll('form');if(forms.length>0){forms[0].submit();return 'submitted'}return 'no_submit_found'})()
-    ;
+    // Submit (custom selector if saved, else text heuristic)
+    const submit_js = buildAuthSubmitJs(allocator, creds.sel_submit) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(submit_js);
     return handleEval(allocator, sender, resp_map, cmd_id, session_id, submit_js);
 }
 
@@ -10207,7 +10225,7 @@ fn isValidVaultName(name: []const u8) bool {
     return true;
 }
 
-fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, password: []const u8) void {
+fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, password: []const u8, sel_user: ?[]const u8, sel_pass: ?[]const u8, sel_submit: ?[]const u8) void {
     if (!isValidVaultName(name)) {
         writeErr("Invalid auth profile name (no /, \\, . allowed)\n", .{});
         return;
@@ -10233,74 +10251,37 @@ fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, passwo
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return;
 
-    var content_buf: [2048]u8 = undefined;
-    var pos: usize = 0;
-
-    const prefix = "{\"url\":\"";
-    if (pos + prefix.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + prefix.len], prefix);
-    pos += prefix.len;
-
-    // Simple JSON - escape basic chars
-    for ([_]struct { key: []const u8, val: []const u8 }{ .{ .key = "", .val = url } }) |_| {
-        for (url) |c| {
-            if (c == '"' or c == '\\') {
-                if (pos + 2 > content_buf.len) return;
-                content_buf[pos] = '\\';
-                content_buf[pos + 1] = c;
-                pos += 2;
-            } else {
-                if (pos + 1 > content_buf.len) return;
-                content_buf[pos] = c;
-                pos += 1;
-            }
+    // JSON 직렬화: cdp.writeJsonString으로 안전 이스케이프 (기존 수작업
+    // 이스케이프 3중 복사 제거). 선택적 셀렉터는 있을 때만 기록.
+    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
+    defer _ = gpa.deinit();
+    const a = gpa.allocator();
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    const w = buf.writer(a);
+    w.writeAll("{\"url\":") catch return;
+    cdp.writeJsonString(w, url) catch return;
+    w.writeAll(",\"username\":") catch return;
+    cdp.writeJsonString(w, username) catch return;
+    w.writeAll(",\"password\":") catch return;
+    cdp.writeJsonString(w, password) catch return;
+    const opt_fields = [_]struct { k: []const u8, v: ?[]const u8 }{
+        .{ .k = "usernameSelector", .v = sel_user },
+        .{ .k = "passwordSelector", .v = sel_pass },
+        .{ .k = "submitSelector", .v = sel_submit },
+    };
+    for (opt_fields) |f| {
+        if (f.v) |val| {
+            if (val.len == 0) continue;
+            w.print(",\"{s}\":", .{f.k}) catch return;
+            cdp.writeJsonString(w, val) catch return;
         }
     }
+    w.writeByte('}') catch return;
 
-    const mid1 = "\",\"username\":\"";
-    if (pos + mid1.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + mid1.len], mid1);
-    pos += mid1.len;
-
-    for (username) |c| {
-        if (c == '"' or c == '\\') {
-            if (pos + 2 > content_buf.len) return;
-            content_buf[pos] = '\\';
-            content_buf[pos + 1] = c;
-            pos += 2;
-        } else {
-            if (pos + 1 > content_buf.len) return;
-            content_buf[pos] = c;
-            pos += 1;
-        }
-    }
-
-    const mid2 = "\",\"password\":\"";
-    if (pos + mid2.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + mid2.len], mid2);
-    pos += mid2.len;
-
-    for (password) |c| {
-        if (c == '"' or c == '\\') {
-            if (pos + 2 > content_buf.len) return;
-            content_buf[pos] = '\\';
-            content_buf[pos + 1] = c;
-            pos += 2;
-        } else {
-            if (pos + 1 > content_buf.len) return;
-            content_buf[pos] = c;
-            pos += 1;
-        }
-    }
-
-    const suffix = "\"}";
-    if (pos + suffix.len > content_buf.len) return;
-    @memcpy(content_buf[pos .. pos + suffix.len], suffix);
-    pos += suffix.len;
-
-    if (std.fs.createFileAbsolute(path, .{})) |f| {
-        _ = f.write(content_buf[0..pos]) catch {};
-        f.close();
+    if (std.fs.createFileAbsolute(path, .{})) |file| {
+        _ = file.write(buf.items) catch {};
+        file.close();
         write("Saved auth profile: {s}\n", .{name});
     } else |_| {
         writeErr("Failed to save auth profile\n", .{});
@@ -10388,7 +10369,14 @@ fn authVaultDelete(name: []const u8) void {
 }
 
 /// Load auth profile from file, return url, username, password.
-fn authVaultLoad(name: []const u8) ?struct { url: []const u8, username: []const u8, password: []const u8 } {
+fn authVaultLoad(name: []const u8) ?struct {
+    url: []const u8,
+    username: []const u8,
+    password: []const u8,
+    sel_user: ?[]const u8 = null,
+    sel_pass: ?[]const u8 = null,
+    sel_submit: ?[]const u8 = null,
+} {
     if (!isValidVaultName(name)) return null;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse return null;
@@ -10416,16 +10404,35 @@ fn authVaultLoad(name: []const u8) ?struct { url: []const u8, username: []const 
         var url: [512]u8 = undefined;
         var user: [256]u8 = undefined;
         var pass: [256]u8 = undefined;
+        var su: [256]u8 = undefined;
+        var sp: [256]u8 = undefined;
+        var ss: [256]u8 = undefined;
     };
     if (url_val.len > StaticBufs.url.len or user_val.len > StaticBufs.user.len or pass_val.len > StaticBufs.pass.len) return null;
     @memcpy(StaticBufs.url[0..url_val.len], url_val);
     @memcpy(StaticBufs.user[0..user_val.len], user_val);
     @memcpy(StaticBufs.pass[0..pass_val.len], pass_val);
 
+    // 선택적 커스텀 셀렉터 (있을 때만)
+    const copyOpt = struct {
+        fn go(v: ?[]const u8, b: []u8) ?[]const u8 {
+            const s = v orelse return null;
+            if (s.len == 0 or s.len > b.len) return null;
+            @memcpy(b[0..s.len], s);
+            return b[0..s.len];
+        }
+    }.go;
+    const su = copyOpt(cdp.getString(parsed.value, "usernameSelector"), &StaticBufs.su);
+    const sp = copyOpt(cdp.getString(parsed.value, "passwordSelector"), &StaticBufs.sp);
+    const ss = copyOpt(cdp.getString(parsed.value, "submitSelector"), &StaticBufs.ss);
+
     return .{
         .url = StaticBufs.url[0..url_val.len],
         .username = StaticBufs.user[0..user_val.len],
         .password = StaticBufs.pass[0..pass_val.len],
+        .sel_user = su,
+        .sel_pass = sp,
+        .sel_submit = ss,
     };
 }
 
@@ -11075,6 +11082,7 @@ fn printUsage() void {
         \\
         \\Auth Vault:
         \\  auth save <name> --url <url> --username <user> --password <pass>
+        \\           [--username-selector <css>] [--password-selector <css>] [--submit-selector <css>]
         \\  auth login <name>         Auto-login using saved credentials
         \\  auth list                 List saved auth profiles
         \\  auth show <name>          Show auth profile (masked password)
@@ -12351,6 +12359,29 @@ test "parseRectCsv: valid + invalid" {
     try std.testing.expect(parseRectCsv("") == null);
     try std.testing.expect(parseRectCsv("1,2,3") == null);
     try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildAuthFillJs: custom selector vs default qsa" {
+    const a = std.testing.allocator;
+    const c = try buildAuthFillJs(a, "#user", "input", "alice\"x");
+    defer a.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "querySelector(\"#user\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "e.value=\"alice\\\"x\"") != null);
+    const d = try buildAuthFillJs(a, null, "input[type=\"password\"]", "pw");
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "querySelectorAll(\"input[type=\\\"password\\\"]\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, d, "no_field") != null);
+}
+
+test "buildAuthSubmitJs: custom click vs heuristic" {
+    const a = std.testing.allocator;
+    const c = try buildAuthSubmitJs(a, "button.login");
+    defer a.free(c);
+    try std.testing.expect(std.mem.indexOf(u8, c, "querySelector(\"button.login\")") != null);
+    try std.testing.expect(std.mem.indexOf(u8, c, "e.click()") != null);
+    const d = try buildAuthSubmitJs(a, null);
+    defer a.free(d);
+    try std.testing.expect(std.mem.indexOf(u8, d, "log\\s*in|sign\\s*in") != null);
 }
 
 test "buildTraceConfigParams: default vs custom categories" {
