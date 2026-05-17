@@ -1247,8 +1247,27 @@ pub fn main() void {
             std.process.exit(1);
         }
     } else if (std.mem.eql(u8, cmd, "wait")) {
-        const ms = args_iter.next() orelse "1000";
-        sendAction(session, "wait", ms, null, daemon_opts);
+        const first = args_iter.next() orelse "1000";
+        if (std.mem.eql(u8, first, "--text") or std.mem.eql(u8, first, "-t")) {
+            // wait --text "<문구>" [--timeout <ms>] — 텍스트 등장까지 폴링 대기
+            const text = args_iter.next() orelse {
+                writeErr("Usage: agent-devtools wait --text <text> [--timeout <ms>]\n", .{});
+                std.process.exit(1);
+            };
+            var timeout: []const u8 = "30000";
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--timeout")) timeout = args_iter.next() orelse "30000";
+            }
+            const pa = std.heap.page_allocator;
+            const expr = buildWaitTextExpr(pa, text) catch {
+                writeErr("wait --text: build error\n", .{});
+                std.process.exit(1);
+            };
+            defer pa.free(expr);
+            sendAction(session, "waitfunction", expr, timeout, daemon_opts);
+        } else {
+            sendAction(session, "wait", first, null, daemon_opts);
+        }
     } else if (std.mem.eql(u8, cmd, "connect")) {
         // endpoint는 이미 cdp_url/cdp_port로 디슈가됨 → 데몬 기동 + 상태 보고
         sendAction(session, "status", null, null, daemon_opts);
@@ -6639,6 +6658,18 @@ fn buildRectExpr(allocator: Allocator, selector: []const u8) ![]u8 {
     try cdp.writeJsonString(w, selector);
     try w.writeAll(");if(!e)return'';var r=e.getBoundingClientRect();" ++
         "return [r.left+scrollX,r.top+scrollY,r.width,r.height].join(',')})()");
+    return buf.toOwnedSlice(allocator);
+}
+
+/// `wait --text` → 페이지에 텍스트가 보이는지 검사하는 JS 불린 표현식
+/// (waitfunction 폴링용). text는 JSON 인코딩(인젝션 안전).
+fn buildWaitTextExpr(allocator: Allocator, text: []const u8) ![]u8 {
+    var buf: std.ArrayList(u8) = .empty;
+    errdefer buf.deinit(allocator);
+    const w = buf.writer(allocator);
+    try w.writeAll("(!!document.body && (document.body.innerText||'').indexOf(");
+    try cdp.writeJsonString(w, text);
+    try w.writeAll(") >= 0)");
     return buf.toOwnedSlice(allocator);
 }
 
@@ -12244,6 +12275,16 @@ test "parseRectCsv: valid + invalid" {
     try std.testing.expect(parseRectCsv("") == null);
     try std.testing.expect(parseRectCsv("1,2,3") == null);
     try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildWaitTextExpr: JSON-encodes text into innerText check" {
+    const a = std.testing.allocator;
+    const e = try buildWaitTextExpr(a, "Wel\"come");
+    defer a.free(e);
+    try std.testing.expectEqualStrings(
+        "(!!document.body && (document.body.innerText||'').indexOf(\"Wel\\\"come\") >= 0)",
+        e,
+    );
 }
 
 test "buildScrollIntoViewExpr: selector JSON-encoded + notfound guard" {
