@@ -10039,7 +10039,8 @@ fn handleAuthLogin(allocator: Allocator, sender: *WsSender, resp_map: *response_
     const name = name_opt orelse return respondErr(allocator, "auth profile name required");
 
     // Load credentials from vault
-    const creds = authVaultLoad(name) orelse return respondErr(allocator, "auth profile not found");
+    const creds = authVaultLoad(allocator, name) orelse return respondErr(allocator, "auth profile not found");
+    defer creds.deinit(allocator);
 
     // 1. Navigate to URL
     const nav_cmd = cdp.pageNavigate(allocator, cmd_id.next(), creds.url, session_id) catch
@@ -10280,8 +10281,11 @@ fn authVaultSave(name: []const u8, url: []const u8, username: []const u8, passwo
     w.writeByte('}') catch return;
 
     if (std.fs.createFileAbsolute(path, .{})) |file| {
-        _ = file.write(buf.items) catch {};
-        file.close();
+        defer file.close();
+        file.writeAll(buf.items) catch {
+            writeErr("Failed to write auth profile\n", .{});
+            return;
+        };
         write("Saved auth profile: {s}\n", .{name});
     } else |_| {
         writeErr("Failed to save auth profile\n", .{});
@@ -10369,14 +10373,26 @@ fn authVaultDelete(name: []const u8) void {
 }
 
 /// Load auth profile from file, return url, username, password.
-fn authVaultLoad(name: []const u8) ?struct {
-    url: []const u8,
-    username: []const u8,
-    password: []const u8,
-    sel_user: ?[]const u8 = null,
-    sel_pass: ?[]const u8 = null,
-    sel_submit: ?[]const u8 = null,
-} {
+const AuthCreds = struct {
+    url: []u8,
+    username: []u8,
+    password: []u8,
+    sel_user: ?[]u8 = null,
+    sel_pass: ?[]u8 = null,
+    sel_submit: ?[]u8 = null,
+    fn deinit(self: *const AuthCreds, a: Allocator) void {
+        a.free(self.url);
+        a.free(self.username);
+        a.free(self.password);
+        if (self.sel_user) |s| a.free(s);
+        if (self.sel_pass) |s| a.free(s);
+        if (self.sel_submit) |s| a.free(s);
+    }
+};
+
+/// vault 프로필 로드 — 모든 값을 호출자 allocator로 소유 복사(정적 버퍼
+/// 제거: 동시 auth login 워커 간 데이터 레이스 방지). 호출자가 deinit.
+fn authVaultLoad(allocator: Allocator, name: []const u8) ?AuthCreds {
     if (!isValidVaultName(name)) return null;
     var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
     const auth_dir = getAuthDir(&dir_buf) orelse return null;
@@ -10384,55 +10400,37 @@ fn authVaultLoad(name: []const u8) ?struct {
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
     const path = std.fmt.bufPrint(&path_buf, "{s}/{s}.json", .{ auth_dir, name }) catch return null;
 
-    const S = struct {
-        var content_buf: [2048]u8 = undefined;
-    };
-    const content = std.fs.cwd().readFile(path, &S.content_buf) catch return null;
+    var content_buf: [4096]u8 = undefined;
+    const content = std.fs.cwd().readFile(path, &content_buf) catch return null;
 
-    var gpa: std.heap.GeneralPurposeAllocator(.{}) = .init;
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
-    const parsed = std.json.parseFromSlice(std.json.Value, alloc, content, .{}) catch return null;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return null;
     defer parsed.deinit();
 
     const url_val = cdp.getString(parsed.value, "url") orelse return null;
     const user_val = cdp.getString(parsed.value, "username") orelse return null;
     const pass_val = cdp.getString(parsed.value, "password") orelse return null;
 
-    // Copy into static buffers since parsed will be freed
-    const StaticBufs = struct {
-        var url: [512]u8 = undefined;
-        var user: [256]u8 = undefined;
-        var pass: [256]u8 = undefined;
-        var su: [256]u8 = undefined;
-        var sp: [256]u8 = undefined;
-        var ss: [256]u8 = undefined;
-    };
-    if (url_val.len > StaticBufs.url.len or user_val.len > StaticBufs.user.len or pass_val.len > StaticBufs.pass.len) return null;
-    @memcpy(StaticBufs.url[0..url_val.len], url_val);
-    @memcpy(StaticBufs.user[0..user_val.len], user_val);
-    @memcpy(StaticBufs.pass[0..pass_val.len], pass_val);
-
-    // 선택적 커스텀 셀렉터 (있을 때만)
-    const copyOpt = struct {
-        fn go(v: ?[]const u8, b: []u8) ?[]const u8 {
+    const dupOpt = struct {
+        fn go(a: Allocator, v: ?[]const u8) ?[]u8 {
             const s = v orelse return null;
-            if (s.len == 0 or s.len > b.len) return null;
-            @memcpy(b[0..s.len], s);
-            return b[0..s.len];
+            if (s.len == 0) return null;
+            return a.dupe(u8, s) catch null;
         }
     }.go;
-    const su = copyOpt(cdp.getString(parsed.value, "usernameSelector"), &StaticBufs.su);
-    const sp = copyOpt(cdp.getString(parsed.value, "passwordSelector"), &StaticBufs.sp);
-    const ss = copyOpt(cdp.getString(parsed.value, "submitSelector"), &StaticBufs.ss);
+
+    const url = allocator.dupe(u8, url_val) catch return null;
+    errdefer allocator.free(url);
+    const username = allocator.dupe(u8, user_val) catch return null;
+    errdefer allocator.free(username);
+    const password = allocator.dupe(u8, pass_val) catch return null;
 
     return .{
-        .url = StaticBufs.url[0..url_val.len],
-        .username = StaticBufs.user[0..user_val.len],
-        .password = StaticBufs.pass[0..pass_val.len],
-        .sel_user = su,
-        .sel_pass = sp,
-        .sel_submit = ss,
+        .url = url,
+        .username = username,
+        .password = password,
+        .sel_user = dupOpt(allocator, cdp.getString(parsed.value, "usernameSelector")),
+        .sel_pass = dupOpt(allocator, cdp.getString(parsed.value, "passwordSelector")),
+        .sel_submit = dupOpt(allocator, cdp.getString(parsed.value, "submitSelector")),
     };
 }
 
