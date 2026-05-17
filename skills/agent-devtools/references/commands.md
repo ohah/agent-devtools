@@ -23,6 +23,7 @@
 | `find role/text/label/placeholder/alt/title/testid <v> [action]` | Locator query (+ optional click/fill/… action) |
 | `find first/last/nth <role> <v> [--name N] [--exact]` | Ordinal locator |
 | `click` / `dblclick` / `tap @ref` | Click / double-click / touch tap |
+| `click @ref --new-tab` | Open the element's link href in a new tab |
 | `fill @ref "text"` | Clear + type |
 | `type @ref "text"` | Type without clearing |
 | `press <key>` | Press key (Enter, Tab, Escape) |
@@ -34,6 +35,8 @@
 | `select @ref "val"` | Dropdown |
 | `clear` / `selectall @ref` | Clear / select all text |
 | `scroll <dir> [px]` | Scroll (up/down/left/right) |
+| `scroll --selector <css>` | Scroll a specific element into view (center) |
+| `frame main` / `frame mainframe` | Confirm main-frame context (iframe switch unsupported) |
 | `scroll to <x> <y>` | Scroll to coordinates |
 | `scrollintoview @ref` | Scroll element into view |
 | `drag @from @to` | Drag and drop |
@@ -63,6 +66,7 @@
 | `diff snapshot [-b file] [-s sel] [-d n]` | AX snapshot diff vs baseline file / last snapshot |
 | `diff url <u1> <u2> [-s/-d]` | Snapshot diff of two URLs |
 | `video/trace/profiler start/stop [path]` | Recording/profiling |
+| `profiler start --categories <csv>` | Trace with custom includedCategories |
 
 ## React Introspection (requires `--enable=react-devtools` at launch)
 | Command | Description |
@@ -90,6 +94,7 @@
 | Command | Description |
 |---|---|
 | `wait <ms>` | Wait milliseconds |
+| `wait --text <문구> [--timeout <ms>]` | Wait until page text appears |
 | `waitforloadstate [ms]` | Page load |
 | `waitforurl <pat> [ms]` | URL match |
 | `waitforfunction <expr> [ms]` | JS condition |
@@ -115,6 +120,9 @@
 | `state save/load/list` | Full state persistence |
 | `state clear [name\|--all] / show <n> / clean --older-than <days> / rename <a> <b>` | State mgmt |
 | `credentials <user> <pass>` | HTTP auth |
+| `auth save <name> --url --username --password` | Save login profile (local vault) |
+| `auth save … --username-selector/--password-selector/--submit-selector <css>` | Custom field selectors for auto-login |
+| `auth login/list/show/delete <name>` | Auto-login / manage saved profiles |
 
 ## Other
 | Command | Description |
