@@ -1669,7 +1669,12 @@ pub fn main() void {
             std.process.exit(1);
         };
         if (std.mem.eql(u8, subcmd, "start")) {
-            sendAction(session, "profiler_start", null, null, daemon_opts);
+            // profiler start [--categories <csv>]
+            var cats: ?[]const u8 = null;
+            while (args_iter.next()) |a| {
+                if (std.mem.eql(u8, a, "--categories")) cats = args_iter.next();
+            }
+            sendAction(session, "profiler_start", null, cats, daemon_opts);
         } else if (std.mem.eql(u8, subcmd, "stop")) {
             const path = args_iter.next();
             sendAction(session, "profiler_stop", path, null, daemon_opts);
@@ -4416,7 +4421,7 @@ fn handleCommand(ctx: *DaemonContext, line: []const u8) []u8 {
     } else if (std.mem.eql(u8, req.action, "trace_stop")) {
         return handleTraceStop(allocator, sender, cmd_id, session_id, resp_map, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, req.url);
     } else if (std.mem.eql(u8, req.action, "profiler_start")) {
-        return handleTraceStart(allocator, sender, cmd_id, session_id, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, true);
+        return handleTraceStartCats(allocator, sender, cmd_id, session_id, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, true, req.pattern);
     } else if (std.mem.eql(u8, req.action, "profiler_stop")) {
         return handleTraceStop(allocator, sender, cmd_id, session_id, resp_map, ctx.trace_active, ctx.trace_complete, ctx.trace_events, ctx.trace_mutex, req.url);
     } else if (std.mem.eql(u8, req.action, "screenshot_annotate")) {
@@ -10422,7 +10427,37 @@ fn collectTraceData(allocator: Allocator, params: std.json.Value, trace_events: 
     }
 }
 
-/// trace start / profiler start — send Tracing.start CDP command
+/// Tracing.start traceConfig params. profiler는 CPU 샘플링 카테고리 기본,
+/// categories_csv 지정 시 includedCategories를 그것으로 대체.
+fn buildTraceConfigParams(allocator: Allocator, is_profiler: bool, categories_csv: ?[]const u8) ![]u8 {
+    if (categories_csv) |csv| {
+        if (csv.len > 0) {
+            var buf: std.ArrayList(u8) = .empty;
+            errdefer buf.deinit(allocator);
+            const w = buf.writer(allocator);
+            try w.writeAll("{\"traceConfig\":{\"includedCategories\":[");
+            var it = std.mem.splitScalar(u8, csv, ',');
+            var first = true;
+            while (it.next()) |raw| {
+                const c = std.mem.trim(u8, raw, " \t");
+                if (c.len == 0) continue;
+                if (!first) try w.writeByte(',');
+                try cdp.writeJsonString(w, c);
+                first = false;
+            }
+            try w.writeAll("]");
+            if (is_profiler) try w.writeAll(",\"enableSampling\":true");
+            try w.writeAll("},\"transferMode\":\"ReportEvents\"}");
+            return buf.toOwnedSlice(allocator);
+        }
+    }
+    const fixed = if (is_profiler)
+        "{\"traceConfig\":{\"includedCategories\":[\"devtools.timeline\",\"disabled-by-default-v8.cpu_profiler\",\"disabled-by-default-v8.cpu_profiler.hires\",\"v8.execute\",\"v8\",\"blink\",\"blink.user_timing\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}"
+    else
+        "{\"traceConfig\":{\"recordMode\":\"recordContinuously\"},\"transferMode\":\"ReportEvents\"}";
+    return allocator.dupe(u8, fixed);
+}
+
 fn handleTraceStart(
     allocator: Allocator,
     sender: *WsSender,
@@ -10433,6 +10468,22 @@ fn handleTraceStart(
     trace_events: *std.ArrayList([]u8),
     trace_mutex: *std.Thread.Mutex,
     is_profiler: bool,
+) []u8 {
+    return handleTraceStartCats(allocator, sender, cmd_id, session_id, trace_active, trace_complete, trace_events, trace_mutex, is_profiler, null);
+}
+
+/// trace start / profiler start [--categories csv] — Tracing.start
+fn handleTraceStartCats(
+    allocator: Allocator,
+    sender: *WsSender,
+    cmd_id: *cdp.CommandId,
+    session_id: ?[]const u8,
+    trace_active: *std.atomic.Value(bool),
+    trace_complete: *std.atomic.Value(bool),
+    trace_events: *std.ArrayList([]u8),
+    trace_mutex: *std.Thread.Mutex,
+    is_profiler: bool,
+    categories_csv: ?[]const u8,
 ) []u8 {
     if (trace_active.load(.acquire)) {
         return respondErr(allocator, "tracing already active — stop first");
@@ -10446,10 +10497,9 @@ fn handleTraceStart(
     }
     trace_complete.store(false, .release);
 
-    const params = if (is_profiler)
-        "{\"traceConfig\":{\"includedCategories\":[\"devtools.timeline\",\"disabled-by-default-v8.cpu_profiler\",\"disabled-by-default-v8.cpu_profiler.hires\",\"v8.execute\",\"v8\",\"blink\",\"blink.user_timing\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}"
-    else
-        "{\"traceConfig\":{\"recordMode\":\"recordContinuously\"},\"transferMode\":\"ReportEvents\"}";
+    const params = buildTraceConfigParams(allocator, is_profiler, categories_csv) catch
+        return respondErr(allocator, "alloc error");
+    defer allocator.free(params);
 
     const sent_id = cmd_id.next();
     const cmd = cdp.serializeCommand(allocator, sent_id, "Tracing.start", params, session_id) catch
@@ -12275,6 +12325,22 @@ test "parseRectCsv: valid + invalid" {
     try std.testing.expect(parseRectCsv("") == null);
     try std.testing.expect(parseRectCsv("1,2,3") == null);
     try std.testing.expect(parseRectCsv("1,2,3,4,5") == null);
+}
+
+test "buildTraceConfigParams: default vs custom categories" {
+    const a = std.testing.allocator;
+    const p1 = try buildTraceConfigParams(a, true, null);
+    defer a.free(p1);
+    try std.testing.expect(std.mem.indexOf(u8, p1, "cpu_profiler") != null);
+    const p2 = try buildTraceConfigParams(a, false, null);
+    defer a.free(p2);
+    try std.testing.expect(std.mem.indexOf(u8, p2, "recordContinuously") != null);
+    const p3 = try buildTraceConfigParams(a, true, "blink, v8 ,devtools.timeline");
+    defer a.free(p3);
+    try std.testing.expectEqualStrings(
+        "{\"traceConfig\":{\"includedCategories\":[\"blink\",\"v8\",\"devtools.timeline\"],\"enableSampling\":true},\"transferMode\":\"ReportEvents\"}",
+        p3,
+    );
 }
 
 test "buildWaitTextExpr: JSON-encodes text into innerText check" {
